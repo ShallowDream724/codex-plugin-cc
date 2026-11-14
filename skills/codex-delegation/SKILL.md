@@ -9,6 +9,8 @@ Default `context_mode: available` copies the host-exported current context, up t
 
 After dispatch, wait unless necessary independent work remains. Do not poll status, invent busywork or narrate unchanged updates. A compaction notice normally needs another wait. Wait timeout returns control without stopping work.
 
+Use one wait for all agents; match events by agent_id. A repeated seq is the same event.
+
 Continue existing agents instead of spawning replacements. `send_message` does not start an idle agent; `followup_task` does. Both preserve its history.
 
 Close failed or finished agents only when you no longer need to continue them.

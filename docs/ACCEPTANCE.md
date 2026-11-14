@@ -13,6 +13,7 @@
 9. 查看状态文件中的真实 `tokenUsage.last` 与 `total`，比较同一线程初始调用和后续短消息的 `cachedInputTokens` / `cacheWriteInputTokens`。Claude 一侧查看其实际 cache read/write 统计。将发生 compact 的轮次单独记录。
 10. 关闭并重开宿主，用原 Claude 会话列出代理后 followup，确认恢复原 Codex thread。最后在实际使用的 Desktop/终端分别验收加载与通知。
 11. 确认 available 的新建结果含首尾预览及消息序号，预览省略不影响 Codex 得到的窗口内容。用 `timeout_ms` 短暂等待正在工作的代理，确认只结束等待；不再需要的失败代理用 `close_agent` 清理，随后列表不再显示它。
+12. 在最后一个完成结果已显示后退出并恢复同一 Claude 会话，再短暂等待，确认不重复返回刚才的完成事件。不要为一个会话并行调用多个 wait；第二次并发调用会说明已有等待者，不另领同一批事件。
 
 不要为了验收超限而无意义地生成几十万 token。错误、压缩事件、失败恢复、旧请求 ID、消息截断和重复交付等边界已有本地模拟测试；真实运行中遇到时再核对实际行为。
 

@@ -50,7 +50,9 @@ function fixture({ handle, initialize = true, delayedWrites = false } = {}) {
 test('initializes once using id 0, opts into experimental API and preserves argv', async () => {
   const { client, calls, frames } = fixture();
   try {
+    assert.equal(client.ready, false);
     assert.deepEqual(await client.start(), { userAgent: 'fake' });
+    assert.equal(client.ready, true);
     assert.deepEqual(await client.start(), { userAgent: 'fake' });
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0], ['custom-codex', ['-c', 'key=literal;$(not-a-shell)', 'app-server', '--stdio'], {
@@ -61,7 +63,7 @@ test('initializes once using id 0, opts into experimental API and preserves argv
     assert.deepEqual(frames[0].params.capabilities, { experimentalApi: true, requestAttestation: false });
     assert.deepEqual(frames[1], { method: 'initialized', params: {} });
     assert.equal(frames.length, 2);
-  } finally { await client.close(); }
+  } finally { await client.close(); assert.equal(client.ready, false); }
 });
 
 test('decodes fragmented UTF-8, CRLF and multiple frames while ignoring plain diagnostics', async () => {

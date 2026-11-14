@@ -2,11 +2,12 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 const ROLE = 'Claude is your parent agent. Work independently first. Ask the parent for necessary decisions using request_user_input. Use notify_parent only for a real blocker; omit routine progress reports. Finish with a concise result and validation report.\n\n';
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const ACTIVE = new Set(['starting', 'running', 'waiting', 'compacting']);
-const TERMINAL = new Set(['completed', 'failed', 'interrupted']);
+const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'unknown']);
 const APPROVALS = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'mcpServer/elicitation/request']);
 const object = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const nonempty = (x) => typeof x === 'string' && x.trim().length > 0;
@@ -48,11 +49,12 @@ export class AgentController extends EventEmitter {
     try { data = JSON.parse(await readFile(this.statePath, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return this; throw error; }
     if (data.version !== 1 || !Array.isArray(data.agents) || !Array.isArray(data.pendingEvents)) throw new Error('Invalid agent state.');
-    this.pendingEvents = data.pendingEvents;
+    // Wire requests cannot be recovered by a new app-server connection.
+    this.pendingEvents = data.pendingEvents.filter((event) => !['question', 'approval'].includes(event.kind));
     this.retiredThreads = new Set(data.retiredThreads ?? []);
     this.nextSeq = data.pendingEvents.reduce((next, event) => Math.max(next, event.seq + 1), data.nextSeq ?? 1);
     for (const saved of data.agents) {
-      const a = { ...saved, pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
+      const a = { ...saved, lastTurnId: saved.turnId, pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
       this.agents.set(a.id, a);
       if (a.threadId) this.threads.set(a.threadId, a);
       if (ACTIVE.has(a.status)) {
@@ -60,6 +62,7 @@ export class AgentController extends EventEmitter {
         this.publish(a, 'interrupted', { reason: 'controller_restarted', stale_pending: true });
       }
     }
+    this.pendingEvents = this.pendingEvents.filter((event) => this.agents.has(event.agent_id));
     await this.persist();
     return this;
   }
@@ -78,10 +81,23 @@ export class AgentController extends EventEmitter {
   }
 
   snapshot() { return { agents: [...this.agents.values()].map((a) => this.view(a, true)), pendingEvents: copy(this.pendingEvents), nextSeq: this.nextSeq }; }
+  hasActiveWork() {
+    return this.descendantTurns.size > 0 || [...this.agents.values()].some((a) => ACTIVE.has(a.status) || a.status === 'unknown' || a.turnId || a.pending.length > 0);
+  }
   eventsAfter(cursor = 0, targets = []) {
     if (!Number.isSafeInteger(cursor) || cursor < 0 || !Array.isArray(targets)) throw new TypeError('Invalid event cursor or targets.');
     const ids = new Set(targets.map((target) => this.find(target).id));
-    return copy(this.pendingEvents.filter((e) => e.seq > cursor && (!ids.size || ids.has(e.agent_id))));
+    return copy(this.pendingEvents.filter((e) => this.agents.has(e.agent_id) && e.seq > cursor && (!ids.size || ids.has(e.agent_id))));
+  }
+  async ackSequences(sequences) {
+    if (!Array.isArray(sequences) || sequences.some((seq) => !Number.isSafeInteger(seq) || seq < 1 || seq >= this.nextSeq)) {
+      throw new TypeError('Invalid event acknowledgement sequences.');
+    }
+    const acknowledged = [...new Set(sequences)];
+    const selected = new Set(acknowledged);
+    this.pendingEvents = this.pendingEvents.filter((event) => !selected.has(event.seq));
+    await this.persist();
+    return { acknowledged };
   }
   async ackEvents(cursor) {
     if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor >= this.nextSeq) throw new TypeError('Invalid event acknowledgement cursor.');
@@ -145,7 +161,7 @@ export class AgentController extends EventEmitter {
       if (!a.interrupted) await this.startTurn(a, ROLE + message, true);
       return { ...this.view(a), context_snapshot: a.snapshot ? { ...copy(a.snapshot), ...(Object.hasOwn(snapshot, 'preview') ? { preview: copy(snapshot.preview) } : {}) } : null };
     } catch (error) {
-      if (ACTIVE.has(a.status)) this.finish(a, this.closing ? 'interrupted' : 'failed', { message: error.message });
+      if (ACTIVE.has(a.status) && !a.turnId) this.finish(a, this.closing ? 'interrupted' : 'failed', { message: error.message });
       throw error;
     } finally {
       a.spawning = false;
@@ -167,24 +183,125 @@ export class AgentController extends EventEmitter {
 
   async startTurn(a, text, newTask = false) {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
+    const previousTaskTurns = newTask ? new Set(a.completedTurns) : null;
     if (newTask) { a.recoveryUsed = false; a.interrupted = false; a.error = null; a.terminalEmitted = false; }
+    a.compactItems.clear();
     a.result = null;
     a.unclassifiedResult = null;
     a.status = a.pending.length ? 'waiting' : 'running'; a.activity = a.pending.length ? 'waiting for parent' : 'working'; a.turnId = null; a.overflow = false;
     a.startingTurn = true;
+    a.startEvents = [];
     let response;
-    try { response = await this.rpc('turn/start', { threadId: a.threadId, input: input(text),
-      ...(a.effort ? { effort: a.effort } : {}), serviceTierForTurn: 'default' }); }
-    finally { a.startingTurn = false; }
+    try {
+      response = await this.rpc('turn/start', { threadId: a.threadId, input: input(text),
+        ...(a.effort ? { effort: a.effort } : {}), serviceTierForTurn: 'default' });
+      if (!nonempty(response?.turn?.id)) throw new Error('turn/start returned no turn id; start outcome is unknown.');
+      a.startingTurn = false;
+      await this.replayTurnStart(a, response.turn.id);
+    } catch (error) {
+      a.startingTurn = false;
+      // On a lost reply, a single observed start is the best available identity.
+      // On success, the response above is authoritative and discards late traffic
+      // from older tasks, without retaining every historical turn ID forever.
+      const observed = [...new Set((a.startEvents ?? []).filter((entry) => !entry.request && entry.message.method === 'turn/started')
+        .map((entry) => entry.message.params.turn.id).filter((id) => !a.completedTurns.has(id)))];
+      await this.replayTurnStart(a, observed.length === 1 ? observed[0] : null);
+      // A transport failure says nothing about whether the server started work.
+      // An observed turn remains authoritative even if its RPC reply was lost.
+      if (!a.turnId && !a.terminalEmitted) this.finish(a, Number.isInteger(error.code) ? 'failed' : 'unknown',
+        { message: error.message, reason: Number.isInteger(error.code) ? 'turn_start_rejected' : 'turn_start_outcome_unknown',
+          ...(Number.isInteger(error.code) ? {} : { recovery: `Keep this same agent. An explicit send, followup, interrupt, or close first checks native Codex thread ${a.threadId} metadata and restores its subscription when needed. Do not create replacement work or automatically resend the original task; if metadata remains inconclusive, inspect this thread in Codex.` }) });
+      await this.persist();
+      throw error;
+    }
+    finally {
+      a.startingTurn = false;
+      a.startEvents = null;
+      // Keep the prior task's IDs until start notifications have been processed.
+      // After binding a new turn, admission checks below reject unrelated turns.
+      if (previousTaskTurns && (a.turnId || a.terminalEmitted && a.status !== 'unknown')) {
+        for (const id of previousTaskTurns) a.completedTurns.delete(id);
+      }
+    }
     // Notifications may already have completed this turn while its RPC was pending.
     const turn = response.turn;
     if (turn?.id && !a.completedTurns.has(turn.id) && ACTIVE.has(a.status) && !a.turnId) a.turnId = turn.id;
+    a.lastTurnId = turn?.id ?? a.lastTurnId;
+    if (previousTaskTurns) for (const id of previousTaskTurns) a.completedTurns.delete(id);
     if (a.interrupted && a.turnId) await this.requestInterrupt(a);
     await this.persist();
   }
 
+  async replayTurnStart(a, turnId) {
+    const events = a.startEvents ?? [];
+    a.startEvents = null;
+    for (const entry of events) {
+      const p = entry.message.params ?? {};
+      const sourceTurn = p.turnId ?? p.turn?.id;
+      if (!turnId || sourceTurn && sourceTurn !== turnId) {
+        if (entry.request) await this.client.reject(entry.message.id, -32602, 'Stale or unconfirmed agent turn.');
+        continue;
+      }
+      if (entry.request) await this.serverRequest(entry.message);
+      else this.observe(entry.message);
+    }
+  }
+
+  async reconcileUnknown(a) {
+    if (a.status !== 'unknown') return;
+    if (a.reconciling) return a.reconciling;
+    const reconcile = async () => {
+      let resumed = false;
+      a.error = { ...a.error };
+      delete a.error.reconciliation_error; delete a.error.reconciliation_status;
+      try {
+        const response = await this.rpc('thread/read', { threadId: a.threadId, includeTurns: false });
+        if (a.status !== 'unknown') return;
+        let status = response?.thread?.status?.type;
+        if (status === 'active' && !a.loaded) {
+          const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true });
+          resumed = true; a.loaded = true;
+          if (a.status !== 'unknown') return { resumed };
+          // The thread may finish while its subscription is being restored.
+          // Use the resume response before deciding whether to bind a live turn.
+          status = response?.thread?.status?.type;
+        }
+        if (['idle', 'notLoaded'].includes(status)) {
+          if (status === 'notLoaded') a.loaded = false;
+          a.status = 'interrupted'; a.activity = 'outcome_reconciled'; a.turnId = null;
+          a.error = null; a.terminalEmitted = true; a.interrupted = true;
+          this.publish(a, 'interrupted', { reason: 'outcome_reconciled', native_status: status });
+        } else if (status === 'active') {
+          // Read a single turn with no item history. An active thread alone is
+          // insufficient to infer which turn may safely be steered/interrupted.
+          const page = await this.rpc('thread/turns/list', { threadId: a.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+          if (a.status !== 'unknown') return { resumed };
+          const turn = page?.data?.[0];
+          if (nonempty(turn?.id) && turn.status === 'inProgress') {
+            a.turnId = turn.id; a.lastTurnId = turn.id; a.status = a.pending.length ? 'waiting' : 'running';
+            a.activity = a.pending.length ? 'waiting for parent' : 'working'; a.error = null; a.terminalEmitted = false;
+          } else a.error = { ...a.error, reconciliation_status: 'active thread has no confirmed inProgress turn' };
+        } else a.error = { ...a.error, reconciliation_status: status ?? 'missing thread status' };
+      } catch (error) {
+        if (a.status === 'unknown') a.error = { ...a.error, reconciliation_error: error.message };
+        else throw error;
+      }
+      await this.persist();
+      return { resumed };
+    };
+    a.reconciling = reconcile();
+    try { return await a.reconciling; }
+    finally { a.reconciling = null; }
+  }
+
+  unknownError(a) {
+    return new Error(`Previous turn/start outcome is unknown; native metadata could not confirm a safe operation (${a.error?.reconciliation_error ?? a.error?.reconciliation_status ?? 'unconfirmed thread'}). Inspect thread ${a.threadId} in Codex before retrying.`);
+  }
+
   async send(a, message, followup) {
     if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    const reconciliation = await this.reconcileUnknown(a);
+    if (a.status === 'unknown') throw this.unknownError(a);
     if (a.removing) throw new Error('Agent is closing.');
     if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
     if (ACTIVE.has(a.status)) {
@@ -199,7 +316,7 @@ export class AgentController extends EventEmitter {
     if (a.resuming) throw new Error('Agent followup is already starting.');
     a.resuming = true;
     try {
-      if (followup || !a.loaded) await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true });
+      if ((followup && !reconciliation?.resumed) || !a.loaded) await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true });
       a.loaded = true;
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
@@ -212,6 +329,7 @@ export class AgentController extends EventEmitter {
   }
 
   canClose(a) {
+    if (a.status === 'unknown') throw new Error('Agent turn/start outcome is unknown; reconcile the native Codex thread before closing ownership.');
     if (!TERMINAL.has(a.status) || a.turnId || a.pending.length || a.spawning || a.resuming || a.startingTurn || a.sending || a.recovery) {
       throw new Error('Agent must be idle and terminal with no pending requests or operations before closing.');
     }
@@ -221,6 +339,8 @@ export class AgentController extends EventEmitter {
   }
 
   async closeAgent(a) {
+    await this.reconcileUnknown(a);
+    if (a.status === 'unknown') throw this.unknownError(a);
     if (a.removing) throw new Error('Agent is already closing.');
     this.canClose(a);
     a.removing = true;
@@ -250,6 +370,8 @@ export class AgentController extends EventEmitter {
   }
 
   async interrupt(a) {
+    await this.reconcileUnknown(a);
+    if (a.status === 'unknown') throw this.unknownError(a);
     a.interrupted = true;
     if (!ACTIVE.has(a.status)) return { agent_id: a.id, status: 'not_running' };
     if (a.turnId) await this.requestInterrupt(a);
@@ -264,6 +386,14 @@ export class AgentController extends EventEmitter {
     a.interruptSentTurn = turnId;
     try { await this.rpc('turn/interrupt', { threadId: a.threadId, turnId }); }
     catch (error) { if (a.interruptSentTurn === turnId) a.interruptSentTurn = null; throw error; }
+  }
+
+  interruptUnconfirmed(a, error) {
+    if (this.closed || this.closing || !a.turnId) return;
+    if (a.status === 'interrupted') a.status = 'unknown';
+    a.activity = 'interrupt not confirmed';
+    a.error = { code: 'interrupt_unconfirmed', message: error.message, turn_id: a.turnId };
+    this.publish(a, 'message', { code: 'interrupt_unconfirmed', message: 'Interruption was not confirmed. This agent may still be running; retry interrupt_agent for this agent.' });
   }
 
   threadId(params = {}) { return params.threadId ?? params.thread?.id; }
@@ -292,7 +422,8 @@ export class AgentController extends EventEmitter {
       if (a.status === 'waiting') a.status = 'running';
       a.activity = ACTIVE.has(a.status) ? 'working' : a.status;
     }
-    this.persist().catch((error) => this.emit('controllerError', error));
+    this.pruneRequestEvents(a);
+    this.persist().catch(() => {});
   }
 
   observe(message) {
@@ -312,21 +443,40 @@ export class AgentController extends EventEmitter {
       if (this.starting && this.important(message)) this.early.push({ message: copy(message) });
       return;
     }
+    if (a.startingTurn && ['turn/started', 'turn/completed', 'item/started', 'item/completed', 'error', 'serverRequest/resolved'].includes(message.method)) {
+      const buffered = copy(message);
+      if (buffered.params.item && buffered.params.item.type !== 'agentMessage') buffered.params.item = { id: p.item.id, type: p.item.type };
+      a.startEvents.push({ message: buffered });
+      return;
+    }
     switch (message.method) {
       case 'turn/started':
         if (a.completedTurns.has(p.turn.id)) return;
+        if (a.terminalEmitted && a.lastTurnId === p.turn.id) return;
+        if (a.turnId && a.turnId !== p.turn.id) return;
+        if (a.terminalEmitted && a.status !== 'unknown') {
+          if (a.interrupted) {
+            a.turnId = p.turn.id;
+            this.requestInterrupt(a).catch((error) => this.interruptUnconfirmed(a, error));
+          }
+          return;
+        }
         a.turnId = p.turn.id;
+        a.lastTurnId = p.turn.id;
+        if (a.status === 'unknown') { a.terminalEmitted = false; a.error = null; a.status = 'running'; }
         if (!a.recovery && !a.terminalEmitted) { a.status = a.pending.length ? 'waiting' : 'running'; a.activity = a.pending.length ? 'waiting for parent' : 'working'; }
-        if (a.interrupted) this.requestInterrupt(a).catch((error) => this.emit('controllerError', error));
+        if (a.interrupted) this.requestInterrupt(a).catch((error) => this.interruptUnconfirmed(a, error));
         break;
       case 'thread/tokenUsage/updated': a.tokenUsage = copy(p.tokenUsage); break;
       case 'error':
+        if (a.terminalEmitted || (p.turnId && (a.completedTurns.has(p.turnId) || a.turnId && a.turnId !== p.turnId))) return;
         if (isOverflow(p.error)) a.overflow = true;
         a.lastError = p.error ? { message: p.error.message, codexErrorInfo: p.error.codexErrorInfo } : null;
         break;
       case 'item/started': case 'item/completed': {
         if (a.terminalEmitted) return;
         const item = p.item ?? {};
+        if (p.turnId && a.completedTurns.has(p.turnId)) return;
         if (a.turnId && p.turnId && a.turnId !== p.turnId) return;
         if (item.type === 'agentMessage' && message.method === 'item/completed') {
           if (['final_answer', 'finalAnswer'].includes(item.phase)) a.result = item.text;
@@ -346,12 +496,13 @@ export class AgentController extends EventEmitter {
       case 'thread/compacted': if (a.recovery) a.recovery.compacted = true; break;
       case 'serverRequest/resolved':
         a.pending = a.pending.filter((r) => r.wireId !== p.requestId);
+        this.pruneRequestEvents(a);
         if (!a.pending.length && a.status === 'waiting') a.status = 'running';
         break;
       case 'turn/completed': this.turnCompleted(a, p.turn); break;
       default: return;
     }
-    this.persist().catch((error) => this.emit('controllerError', error));
+    this.persist().catch(() => {});
   }
 
   important(message) {
@@ -361,9 +512,14 @@ export class AgentController extends EventEmitter {
 
   turnCompleted(a, turn) {
     if (!turn?.id || a.completedTurns.has(turn.id)) return;
+    if (a.terminalEmitted) {
+      if (a.turnId === turn.id) { a.turnId = null; a.lastTurnId = turn.id; }
+      return;
+    }
     if (a.turnId && a.turnId !== turn.id) return;
-    a.completedTurns.add(turn.id); a.turnId = null;
+    a.completedTurns.add(turn.id); a.lastTurnId = turn.id; a.turnId = null;
     a.pending = a.pending.filter((request) => request.params.threadId !== a.threadId || request.params.turnId !== turn.id);
+    this.pruneRequestEvents(a);
     if (this.closing || a.interrupted || turn.status === 'interrupted') { a.recovery = null; this.finish(a, 'interrupted', {}); return; }
     if (a.recovery) {
       if (turn.status !== 'completed' || !a.recovery.compacted) {
@@ -371,7 +527,9 @@ export class AgentController extends EventEmitter {
         this.finish(a, 'failed', { message: turn.error?.message ?? 'Context compaction did not complete.' });
       } else {
         a.recovery = null;
-        this.startTurn(a, CONTINUE).catch((error) => { if (!this.closing && ACTIVE.has(a.status)) this.finish(a, 'failed', { message: error.message }); });
+        // startTurn already records this agent's failed/unknown outcome. A
+        // rejected continuation must not terminate unrelated agents or helper.
+        this.startTurn(a, CONTINUE).catch(() => {});
       }
       return;
     }
@@ -394,8 +552,14 @@ export class AgentController extends EventEmitter {
     // Descendants can outlive the root turn. Their wire IDs remain answerable
     // until their own turn ends, the server resolves them, or the controller closes.
     a.pending = a.pending.filter((request) => request.params.threadId !== a.threadId);
-    if (kind === 'failed') a.error = details;
+    this.pruneRequestEvents(a);
+    if (kind === 'failed' || kind === 'unknown') a.error = details;
     this.publish(a, kind, details);
+  }
+
+  pruneRequestEvents(a) {
+    this.pendingEvents = this.pendingEvents.filter((event) => event.agent_id !== a.id || !['question', 'approval'].includes(event.kind)
+      || a.pending.some((request) => request.id === event.request_id && request.params.threadId === (event.source_thread_id ?? a.threadId)));
   }
 
   async serverRequest(message) {
@@ -409,7 +573,9 @@ export class AgentController extends EventEmitter {
       if (this.starting) { this.early.push({ request: true, message: copy(message) }); return; }
       await this.client.reject(message.id, -32601, 'Thread is not owned by this controller.'); return;
     }
+    if (direct && a.startingTurn) { a.startEvents.push({ request: true, message: copy(message) }); return; }
     const activeTurnId = direct ? a.turnId : this.descendantTurns.get(sourceId);
+    if (!direct && !activeTurnId) { await this.client.reject(message.id, -32602, 'Descendant has no active turn.'); return; }
     if (activeTurnId && p.turnId && p.turnId !== activeTurnId) { await this.client.reject(message.id, -32602, 'Stale agent turn.'); return; }
     if (direct && a.terminalEmitted) { await this.client.reject(message.id, -32602, 'Agent has no active turn.'); return; }
     if (message.method === 'item/tool/call' && p.tool === 'notify_parent') {
@@ -447,6 +613,7 @@ export class AgentController extends EventEmitter {
     try { await this.client.respond(pending.wireId, result); }
     catch (error) { pending.responding = false; throw error; }
     a.pending = a.pending.filter((r) => r !== pending);
+    this.pruneRequestEvents(a);
     if (!a.pending.length) {
       if (a.status === 'waiting') a.status = 'running';
       a.activity = ACTIVE.has(a.status) ? 'working' : a.status;
@@ -469,28 +636,43 @@ export class AgentController extends EventEmitter {
   }
 
   publish(a, kind, details) {
-    const event = { seq: this.nextSeq++, agent_id: a.id, kind, ...details };
+    const event = { seq: this.nextSeq++, agent_id: a.id, name: a.name ?? null, turn_id: details.turnId ?? a.turnId ?? a.lastTurnId ?? null, kind, ...details };
     this.pendingEvents.push(event);
     // Keep every important event until a future explicit retention policy exists.
     // No tool output, thinking, or input prompt enters this durable journal.
-    this.persist().then(() => { if (this.agents.has(a.id)) this.emit('event', copy(event)); }).catch((error) => this.emit('controllerError', error));
+    this.persist().then(() => {
+      if (this.agents.has(a.id) && this.pendingEvents.some((pending) => pending.seq === event.seq)) this.emit('event', copy(event));
+    }).catch(() => {});
   }
 
   persist() {
     if (!this.statePath) return Promise.resolve();
-    const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
+    if (this.persistScheduled) return this.persistScheduled;
+    // Snapshot once per microtask batch, then serialize disk writes. All callers
+    // await the batch containing their mutation; failed writes still reject them.
+    const write = this.persistTail.then(() => {
+      this.persistScheduled = null;
+      const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
       id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, status: a.status,
       activity: a.activity, turnId: a.turnId, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
       snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed,
     })) };
-    const write = this.persistTail.then(async () => {
+      return (async () => {
       await mkdir(path.dirname(this.statePath), { recursive: true });
       const temp = `${this.statePath}.tmp`;
       await writeFile(temp, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
       await rename(temp, this.statePath);
+      })();
     });
-    this.persistTail = write.catch(() => {});
-    return write;
+    const durable = write.catch((error) => {
+      // One failure notification per actual write batch, regardless of how many
+      // callers share it. ACK/removal mutations must fail closed just like events.
+      this.emit('controllerError', error);
+      throw error;
+    });
+    this.persistScheduled = durable;
+    this.persistTail = durable.catch(() => {});
+    return durable;
   }
 
   disconnected() {
@@ -498,6 +680,7 @@ export class AgentController extends EventEmitter {
     this.closed = true; this.resolveClosed();
     for (const a of this.agents.values()) {
       a.pending = [];
+      this.pruneRequestEvents(a);
       if (ACTIVE.has(a.status)) this.finish(a, 'failed', { message: 'App-server connection closed.' });
     }
   }
@@ -535,6 +718,7 @@ export class AgentController extends EventEmitter {
       this.closed = true; this.resolveClosed();
       for (const a of this.agents.values()) {
         a.pending = [];
+        this.pruneRequestEvents(a);
         if (ACTIVE.has(a.status)) this.finish(a, 'interrupted', { reason: 'controller_closed' });
       }
     }
@@ -542,14 +726,14 @@ export class AgentController extends EventEmitter {
     this.client.off('request', this.onRequest);
     this.client.off('closed', this.onClosed);
     this.descendantTurns.clear();
-    await this.persistTail;
+    await this.persist();
   }
 }
 
 function replyFormat(method, params) {
   if (method === 'item/tool/requestUserInput') return { answers: Object.fromEntries(params.questions.map((question) => [question.id, { answers: ['<text>'] }])) };
   if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
-    return { decision: params.availableDecisions?.length ? '<one value from availableDecisions>' : 'accept|acceptForSession|decline|cancel' };
+    return { decision: Array.isArray(params.availableDecisions) ? '<one value from availableDecisions>' : 'accept|acceptForSession|decline|cancel' };
   }
   if (method === 'item/permissions/requestApproval') return { permissions: '<granted subset of requested permissions>', scope: 'turn|session' };
   if (method === 'mcpServer/elicitation/request') return { action: 'accept|decline|cancel', content: '<form data or null>', _meta: null };
@@ -576,6 +760,9 @@ function validateAnswer({ method, params }, answer) {
         || (object(network) && nonempty(network.host) && ['allow', 'deny'].includes(network.action)));
     }
     if (!valid) throw new TypeError('Invalid approval decision.');
+    if (Array.isArray(params.availableDecisions) && !params.availableDecisions.some((allowed) => isDeepStrictEqual(allowed, decision))) {
+      throw new TypeError('Approval decision is not in availableDecisions.');
+    }
     return { decision: copy(decision) };
   }
   if (method === 'item/permissions/requestApproval') {

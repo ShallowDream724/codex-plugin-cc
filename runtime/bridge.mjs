@@ -1,128 +1,208 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { mkdir, rm, rmdir, stat } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFile, readdir, rm } from 'node:fs/promises';
+import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { performance } from 'node:perf_hooks';
 import { AppServerClient } from './appserver-client.mjs';
 import { AgentController } from './agents.mjs';
 import { createBroker } from './broker.mjs';
-import { ownerDirectory, ensureDirectory, readJson, writeJson } from './storage.mjs';
+import { DiskReceipts } from './receipts.mjs';
+import { DeliveryStore } from './delivery.mjs';
+import { ownerDirectory, ensureDirectory, readJson, writeJson, acquireOwnedLock } from './storage.mjs';
 
 const entry = fileURLToPath(import.meta.url);
 const sleep = ms => new Promise(done => setTimeout(done, ms));
-const removeLock = path => rmdir(path).catch(error => { if (error.code !== 'ENOENT') throw error; });
+const PROTOCOL = 2;
+let signaturePromise;
+export function runtimeSignature() {
+  return signaturePromise ||= (async () => {
+    const runtime = dirname(entry);
+    const pkg = JSON.parse(await readFile(join(runtime, '..', 'package.json'), 'utf8'));
+    const hash = createHash('sha256');
+    for (const name of (await readdir(runtime)).filter(name => name.endsWith('.mjs')).sort()) {
+      hash.update(name).update(await readFile(join(runtime, name)));
+    }
+    return { protocol: PROTOCOL, version: pkg.version, build: hash.digest('hex') };
+  })();
+}
 
-async function call(endpoint, body, timeout = 35000) {
+export async function call(endpoint, body, timeout = 35000) {
   const response = await fetch(`http://127.0.0.1:${endpoint.port}/`, {
     method: 'POST', headers: { authorization: 'Bearer ' + endpoint.token, 'content-type': 'application/json' },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(timeout),
+    body: JSON.stringify({ ...body, protocolVersion: PROTOCOL }), signal: AbortSignal.timeout(timeout),
   });
   const result = await response.json();
   if (!response.ok && !result.error) throw new Error('Local bridge refused the request.');
   return result;
 }
 
-async function alive(path) {
+async function probe(path) {
   const endpoint = await readJson(path, null);
   if (!endpoint) return null;
-  try { const result = await call(endpoint, { operation: 'health' }, 1500); return result.ready ? endpoint : null; }
+  try { return { endpoint, health: await call(endpoint, { operation: 'health' }, 1500) }; }
   catch { return null; }
 }
 
-async function ensureBroker(owner, cwd) {
-  const dir = ownerDirectory(owner);
-  await ensureDirectory(dir);
-  const endpointPath = join(dir, 'endpoint.json');
-  const existing = await alive(endpointPath);
-  if (existing) return existing;
-  const lockPath = join(dir, 'starting');
-  let locked = false;
-  try { await mkdir(lockPath); locked = true; }
-  catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    // A crashed starter leaves an empty directory. Never recursively delete it.
-    const info = await stat(lockPath).catch(() => null);
-    if (info && Date.now() - info.mtimeMs > 60000) {
-      await removeLock(lockPath);
-      try { await mkdir(lockPath); locked = true; }
-      catch (retryError) { if (retryError.code !== 'EEXIST') throw retryError; }
-    }
+function compatible(probed, signature) {
+  if (!probed) return null;
+  const metadata = probed.health;
+  if (metadata.protocol !== signature.protocol || metadata.version !== signature.version || metadata.build !== signature.build) {
+    const error = new Error('This session has a helper from a different plugin build. Let its active tasks finish, then shut down or restart the session helper before retrying.');
+    error.code = 'helper_restart_required';
+    throw error;
   }
-  if (locked) {
-    // This detached helper is scoped to this Claude session and stops when its lease expires.
-    const child = spawn(process.execPath, [entry, 'serve', owner], { cwd, detached: true, windowsHide: true, stdio: 'ignore', env: process.env });
-    child.on('error', () => {});
-    child.unref();
-  }
-  const startedAt = Date.now();
-  const deadline = startedAt + 40000;
-  while (Date.now() < deadline) {
-    await sleep(150);
-    const endpoint = await alive(endpointPath);
-    if (endpoint) return endpoint;
-    const failure = await readJson(join(dir, 'startup-error.json'), null);
-    if (failure && failure.at > startedAt) throw new Error(failure.message);
-  }
-  // Only the starter removes its own lock. A later caller may start again after this bounded failure.
-  if (locked) await removeLock(lockPath);
-  throw new Error('Codex bridge did not start. Check that Node and Codex CLI are available.');
+  return metadata.ready ? probed.endpoint : null;
 }
 
-async function serve(owner) {
-  const dir = ownerDirectory(owner);
-  await ensureDirectory(dir);
-  let lastActivity = Date.now(), shuttingDown = false;
-  let server, controller, client, lease;
-  const endpointPath = join(dir, 'endpoint.json');
-  const shutdown = async () => {
-    if (shuttingDown) return;
+export async function ensureBroker(owner, cwd, { directory = ownerDirectory(owner), signature, spawnHelper, timeoutMs = 40000, pollMs = 150 } = {}) {
+  signature ||= await runtimeSignature();
+  await ensureDirectory(directory);
+  const endpointPath = join(directory, 'endpoint.json');
+  const existing = compatible(await probe(endpointPath), signature);
+  if (existing) return existing;
+  const startedAt = Date.now();
+  const deadline = performance.now() + timeoutMs;
+  let starter;
+  try {
+    while (performance.now() < deadline) {
+      // The starter lock serializes launch requests; the helper's service lock
+      // independently prevents duplicate Codex processes if a starter crashes.
+      starter ||= await acquireOwnedLock(join(directory, 'starting'));
+      if (starter) {
+        const rechecked = compatible(await probe(endpointPath), signature);
+        if (rechecked) return rechecked;
+        if (spawnHelper) await spawnHelper();
+        else {
+          const child = spawn(process.execPath, [entry, 'serve', owner], {
+            cwd, detached: true, windowsHide: true, stdio: 'ignore', env: process.env,
+          });
+          child.on('error', () => {});
+          child.unref();
+        }
+        // A timeout cannot release another starter or the service lock.
+        while (performance.now() < deadline) {
+          const endpoint = compatible(await probe(endpointPath), signature);
+          if (endpoint) return endpoint;
+          const failure = await readJson(join(directory, 'startup-error.json'), null);
+          if (failure && failure.at >= startedAt) throw new Error(failure.message);
+          await sleep(pollMs);
+        }
+        break;
+      }
+      const endpoint = compatible(await probe(endpointPath), signature);
+      if (endpoint) return endpoint;
+      await sleep(pollMs);
+    }
+    throw new Error('Codex bridge did not start. Check that Node and Codex CLI are available.');
+  } finally { await starter?.release(); }
+}
+
+/** A monotonic idle lease grants a fresh interval after a long scheduler pause. */
+export function createIdleLease({ now = () => performance.now(), idleMs = 90000, tickMs = 10000, resumeGraceMs = 30000 } = {}) {
+  let lastActivity = now(), lastTick = lastActivity, resumeUntil = 0;
+  return {
+    touch() { lastActivity = now(); },
+    expired() {
+      const current = now();
+      if (current - lastTick > Math.max(tickMs * 3, resumeGraceMs)) resumeUntil = current + resumeGraceMs;
+      lastTick = current;
+      return current >= resumeUntil && current - lastActivity > idleMs;
+    },
+  };
+}
+
+export async function serve(owner, { directory = ownerDirectory(owner), clientFactory, controllerFactory,
+  brokerFactory = createBroker, signature, exit = code => { process.exitCode = code; } } = {}) {
+  await ensureDirectory(directory);
+  const ownership = await acquireOwnedLock(join(directory, 'service'));
+  if (!ownership) return null;
+  let shuttingDown = false, shutdownPromise, server, controller, client, lease, listening = false;
+  let finishStartup;
+  const startupFinished = new Promise(done => { finishStartup = done; });
+  const endpointPath = join(directory, 'endpoint.json');
+  const token = randomBytes(32).toString('hex');
+  const idle = createIdleLease();
+  const ready = () => !shuttingDown && listening && client?.ready === true && !controller?.closed && !controller?.closing;
+  const assertConnected = () => { if (shuttingDown || !client?.ready) throw new Error('App-server closed during helper initialization.'); };
+  const shutdown = () => {
+    if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     clearInterval(lease);
     server?.close();
-    await controller?.close();
-    await client?.close();
-    const existing = await readJson(endpointPath, null);
-    if (existing?.pid === process.pid) await rm(endpointPath, { force: true });
-    setTimeout(() => process.exit(0), 30).unref();
+    shutdownPromise = (async () => {
+      // Keep service ownership until initialization stops publishing state.
+      await startupFinished;
+      server?.close();
+      try { await controller?.close(); }
+      finally {
+        try { await client?.close(); }
+        finally {
+          server?.closeAllConnections?.();
+          await server?.drain?.();
+          const existing = await readJson(endpointPath, null);
+          if (existing?.token === token) await rm(endpointPath, { force: true });
+          await ownership.release();
+          process.off('SIGTERM', onSignal);
+          process.off('SIGINT', onSignal);
+        }
+      }
+    })();
+    return shutdownPromise;
   };
+  const onSignal = () => { void shutdown().catch(() => exit(1)); };
+  process.on('SIGTERM', onSignal);
+  process.on('SIGINT', onSignal);
+  let failure;
   try {
-    client = new AppServerClient({ command: process.env.CODEX_SUBAGENTS_CODEX_COMMAND || 'codex', cwd: process.cwd() });
+    signature ||= await runtimeSignature();
+    client = clientFactory ? clientFactory() : new AppServerClient({ command: process.env.CODEX_SUBAGENTS_CODEX_COMMAND || 'codex', cwd: process.cwd() });
+    // Register before start: transport closure can happen in any await gap.
+    client.on('closed', () => { if (!shuttingDown) void shutdown().catch(() => exit(1)); });
     await client.start();
-    controller = new AgentController({ client, statePath: join(dir, 'agents.json') });
-    await controller.init();
+    assertConnected();
+    controller = controllerFactory ? controllerFactory(client) : new AgentController({ client, statePath: join(directory, 'agents.json') });
     controller.on('controllerError', error => {
-      writeJson(join(dir, 'startup-error.json'), { at: Date.now(), message: `Agent state could not be saved: ${error.message}` })
-        .finally(() => shutdown()).catch(() => process.exit(1));
+      void writeJson(join(directory, 'startup-error.json'), { at: Date.now(), message: `Agent state could not be saved: ${error.message}` })
+        .finally(() => shutdown()).catch(() => exit(1));
     });
-    const token = randomBytes(32).toString('hex');
-    server = createBroker({ controller, token, receipts: await readJson(join(dir, 'receipts.json'), {}),
-      saveReceipts: value => writeJson(join(dir, 'receipts.json'), value),
-      onActivity: () => { lastActivity = Date.now(); }, onShutdown: shutdown });
+    await controller.init();
+    assertConnected();
+    const receiptStore = await DiskReceipts.open(join(directory, 'receipts'), { legacyPath: join(directory, 'receipts.json') });
+    const deliveryStore = await DeliveryStore.open({ directory: join(directory, 'deliveries'), controller });
+    assertConnected();
+    server = brokerFactory({ controller, token, receiptStore, deliveryStore, requiredProtocol: PROTOCOL,
+      getHealth: () => ({ ready: ready(), ...signature,
+        active: controller.hasActiveWork?.() ?? [...(controller.agents?.values() || [])].some(agent => ['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown'].includes(agent.status)) }),
+      onActivity: () => { idle.touch(); }, onShutdown: shutdown });
     await new Promise((done, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', done); });
-    await writeJson(endpointPath, { port: server.address().port, token, pid: process.pid, version: 1 });
-    await removeLock(join(dir, 'starting'));
-    lease = setInterval(() => { if (Date.now() - lastActivity > 90000) shutdown().catch(() => process.exit(1)); }, 10000);
-    client.on('closed', () => { if (!shuttingDown) shutdown().catch(() => process.exit(1)); });
-    process.on('SIGTERM', () => shutdown());
-    process.on('SIGINT', () => shutdown());
+    listening = true;
+    assertConnected();
+    await writeJson(endpointPath, { port: server.address().port, token, pid: process.pid, ...signature });
+    assertConnected();
+    lease = setInterval(() => { if (idle.expired()) void shutdown().catch(() => exit(1)); }, 10000);
   } catch (error) {
-    await writeJson(join(dir, 'startup-error.json'), { at: Date.now(), message: error.message });
-    await removeLock(join(dir, 'starting'));
+    failure = error;
+    await writeJson(join(directory, 'startup-error.json'), { at: Date.now(), message: error.message }).catch(() => {});
+  } finally { finishStartup(); }
+  if (failure || shuttingDown) {
     await shutdown();
-    process.exitCode = 1;
+    if (failure) exit(1);
+    return null;
   }
+  return { shutdown, ready, endpoint: await readJson(endpointPath, null) };
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  if (argv[0] === 'serve') return serve(argv[1]);
+  if (argv[0] === 'serve') { await serve(argv[1]); return; }
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
   const body = JSON.parse(input);
   const dir = ownerDirectory(body.owner);
-  // Observation after a host restart must not restart a stopped worker without a tool call.
-  let endpoint = await alive(join(dir, 'endpoint.json'));
-  if (!endpoint && ['observe', 'ack', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
+  const existing = await probe(join(dir, 'endpoint.json'));
+  let endpoint = body.operation === 'shutdown' ? existing?.endpoint : compatible(existing, await runtimeSignature());
+  if (!endpoint && ['observe', 'ack', 'confirm', 'release', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
   endpoint ||= await ensureBroker(body.owner, body.cwd || process.cwd());
   try { return await call(endpoint, body, body.operation === 'wait' ? 35000 : 150000); }
   catch (error) {

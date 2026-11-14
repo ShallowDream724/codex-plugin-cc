@@ -4,11 +4,12 @@ import { EventEmitter } from 'node:events';
 import { createBroker } from '../runtime/broker.mjs';
 
 class FakeController extends EventEmitter {
-  constructor() { super(); this.events = []; this.calls = []; this.acks = []; this.status = 'running'; }
+  constructor() { super(); this.events = []; this.calls = []; this.acks = []; this.status = 'running'; this.nextSeq = 1; }
   async dispatch(op, args) { this.calls.push({ op, args }); return op === 'list_agents' ? { agents: [{ agent_id: 'a', status: this.status }] } : { agent_id: 'a', accepted: true }; }
   eventsAfter(cursor) { return this.events.filter(e => e.seq > cursor); }
   async ackEvents(cursor) { this.acks.push(cursor); this.events = this.events.filter(e => e.seq > cursor); }
-  publish(kind = 'completed') { const e = { seq: 1, kind, agent_id: 'a' }; this.events.push(e); this.emit('event', e); }
+  async ackSequences(sequences) { this.acks.push(sequences); this.events = this.events.filter(e => !sequences.includes(e.seq)); }
+  publish(kind = 'completed') { const e = { seq: this.nextSeq++, kind, agent_id: 'a' }; this.events.push(e); this.emit('event', e); }
 }
 
 async function setup(t, options = {}) {
@@ -21,7 +22,7 @@ async function setup(t, options = {}) {
     const response = await fetch(url, { method: 'POST', headers: { authorization: 'Bearer ' + token }, body: JSON.stringify(body), ...extra });
     return { status: response.status, body: await response.json() };
   };
-  return { controller, post, url };
+  return { controller, post, url, server };
 }
 
 test('local transport requires a session secret', async t => {
@@ -78,8 +79,51 @@ test('waiting wakes on an important event and observation cannot steal it', asyn
   assert.deepEqual((await post({ operation: 'observe' })).body.events, []);
   controller.publish('question');
   const result = await waiting;
-  assert.equal(result.body.events[0].kind, 'question'); assert.equal(result.body.cursor, 1);
-  assert.deepEqual(controller.acks, [0]); // Delivery is acked by a later host action, not speculatively.
+  assert.equal(result.body.events[0].kind, 'question'); assert.ok(result.body.delivery_id);
+  assert.deepEqual(controller.acks, []); // Returning a response is not proof that Claude retained it.
+  await post({ operation: 'confirm', args: { observations: [{ delivery_id: result.body.delivery_id, sequences: [1], events: result.body.events }] } });
+  assert.deepEqual(controller.acks, [[1]]);
+});
+
+test('parallel waits return a busy result instead of delivering the same question twice', async t => {
+  const { controller, post } = await setup(t, { waitTimeoutMs: 1000 });
+  const first = post({ operation: 'wait' });
+  await new Promise(done => setTimeout(done, 20));
+  assert.equal((await post({ operation: 'wait' })).body.waiting, true);
+  controller.publish('question');
+  const result = (await first).body;
+  assert.equal(result.events[0].seq, 1);
+  const another = (await post({ operation: 'wait', args: { timeout_ms: 0 } })).body;
+  assert.equal(another.pending, true); assert.equal(another.events, undefined);
+  await post({ operation: 'release', args: { delivery_id: result.delivery_id } });
+  assert.equal((await post({ operation: 'wait' })).body.events[0].seq, 1);
+});
+
+test('queued prompt reserves delivery until confirmation and legacy cursor cannot erase events', async t => {
+  const { controller, post } = await setup(t);
+  controller.publish();
+  const prompt = (await post({ operation: 'observe', args: { deliver: true } })).body;
+  assert.ok(prompt.delivery_id);
+  const waiting = (await post({ operation: 'wait', cursor: 9999, args: { timeout_ms: 0 } })).body;
+  assert.equal(waiting.pending, true); assert.equal(controller.events.length, 1);
+  await post({ operation: 'confirm', args: { delivery_ids: [prompt.delivery_id] } });
+  assert.equal(controller.events.length, 0);
+});
+
+test('restored history is confirmed before a first wait and metadata health reflects the transport', async t => {
+  const { controller, post } = await setup(t, { getHealth: () => ({ ready: false, protocol: 2 }), requiredProtocol: 2 });
+  assert.equal((await post({ operation: 'health' })).body.ready, false);
+  assert.equal((await post({ operation: 'list_agents' })).body.error.code, 'bridge_version_mismatch');
+  controller.publish(); controller.publish();
+  const result = await post({ operation: 'wait', protocolVersion: 2, restore: { legacy_events: [{ seq: 1, agent_id: 'a', kind: 'completed' }] } });
+  assert.deepEqual(result.body.events.map(e => e.seq), [2]);
+});
+
+test('tool-call IDs cannot be reused with different mutation inputs', async t => {
+  const { controller, post } = await setup(t);
+  await post({ operation: 'send_message', requestId: 'same', args: { target: 'a', message: 'first' } });
+  const result = await post({ operation: 'send_message', requestId: 'same', args: { target: 'a', message: 'changed' } });
+  assert.equal(result.body.error.code, 'request_id_conflict'); assert.equal(controller.calls.length, 1);
 });
 
 test('wait timeout is local pending state, not an agent interruption', async t => {
@@ -112,4 +156,25 @@ test('disconnecting a waiter leaves the Codex task running', async t => {
   await assert.rejects(pending);
   assert.equal(controller.status, 'running');
   assert.equal(controller.calls.filter(c => c.op === 'interrupt_agent').length, 0);
+});
+
+test('shutdown releases local waiters but drains accepted disconnected mutations before releasing ownership', async t => {
+  const { post, controller, server } = await setup(t, { waitTimeoutMs: 10000 });
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  controller.dispatch = async op => {
+    if (op === 'list_agents') return { agents: [{ agent_id: 'a', status: 'running' }] };
+    entered(); await new Promise(resolve => { release = resolve; }); return { accepted: true };
+  };
+  const abort = new AbortController();
+  const action = post({ operation: 'send_message', requestId: 'slow', args: {} }, { signal: abort.signal }).catch(() => {});
+  await started;
+  const waiting = post({ operation: 'wait' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  abort.abort(); server.close();
+  assert.equal((await waiting).body.cancelled, true);
+  let drained = false;
+  const drain = server.drain().then(() => { drained = true; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(drained, false);
+  release(); await action; await drain; assert.equal(drained, true);
 });

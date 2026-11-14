@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentController } from '../runtime/agents.mjs';
@@ -39,6 +39,18 @@ async function setup(t, options = {}) {
   return { client, controller, spawn: (args = {}) => controller.dispatch('spawn_agent', { message: 'Solve task', cwd: '/workspace', context_mode: 'none', ...args }) };
 }
 const pendingQuestion = (threadId = 'thread-1', turnId = 'turn-1') => ({ threadId, turnId, itemId: 'q-item', questions: [{ id: 'choice', header: 'Choose', question: 'Which?' }], isBlocking: true });
+
+test('an asynchronous interruption rejection stays local to its agent', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const first = await spawn(), second = await spawn();
+  const errors = []; controller.on('controllerError', error => errors.push(error));
+  controller.find(first.id).interrupted = true;
+  client.handler = method => { if (method === 'turn/interrupt') throw Object.assign(new Error('interrupt rejected'), { code: -32000 }); };
+  client.note('turn/started', { threadId: first.thread_id, turn: { id: first.turn_id } });
+  await tick();
+  assert.equal(errors.length, 0); assert.equal(controller.find(second.id).status, 'running');
+  assert.ok(controller.eventsAfter(0).some(event => event.agent_id === first.id && event.code === 'interrupt_unconfirmed'));
+});
 
 test('default available context returns preview once without retaining private history or preview', async (t) => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
@@ -115,7 +127,7 @@ test('completed final messages and requests before RPC replies are not lost', as
   };
   const agent = await spawn(); await tick();
   assert.equal(agent.status, 'completed');
-  assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'question').length, 1);
+  assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'question').length, 0);
   assert.deepEqual(controller.eventsAfter(0).filter((e) => e.kind === 'completed').map((e) => e.result), ['Done early']);
   client.complete(); assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'completed').length, 1);
 });
@@ -177,9 +189,11 @@ test('all approval families require explicit valid protocol response', async (t)
     await controller.dispatch('answer_agent', { target: agent.id, request_id: index, answer });
     assert.deepEqual(client.replies.at(-1).result, answer);
   }
-  assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'approval').length, 4);
+  assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'approval').length, 0);
   client.ask('limited', 'item/commandExecution/requestApproval', { threadId: 'thread-1', turnId: 'turn-1', availableDecisions: ['decline', 'cancel'] });
   assert.deepEqual(controller.eventsAfter(0).at(-1).reply_format, { decision: '<one value from availableDecisions>' });
+  await assert.rejects(controller.dispatch('answer_agent', { target: agent.id, request_id: 'limited', answer: { decision: 'accept' } }), /availableDecisions/);
+  await controller.dispatch('answer_agent', { target: agent.id, request_id: 'limited', answer: { decision: 'decline' } });
 });
 
 test('answers are isolated to their owning agent', async (t) => {
@@ -611,4 +625,328 @@ test('native interruption failures do not prevent shutdown and already closed tr
   const other = await setup(t); await other.spawn(); other.client.emit('closed');
   await other.controller.close();
   assert.equal(other.client.calls.filter((call) => call.method === 'turn/interrupt').length, 0);
+});
+
+test('followup start rejection is terminal while ambiguous starts require reconciliation', async (t) => {
+  for (const rpcRejected of [true, false]) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+    client.handler = (method) => {
+      if (method === 'turn/start') throw Object.assign(new Error(rpcRejected ? 'server rejected start' : 'reply timed out'), { code: rpcRejected ? -32602 : 'ETIMEDOUT' });
+    };
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'next' }), /rejected|timed out/);
+    const current = controller.snapshot().agents[0];
+    assert.equal(current.status, rpcRejected ? 'failed' : 'unknown');
+    assert.equal(current.turn_id, null);
+    assert.equal(current.error.reason, rpcRejected ? 'turn_start_rejected' : 'turn_start_outcome_unknown');
+    if (!rpcRejected) {
+      assert.match(current.error.recovery, /native Codex thread thread-1/);
+      const count = client.calls.filter((call) => call.method === 'turn/start').length;
+      await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'duplicate' }), /outcome is unknown/);
+      await assert.rejects(controller.dispatch('send_message', { target: agent.id, message: 'duplicate' }), /outcome is unknown/);
+      await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /outcome is unknown/);
+      assert.equal(client.calls.filter((call) => call.method === 'turn/start').length, count);
+      assert.equal(client.calls.filter((call) => call.method === 'thread/read').length, 3);
+      client.note('turn/started', { threadId: 'thread-1', turn: { id: 'late-start' } });
+      assert.equal(controller.snapshot().agents[0].status, 'running');
+      client.complete('thread-1', 'late-start');
+      assert.equal(controller.snapshot().agents[0].status, 'completed');
+    }
+  }
+});
+
+test('observed starts and completions remain authoritative if the turn/start reply fails', async (t) => {
+  for (const complete of [false, true]) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+    client.handler = (method) => {
+      if (method !== 'turn/start') return;
+      client.note('turn/started', { threadId: 'thread-1', turn: { id: 'observed' } });
+      if (complete) client.complete('thread-1', 'observed');
+      throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' });
+    };
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'next' }), /lost reply/);
+    assert.equal(controller.snapshot().agents[0].status, complete ? 'completed' : 'running');
+    assert.equal(controller.snapshot().agents[0].turn_id, complete ? null : 'observed');
+    assert.equal(client.calls.filter((call) => call.method === 'turn/start').length, 2);
+  }
+});
+
+test('exact acknowledgements are idempotent and retain omitted and other-agent events', async (t) => {
+  const { client, controller, spawn } = await setup(t); const first = await spawn({ name: 'one' }); const second = await spawn({ name: 'two' });
+  client.complete('thread-1', 'turn-1'); client.complete('thread-2', 'turn-2');
+  const [one, two] = controller.eventsAfter(0);
+  assert.equal(one.name, 'one'); assert.equal(one.turn_id, 'turn-1');
+  assert.equal(two.name, 'two'); assert.equal(two.turn_id, 'turn-2');
+  await controller.ackSequences([two.seq, two.seq]);
+  assert.deepEqual(controller.eventsAfter(0).map((event) => event.agent_id), [first.id]);
+  assert.deepEqual(await controller.ackSequences([two.seq]), { acknowledged: [two.seq] });
+  for (const invalid of [[0], [-1], [controller.nextSeq], ['1'], null]) await assert.rejects(controller.ackSequences(invalid), /Invalid event/);
+  controller.pendingEvents.push({ seq: 99, agent_id: 'missing', kind: 'completed' });
+  assert.deepEqual(controller.eventsAfter(0).map((event) => event.agent_id), [first.id]);
+  assert.notEqual(first.id, second.id);
+});
+
+test('answered, resolved and completed requests disappear without removing live descendants', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  client.ask('answer', 'item/tool/requestUserInput', pendingQuestion());
+  await controller.dispatch('answer_agent', { target: agent.id, request_id: 'answer', answer: { answers: { choice: { answers: ['yes'] } } } });
+  assert.deepEqual(controller.eventsAfter(0), []);
+  client.ask('resolve', 'item/tool/requestUserInput', pendingQuestion());
+  client.note('serverRequest/resolved', { threadId: 'thread-1', requestId: 'resolve' });
+  assert.deepEqual(controller.eventsAfter(0), []);
+  client.ask('root', 'item/tool/requestUserInput', pendingQuestion());
+  client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
+  client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  client.ask('child', 'item/tool/requestUserInput', pendingQuestion('child', 'child-turn'));
+  client.complete();
+  assert.deepEqual(controller.eventsAfter(0).map((event) => event.request_id).filter(Boolean), ['child']);
+  client.complete('child', 'child-turn');
+  assert.equal(controller.eventsAfter(0).filter((event) => event.kind === 'question').length, 0);
+  client.ask('late-child', 'item/tool/requestUserInput', pendingQuestion('child', 'child-turn')); await tick();
+  assert.equal(controller.eventsAfter(0).filter((event) => event.kind === 'question').length, 0);
+  assert.equal(client.rejected.at(-1).id, 'late-child');
+});
+
+test('restart discards nonrecoverable requests and orphan journal entries', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath }); await spawn();
+  client.ask('q', 'item/tool/requestUserInput', pendingQuestion());
+  client.ask('a', 'item/fileChange/requestApproval', { threadId: 'thread-1', turnId: 'turn-1' });
+  controller.pendingEvents.push({ seq: controller.nextSeq++, agent_id: 'missing', kind: 'completed' });
+  await controller.persist();
+  const restarted = new AgentController({ client: new MockClient(), statePath }); await restarted.init(); t.after(() => restarted.close());
+  assert.deepEqual(restarted.eventsAfter(0).map((event) => event.kind), ['interrupted']);
+});
+
+test('turn-local deduplication remains bounded and rejects late prior-turn notifications', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  for (let i = 1; i <= 25; i++) {
+    const turnId = `turn-${i}`;
+    client.note('item/started', { threadId: 'thread-1', turnId, item: { id: `compact-${i}`, type: 'contextCompaction' } });
+    client.complete('thread-1', turnId);
+    if (i < 25) await controller.dispatch('followup_task', { target: agent.id, message: 'next' });
+    client.note('turn/started', { threadId: 'thread-1', turn: { id: 'turn-1' } });
+    client.note('item/completed', { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'agentMessage', phase: 'final_answer', text: 'late stale result' } });
+    client.complete('thread-1', 'turn-1');
+    assert.ok(controller.find(agent.id).completedTurns.size <= 1);
+    assert.ok(controller.find(agent.id).compactItems.size <= 1);
+  }
+  assert.equal(controller.snapshot().agents[0].status, 'completed');
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter(0)), /late stale result/);
+});
+
+test('same-batch persistence shares a write and event notification follows durable journal', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath }); await spawn();
+  const first = controller.persist(); const second = controller.persist();
+  assert.equal(first, second); await first;
+  let observed;
+  const emitted = new Promise((resolve) => controller.once('event', (event) => {
+    observed = readFile(statePath, 'utf8').then((text) => JSON.parse(text).pendingEvents.some((saved) => saved.seq === event.seq));
+    resolve();
+  }));
+  client.complete(); await emitted;
+  assert.equal(await observed, true);
+});
+
+test('authoritative start reply filters arbitrarily old events while a new start is pending', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+  await controller.dispatch('followup_task', { target: agent.id, message: 'second' }); client.complete('thread-1', 'turn-2');
+  let release;
+  client.handler = (method) => {
+    if (method === 'turn/start') return new Promise((resolve) => { release = resolve; });
+  };
+  const starting = controller.dispatch('followup_task', { target: agent.id, message: 'third' });
+  await tick();
+  client.note('turn/started', { threadId: 'thread-1', turn: { id: 'turn-1' } });
+  client.note('item/completed', { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'agentMessage', phase: 'final_answer', text: 'stale old final' } });
+  client.ask('old-q', 'item/tool/requestUserInput', pendingQuestion());
+  client.complete();
+  client.note('turn/started', { threadId: 'thread-1', turn: { id: 'turn-3' } });
+  client.ask('new-q', 'item/tool/requestUserInput', pendingQuestion('thread-1', 'turn-3'));
+  release({ turn: { id: 'turn-3' } }); await starting;
+  assert.equal(controller.snapshot().agents[0].turn_id, 'turn-3');
+  assert.equal(controller.snapshot().agents[0].status, 'waiting');
+  assert.deepEqual(controller.snapshot().agents[0].pending_requests.map((request) => request.request_id), ['new-q']);
+  assert.deepEqual(client.rejected.map((request) => request.id), ['old-q']);
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter(0)), /stale old final/);
+});
+
+test('persistence errors reject callers and prevent premature event publication', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const { client, controller, spawn } = await setup(t); await spawn();
+  controller.statePath = dir;
+  const errors = [], events = [];
+  controller.on('controllerError', (error) => errors.push(error)); controller.on('event', (event) => events.push(event));
+  client.complete();
+  await assert.rejects(controller.persist());
+  await tick();
+  assert.ok(errors.length > 0); assert.deepEqual(events, []);
+  controller.statePath = null;
+});
+
+test('active work includes unresolved starts and descendants after root completion', async (t) => {
+  const { client, controller, spawn } = await setup(t);
+  assert.equal(controller.hasActiveWork(), false);
+  const agent = await spawn(); assert.equal(controller.hasActiveWork(), true);
+  client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
+  client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  client.complete(); assert.equal(controller.hasActiveWork(), true);
+  client.ask('child-q', 'item/tool/requestUserInput', pendingQuestion('child', 'child-turn'));
+  assert.equal(controller.hasActiveWork(), true);
+  client.complete('child', 'child-turn'); assert.equal(controller.hasActiveWork(), false);
+  controller.find(agent.id).status = 'unknown'; assert.equal(controller.hasActiveWork(), true);
+});
+
+test('approval allowlists compare structured decisions and reject unoffered amendments', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  const allowed = { applyNetworkPolicyAmendment: { network_policy_amendment: { host: 'example.com', action: 'allow' } } };
+  client.ask('structured', 'item/commandExecution/requestApproval', { threadId: 'thread-1', turnId: 'turn-1', availableDecisions: [allowed] });
+  await assert.rejects(controller.dispatch('answer_agent', { target: agent.id, request_id: 'structured', answer: { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['curl'] } } } }), /availableDecisions/);
+  await controller.dispatch('answer_agent', { target: agent.id, request_id: 'structured', answer: { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { action: 'allow', host: 'example.com' } } } } });
+  assert.deepEqual(client.replies.at(-1).result.decision, allowed);
+});
+
+test('persisted unknown starts reconcile idle metadata before an explicit new followup', async (t) => {
+  for (const nativeStatus of ['idle', 'notLoaded']) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+    const statePath = path.join(dir, 'state.json');
+    const { client, controller, spawn } = await setup(t, { statePath }); const agent = await spawn(); client.complete();
+    client.handler = (method) => { if (method === 'turn/start') throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' }); };
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'ORIGINAL DO NOT REPLAY' }));
+    await controller.close();
+    const restartedClient = new MockClient();
+    restartedClient.turnCount = 10;
+    restartedClient.handler = (method) => { if (method === 'thread/read') return { thread: { id: 'thread-1', status: { type: nativeStatus } } }; };
+    const restarted = new AgentController({ client: restartedClient, statePath }); await restarted.init(); t.after(() => restarted.close());
+    assert.equal(restarted.snapshot().agents[0].status, 'unknown'); assert.equal(restarted.hasActiveWork(), true);
+    const result = await restarted.dispatch('followup_task', { target: agent.id, message: 'EXPLICIT NEW TASK' });
+    assert.equal(result.status, 'running'); assert.equal(result.turn_id, 'turn-11');
+    assert.deepEqual(restartedClient.calls[0], { method: 'thread/read', params: { threadId: 'thread-1', includeTurns: false } });
+    assert.equal(restartedClient.calls.filter((call) => call.method === 'thread/turns/list').length, 0);
+    const starts = restartedClient.calls.filter((call) => call.method === 'turn/start');
+    assert.equal(starts.length, 1); assert.equal(starts[0].params.input[0].text, 'EXPLICIT NEW TASK');
+    assert.equal(restarted.eventsAfter(0).filter((event) => event.reason === 'outcome_reconciled').length, 1);
+  }
+});
+
+test('unknown active starts use one metadata turn and steer or interrupt without another start', async (t) => {
+  for (const operation of ['send_message', 'followup_task', 'interrupt_agent']) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+    client.handler = (method) => { if (method === 'turn/start') throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' }); };
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'original' }));
+    client.handler = (method) => {
+      if (method === 'thread/read') return { thread: { status: { type: 'active', activeFlags: [] } } };
+      if (method === 'thread/turns/list') return { data: [{ id: 'native-running', status: 'inProgress', items: [], itemsView: 'notLoaded' }] };
+    };
+    await controller.dispatch(operation, { target: agent.id, message: 'steer current work' });
+    assert.equal(controller.snapshot().agents[0].status, 'running');
+    assert.equal(controller.snapshot().agents[0].turn_id, 'native-running');
+    assert.deepEqual(client.calls.find((call) => call.method === 'thread/turns/list').params,
+      { threadId: 'thread-1', limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+    assert.equal(client.calls.filter((call) => call.method === 'turn/start').length, 2);
+    assert.equal(client.calls.at(-1).method, operation === 'interrupt_agent' ? 'turn/interrupt' : 'turn/steer');
+  }
+});
+
+test('unknown close reconciles idle ownership while insufficient metadata never restarts work', async (t) => {
+  for (const mode of ['idle', 'systemError', 'active-completed', 'read-error']) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+    client.handler = (method) => { if (method === 'turn/start') throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' }); };
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'original' }));
+    client.handler = (method) => {
+      if (method === 'thread/read') {
+        if (mode === 'read-error') throw new Error('metadata unavailable');
+        return { thread: { status: { type: mode === 'active-completed' ? 'active' : mode } } };
+      }
+      if (method === 'thread/turns/list') return { data: [{ id: 'already-finished', status: 'completed' }] };
+    };
+    if (mode === 'idle') {
+      assert.equal((await controller.dispatch('close_agent', { target: agent.id })).status, 'closed');
+      assert.deepEqual(controller.snapshot().agents, []);
+    } else {
+      await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'do not duplicate' }), /outcome is unknown/);
+      assert.equal(controller.snapshot().agents[0].status, 'unknown');
+      assert.equal(controller.hasActiveWork(), true);
+    }
+    assert.equal(client.calls.filter((call) => call.method === 'turn/start').length, 2);
+  }
+});
+
+test('persisted unknown active work restores subscription and steers without starting a turn', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath }); const agent = await spawn(); client.complete();
+  client.handler = (method) => { if (method === 'turn/start') throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' }); };
+  await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'original' })); await controller.close();
+  const restartedClient = new MockClient();
+  restartedClient.handler = (method) => {
+    if (method === 'thread/read' || method === 'thread/resume') return { thread: { id: 'thread-1', status: { type: 'active', activeFlags: [] } } };
+    if (method === 'thread/turns/list') return { data: [{ id: 'native-running', status: 'inProgress', items: [], itemsView: 'notLoaded' }] };
+  };
+  const restarted = new AgentController({ client: restartedClient, statePath }); await restarted.init(); t.after(() => restarted.close());
+  await restarted.dispatch('followup_task', { target: agent.id, message: 'steer existing work' });
+  assert.deepEqual(restartedClient.calls.map((call) => call.method), ['thread/read', 'thread/resume', 'thread/turns/list', 'turn/steer']);
+  assert.deepEqual(restartedClient.calls[1].params, { threadId: 'thread-1', excludeTurns: true });
+  assert.equal(restarted.find(agent.id).loaded, true);
+  restartedClient.complete('thread-1', 'native-running');
+  assert.equal(restarted.snapshot().agents[0].status, 'completed');
+});
+
+test('resume-window idle metadata reconciles without binding stale active turns', async (t) => {
+  for (const operation of ['followup_task', 'close_agent']) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+    client.handler = (method) => { if (method === 'turn/start') throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' }); };
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'original' }));
+    controller.find(agent.id).loaded = false;
+    const before = client.calls.length;
+    client.handler = (method) => {
+      if (method === 'thread/read') return { thread: { status: { type: 'active', activeFlags: [] } } };
+      if (method === 'thread/resume') return { thread: { status: { type: 'idle' } } };
+    };
+    const result = await controller.dispatch(operation, { target: agent.id, message: 'explicit new task' });
+    const calls = client.calls.slice(before);
+    assert.equal(calls.filter((call) => call.method === 'thread/resume').length, 1);
+    assert.equal(calls.filter((call) => call.method === 'thread/turns/list').length, 0);
+    assert.equal(calls.filter((call) => call.method === 'turn/steer').length, 0);
+    assert.equal(calls.filter((call) => call.method === 'turn/start').length, operation === 'followup_task' ? 1 : 0);
+    assert.equal(result.status, operation === 'followup_task' ? 'running' : 'closed');
+  }
+});
+
+test('rejected overflow continuation fails only its agent without a controller-wide error', async (t) => {
+  const { client, controller, spawn } = await setup(t); const first = await spawn(); const second = await spawn();
+  const errors = []; controller.on('controllerError', (error) => errors.push(error));
+  client.complete('thread-1', 'turn-1', 'failed', { codexErrorInfo: 'contextWindowExceeded' });
+  client.note('turn/started', { threadId: 'thread-1', turn: { id: 'compact-first' } });
+  client.note('item/completed', { threadId: 'thread-1', turnId: 'compact-first', item: { id: 'compact-item', type: 'contextCompaction' } });
+  client.handler = (method, params) => {
+    if (method === 'turn/start' && params.threadId === 'thread-1') throw Object.assign(new Error('continuation rejected'), { code: -32602 });
+  };
+  client.complete('thread-1', 'compact-first'); await tick();
+  assert.equal(controller.find(first.id).status, 'failed');
+  assert.equal(controller.find(second.id).status, 'running');
+  assert.equal(controller.find(second.id).turnId, 'turn-2');
+  assert.deepEqual(errors, []);
+  assert.equal(controller.closed, false);
+  assert.equal(controller.eventsAfter(0, [first.id]).at(-1).kind, 'failed');
+  assert.equal(controller.eventsAfter(0, [first.id]).at(-1).reason, 'turn_start_rejected');
+});
+
+test('failed acknowledgement persistence emits one controller error and retains the disk journal', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath }); await spawn(); client.complete(); await controller.persist();
+  const [event] = controller.eventsAfter(0);
+  const before = await readFile(statePath, 'utf8');
+  const errors = []; controller.on('controllerError', (error) => errors.push(error));
+  await mkdir(`${statePath}.tmp`);
+  try {
+    await assert.rejects(controller.ackSequences([event.seq]));
+    await tick();
+    assert.equal(errors.length, 1);
+    assert.equal(await readFile(statePath, 'utf8'), before);
+    assert.ok(JSON.parse(before).pendingEvents.some((saved) => saved.seq === event.seq));
+  } finally { await rm(`${statePath}.tmp`, { recursive: true, force: true }); }
 });

@@ -64,6 +64,8 @@ export class AppServerClient extends EventEmitter {
     this.#exitPromise = new Promise((resolve) => { this.#resolveExit = resolve; });
   }
 
+  get ready() { return this.#state === 'ready'; }
+
   start() {
     if (this.#startPromise) return this.#startPromise;
     if (this.#state !== 'new') return Promise.reject(this.#error ?? new Error('App-server client is closed.'));
@@ -112,7 +114,7 @@ export class AppServerClient extends EventEmitter {
         this.#resolveExit();
       });
       const result = await this.request('initialize', {
-        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.1.1' },
+        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.1.2' },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       await this.#send({ method: 'initialized', params: {} });

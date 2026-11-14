@@ -70,8 +70,8 @@ function sse(res, index, call) {
 }
 
 async function startProvider(contextMode) {
-  let count = 0, failure;
-  const names = [];
+  let count = 0, failure, recovery = false;
+  const names = [], completedDeliveryIds = new Set();
   const server = createServer(async (req, res) => {
     try {
       const chunks = [];
@@ -84,8 +84,18 @@ async function startProvider(contextMode) {
       const events = values.flatMap((value) => value.events || []);
       const question = events.find((event) => event.kind === 'question');
       const complete = events.find((event) => event.kind === 'completed');
+      for (const value of values) if (value.delivery_id && value.events?.some(event => event.kind === 'completed')) completedDeliveryIds.add(value.delivery_id);
       let call;
-      if (count === 0) call = { name: 'spawn_agent', input: { name: 'offline-worker', message: 'OFFLINE_DELEGATED_TASK', context_mode: contextMode } };
+      if (recovery) {
+        if (count === 0) call = { name: 'wait_agent', input: { timeout_ms: 0 } };
+        else {
+          const latest = values.at(-1);
+          assert.equal(latest?.idle, true, 'resumed host wait must report idle');
+          assert.deepEqual(latest.events, [], 'resumed host must not replay an acknowledged completion');
+          assert.equal(count, 1, 'recovery must finish after one bounded wait');
+        }
+      }
+      else if (count === 0) call = { name: 'spawn_agent', input: { name: 'offline-worker', message: 'OFFLINE_DELEGATED_TASK', context_mode: contextMode } };
       else if (count === 1) {
         const shapes = (body.messages || []).flatMap((message) => Array.isArray(message.content) ? message.content : []).filter((block) => block.type === 'tool_result').map((block) => ({ is_error: block.is_error, contentType: typeof block.content, blockTypes: Array.isArray(block.content) ? block.content.map((part) => part.type) : undefined }));
         assert.ok(agent, `spawn result must traverse the native host (parsed keys: ${JSON.stringify(values.map((value) => Object.keys(value)))}; shapes: ${JSON.stringify(shapes)}; registered plugin tool count: ${(body.tools || []).filter((tool) => tool.name?.includes('codex')).length})`);
@@ -95,7 +105,7 @@ async function startProvider(contextMode) {
       else if (count === 3) call = { name: 'wait_agent', input: {} };
       else { assert.ok(complete, 'wait must return synthetic completion'); assert.equal(complete.result, 'OFFLINE_CODEX_COMPLETED'); }
       names.push(call?.name || 'final');
-      sse(res, count++, call);
+      sse(res, recovery ? `recovery-${count++}` : count++, call);
     } catch (error) {
       failure = error;
       res.writeHead(400, { 'content-type': 'application/json' });
@@ -103,7 +113,9 @@ async function startProvider(contextMode) {
     }
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  return { server, port: server.address().port, names, check: () => { if (failure) throw failure; } };
+  return { server, port: server.address().port, names, completedDeliveryIds,
+    beginRecovery: () => { recovery = true; count = 0; names.length = 0; },
+    check: () => { if (failure) throw failure; } };
 }
 
 async function runChild(args, options, timeoutMs = 60000) {
@@ -180,7 +192,7 @@ function syntheticTranscript(sessionId, cwd, large = false) {
   return rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
 }
 
-test('real Claude host runs native hook capture and local Codex question lifecycle offline', { skip: !cli, timeout: 180000 }, async (t) => {
+test('real Claude host runs native hook capture and local Codex question lifecycle offline', { skip: !cli, timeout: 270000 }, async (t) => {
   assert.ok(path.isAbsolute(cli), 'CODEX_SUBAGENTS_TEST_CLAUDE must be an absolute cli.js path');
   const installationBefore = await installedHostHashes();
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'codex-host-offline-'));
@@ -189,7 +201,7 @@ test('real Claude host runs native hook capture and local Codex question lifecyc
     for (const scenario of transportOnly ? ['plain'] : ['plain', 'compacted', 'large']) {
       const compacted = scenario === 'compacted', inheritedContext = scenario !== 'plain';
       let succeeded = false;
-      await t.test(compacted ? 'five compaction boundaries retain available effective context' : inheritedContext ? '4202 historical messages respect the host 4096 record cap' : 'plain native hook round trip', { timeout: 75000 }, async (scenarioTest) => {
+      await t.test(compacted ? 'five compaction boundaries retain available effective context' : inheritedContext ? '4202 historical messages respect the host 4096 record cap' : 'plain native hook round trip and same-session recovery', { timeout: 90000 }, async (scenarioTest) => {
       const directory = path.join(temporary, scenario);
       await mkdir(directory, { recursive: true });
       const provider = await startProvider(inheritedContext ? 'available' : 'none');
@@ -215,14 +227,21 @@ test('real Claude host runs native hook capture and local Codex question lifecyc
         assert.ok(result.stdout.includes('OFFLINE_HOST_COMPLETED'), 'host must reach the final synthetic response');
         assert.deepEqual(provider.names, ['spawn_agent', 'wait_agent', 'answer_agent', 'wait_agent', 'final']);
         const frames = (await readFile(path.join(env.CODEX_SUBAGENTS_STATE_DIR, 'fake-codex.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+        const stateDirs = (await readdir(env.CODEX_SUBAGENTS_STATE_DIR, { withFileTypes: true })).filter((entry) => entry.isDirectory() && /^[a-f0-9]{32}$/.test(entry.name));
+        assert.equal(stateDirs.length, 1, 'one isolated Claude session must own this scenario');
+        const stateDirectory = path.join(env.CODEX_SUBAGENTS_STATE_DIR, stateDirs[0].name);
+        const saved = JSON.parse(await readFile(path.join(stateDirectory, 'agents.json'), 'utf8'));
+        assert.ok(provider.completedDeliveryIds.size > 0, 'completion must traverse a native tool result carrying its delivery ID');
+        assert.ok(!saved.pendingEvents.some(event => event.kind === 'completed'), 'native session.append must acknowledge the delivered completion before host exit');
+        for (const id of provider.completedDeliveryIds) {
+          const receiptPath = path.join(stateDirectory, 'deliveries', 'batches', createHash('sha256').update(id).digest('hex') + '.json');
+          assert.equal(JSON.parse(await readFile(receiptPath, 'utf8')).status, 'acknowledged', 'the final append must persist its exact completion delivery acknowledgement');
+        }
         const history = frames.find((frame) => frame.method === 'thread/inject_items')?.params.items;
         assert.ok(frames.some((frame) => frame.id === 1000 && frame.result?.answers?.choice?.answers?.[0] === 'Proceed'), 'answer_agent must reply to the Codex server request');
         if (inheritedContext) {
           assert.ok(Array.isArray(history), 'native session.messages snapshot must reach Codex thread/inject_items');
           const inherited = JSON.stringify(history);
-          const stateDirs = (await readdir(env.CODEX_SUBAGENTS_STATE_DIR, { withFileTypes: true })).filter((entry) => entry.isDirectory() && /^[a-f0-9]{32}$/.test(entry.name));
-          assert.equal(stateDirs.length, 1, 'one isolated Claude session must own this scenario');
-          const saved = JSON.parse(await readFile(path.join(env.CODEX_SUBAGENTS_STATE_DIR, stateDirs[0].name, 'agents.json'), 'utf8'));
           const stats = saved.agents[0].snapshot.stats;
           assert.equal(stats.inputMessages, history.length - 1, 'each fixture API message must remain one history item plus the notice');
           assert.ok(stats.inputMessages <= 4096, 'inheritance must stay within the public host API limit');
@@ -242,7 +261,23 @@ test('real Claude host runs native hook capture and local Codex question lifecyc
             assert.ok(!inherited.includes('OFFLINE_WINDOW_MESSAGE_0"'), 'the host-limited earliest message must be absent');
             for (const index of [2100, 4201]) assert.ok(inherited.includes(`OFFLINE_WINDOW_MESSAGE_${index}`), `available snapshot must retain message ${index}`);
           }
-        } else assert.equal(history, undefined, 'context_mode none must not inject context');
+        } else {
+          assert.equal(history, undefined, 'context_mode none must not inject context');
+          const turnStarts = frames.filter(frame => frame.method === 'turn/start').length;
+          provider.beginRecovery();
+          const resumed = await runChild([...args.slice(0, -3), '--resume', sessionId, 'OFFLINE_HOST_RECOVERY_REQUEST'], { cwd: directory, env }, 30000);
+          provider.check();
+          assert.equal(resumed.code, 0, `resumed isolated Claude must exit successfully (${resumed.stderrBytes} stderr bytes; ${resumed.diagnostic})`);
+          assert.ok(resumed.stdout.includes('OFFLINE_HOST_COMPLETED'), 'resumed host must reach the final synthetic response');
+          assert.deepEqual(provider.names, ['wait_agent', 'final']);
+          const resumedFrames = (await readFile(path.join(env.CODEX_SUBAGENTS_STATE_DIR, 'fake-codex.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+          assert.equal(resumedFrames.filter(frame => frame.method === 'turn/start').length, turnStarts, 'resuming the same host session must not dispatch another Codex task');
+          const resumedStateDirs = (await readdir(env.CODEX_SUBAGENTS_STATE_DIR, { withFileTypes: true })).filter(entry => entry.isDirectory() && /^[a-f0-9]{32}$/.test(entry.name));
+          assert.deepEqual(resumedStateDirs.map(entry => entry.name), stateDirs.map(entry => entry.name), 'resume must reuse the same isolated owner state');
+          const resumedState = JSON.parse(await readFile(path.join(stateDirectory, 'agents.json'), 'utf8'));
+          assert.ok(!resumedState.pendingEvents.some(event => event.kind === 'completed'), 'same-session recovery must keep the acknowledged completion cleared');
+          scenarioTest.diagnostic(JSON.stringify({ scenario, nativeAppendAcknowledged: provider.completedDeliveryIds.size, resumedIdle: true, turnStartsBefore: turnStarts, turnStartsAfter: resumedFrames.filter(frame => frame.method === 'turn/start').length }));
+        }
         succeeded = true;
       } finally {
         await cleanupBrokers(env.CODEX_SUBAGENTS_STATE_DIR);
