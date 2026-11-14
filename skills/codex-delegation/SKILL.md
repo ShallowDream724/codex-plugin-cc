@@ -7,9 +7,11 @@ Claude plans, decides and communicates; Codex investigates and implements. Give 
 
 Default `context_mode: available` copies the host-exported current context, up to 4096 API messages. Earlier content may be summarized or omitted. Do not write another handoff summary. Use `none` for independent work; answer missing-context questions when they arise.
 
-After dispatch, wait unless necessary independent work remains. Do not poll status, invent busywork or narrate unchanged updates. A compaction notice normally needs another wait.
+After dispatch, wait unless necessary independent work remains. Do not poll status, invent busywork or narrate unchanged updates. A compaction notice normally needs another wait. Wait timeout returns control without stopping work.
 
 Continue existing agents instead of spawning replacements. `send_message` does not start an idle agent; `followup_task` does. Both preserve its history.
+
+Close failed or finished agents only when you no longer need to continue them.
 
 Answer questions from existing requirements. Ask the user for missing product decisions, material costs, destructive choices or permission expansion. Copy exact request IDs and response shapes; never automatically approve.
 

@@ -36,8 +36,38 @@ function canonical(value, ancestors = new Set()) {
   return result;
 }
 
-function evidence(label, value, role) {
-  return { type: role === 'assistant' ? 'output_text' : 'input_text', text: `[Claude historical ${label}]\n${canonical(value)}` };
+// Preview historical text without returning its serialized evidence envelope or
+// tool arguments. Media sources and unknown structured data stay placeholders.
+function historicalPreview(text) {
+  const value = JSON.parse(text.slice(text.indexOf('\n') + 1));
+  if (!object(value)) return '[historical data]';
+  if (value.type === 'image' || value.type === 'audio') return '';
+  if (value.type === 'text' && typeof value.text === 'string') return value.text;
+  if ((value.type === 'tool_result' || (typeof value.type === 'string' && value.type.endsWith('_tool_result'))) && typeof value.content === 'string') return value.content;
+  if (value.type === 'document' && ['text', 'content'].includes(value.source?.type)) {
+    const content = value.source.type === 'text' ? value.source.data : value.source.content;
+    if (typeof content === 'string') return content;
+  }
+  return `[${value.type ?? value.block?.type ?? 'historical metadata'}]`;
+}
+
+function contextPreview(history, sourcePositions, historicalItems) {
+  function endpoint(index, fromEnd) {
+    const message = history[index];
+    const text = message.content.map(item => {
+      if (item.type === 'input_image') return '[image]';
+      if (item.type === 'input_audio') return '[audio]';
+      return historicalItems.has(item) ? historicalPreview(item.text) : item.text;
+    }).filter(Boolean).join('\n');
+    const sample = fromEnd ? text.slice(-320) : text.slice(0, 320);
+    const points = Array.from(sample);
+    // A 320-unit sample contains at least 160 codepoints. Taking only 159
+    // discards any surrogate split at its outer edge, along with the excess.
+    const excerpt = sample.length === text.length && points.length <= 160 ? text : fromEnd ? '…' + points.slice(-159).join('') : points.slice(0, 159).join('') + '…';
+    return { source_message_1based: sourcePositions[index - 1], role: message.role, text: excerpt };
+  }
+  const count = history.length - 1; // The fixed inheritance notice is not a source message.
+  return { preview_only: true, first: count ? endpoint(1, false) : null, last: count ? endpoint(count, true) : null, omitted_messages: Math.max(0, count - 2) };
 }
 
 function mediaUrl(block, kind) {
@@ -70,6 +100,14 @@ export function prepareContextSnapshot({ messages, source, hostMessageLimit = 40
 
   const stats = { scope: 'host_available', hostMessageLimit, inputMessages: messages.length, retainedMessages: 0, droppedMessages: 0, filteredThinkingBlocks: 0, toolUses: 0, toolResults: 0, historicalBlocks: 0, images: 0, audio: 0, historyItems: 0 };
   const history = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: INHERITANCE_NOTICE }] }];
+  const sourcePositions = [];
+  const historicalItems = new Set();
+
+  function evidence(label, value, role) {
+    const item = { type: role === 'assistant' ? 'output_text' : 'input_text', text: `[Claude historical ${label}]\n${canonical(value)}` };
+    historicalItems.add(item);
+    return item;
+  }
 
   function sequence(entries, role, label) {
     return entries.flatMap((child, index) => {
@@ -151,7 +189,7 @@ export function prepareContextSnapshot({ messages, source, hostMessageLimit = 40
     return [evidence(label ?? block.type, block, role)];
   }
 
-  for (const message of messages) {
+  for (const [sourceIndex, message] of messages.entries()) {
     if (!object(message) || !['user', 'assistant'].includes(message.role)) fail('invalid_context', 'Only original user and assistant message roles are supported.');
     const { role } = message;
     let content;
@@ -168,9 +206,10 @@ export function prepareContextSnapshot({ messages, source, hostMessageLimit = 40
       fail('invalid_context', 'Message content must be a string or content block array.');
     }
     history.push({ type: 'message', role, content });
+    sourcePositions.push(sourceIndex + 1);
     stats.retainedMessages++;
   }
   stats.historyItems = history.length;
   const digest = createHash('sha256').update(canonical({ version: 1, history })).digest('hex');
-  return { version: 1, history, digest, stats };
+  return { version: 1, history, digest, stats, preview: contextPreview(history, sourcePositions, historicalItems) };
 }

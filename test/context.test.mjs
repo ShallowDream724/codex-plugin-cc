@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { prepareContextSnapshot, ContextSnapshotError } from '../runtime/context.mjs';
 
 const snapshot = messages => prepareContextSnapshot({ messages, source: 'claude_api_available', hostMessageLimit: 4096 });
@@ -158,4 +159,83 @@ test('invalid JSON and unrecognized roles are explicit errors', () => {
   fails(() => snapshot([{ role: 'assistant', content: [{ type: 'tool_use', input: { missing: undefined } }] }]), 'invalid_context');
   const circular = {}; circular.self = circular;
   fails(() => snapshot([{ role: 'assistant', content: [{ type: 'tool_use', input: circular }] }]), 'invalid_context');
+});
+
+test('range preview excludes the notice and thinking, preserving source positions and roles', () => {
+  const result = snapshot([
+    { role: 'assistant', content: [{ type: 'thinking', thinking: 'PRIVATE_FIRST' }] },
+    { role: 'user', content: 'earliest retained text' },
+    { role: 'assistant', content: 'middle one' },
+    { role: 'user', content: 'middle two' },
+    { role: 'assistant', content: [{ type: 'thinking', thinking: 'PRIVATE_LAST' }, { type: 'text', text: 'latest retained text' }] },
+  ]);
+  assert.deepEqual(result.preview, {
+    preview_only: true,
+    first: { source_message_1based: 2, role: 'user', text: 'earliest retained text' },
+    last: { source_message_1based: 5, role: 'assistant', text: 'latest retained text' },
+    omitted_messages: 2,
+  });
+  assert.doesNotMatch(JSON.stringify(result.preview), /PRIVATE_|Parent Claude context/);
+});
+
+test('empty and all-thinking windows have no preview endpoints; one message has both', () => {
+  const empty = { preview_only: true, first: null, last: null, omitted_messages: 0 };
+  assert.deepEqual(snapshot([]).preview, empty);
+  assert.deepEqual(snapshot([{ role: 'assistant', content: [{ type: 'thinking', thinking: 'hidden' }, { type: 'redacted_thinking', data: 'hidden' }] }]).preview, empty);
+  const result = snapshot([{ role: 'user', content: 'single retained message' }]);
+  assert.deepEqual(result.preview.first, result.preview.last);
+  assert.equal(result.preview.omitted_messages, 0);
+  assert.equal(snapshot([{ role: 'user', content: [] }]).preview.first.text, '');
+});
+
+test('preview takes Unicode-safe beginning and ending excerpts without truncating history or changing its digest', () => {
+  const longText = '😀'.repeat(200) + '末尾🧭';
+  const result = snapshot([{ role: 'user', content: longText }]);
+  assert.equal(result.preview.first.text, '😀'.repeat(159) + '…');
+  assert.equal(result.preview.last.text, '…' + Array.from(longText).slice(-159).join(''));
+  for (const endpoint of [result.preview.first, result.preview.last]) assert.equal(Array.from(endpoint.text).length, 160);
+  assert.equal(result.history[1].content[0].text, longText);
+  const sorted = value => Array.isArray(value) ? value.map(sorted) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sorted(value[key])])) : value;
+  const historyDigest = createHash('sha256').update(JSON.stringify(sorted({ version: 1, history: result.history }))).digest('hex');
+  assert.equal(result.digest, historyDigest);
+  result.preview.first.text = 'edited preview';
+  assert.equal(result.digest, snapshot([{ role: 'user', content: longText }]).digest);
+});
+
+test('long historical tool text previews omit evidence JSON and arguments, with complete tool history retained', () => {
+  const longResult = 'RESULT_START ' + 'x'.repeat(12000) + ' RESULT_END';
+  const result = snapshot([
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'read', name: 'Read', input: { secret_argument: 'DO_NOT_PREVIEW_ARGUMENTS' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'read', content: longResult }] },
+  ]);
+  assert.equal(result.preview.first.text, '[tool_use]');
+  assert.ok(result.preview.last.text.endsWith(' RESULT_END'));
+  assert.equal(Array.from(result.preview.last.text).length, 160);
+  assert.doesNotMatch(JSON.stringify(result.preview), /DO_NOT_PREVIEW_ARGUMENTS|tool_use_id|Claude historical|"content"/);
+  assert.ok(text(result).includes(longResult));
+  assert.match(text(result), /DO_NOT_PREVIEW_ARGUMENTS/);
+});
+
+test('bounded Unicode samples discard split surrogates and preserve exactly 160 codepoints', () => {
+  const exact = '😀'.repeat(160);
+  const short = snapshot([{ role: 'user', content: exact }]).preview;
+  assert.equal(short.first.text, exact);
+  assert.equal(short.last.text, exact);
+  // The 320-unit head sample ends on a high surrogate; the tail starts on a low one.
+  const result = snapshot([{ role: 'user', content: 'a' + '😀'.repeat(200) + 'z' }]);
+  assert.equal(result.preview.first.text, 'a' + '😀'.repeat(158) + '…');
+  assert.equal(result.preview.last.text, '…' + '😀'.repeat(158) + 'z');
+});
+
+test('preview media endpoints expose only their types, including nested tool text and media', () => {
+  const result = snapshot([
+    { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'PRIVATE_IMAGE_BASE64' } }] },
+    { role: 'user', content: [{ type: 'audio', source: { type: 'url', url: 'https://example.test/private-audio.wav' } }] },
+  ]);
+  assert.equal(result.preview.first.text, '[image]');
+  assert.equal(result.preview.last.text, '[audio]');
+  assert.doesNotMatch(JSON.stringify(result.preview), /PRIVATE_IMAGE_BASE64|https:|base64|"source":/);
+  const nested = snapshot([{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: [{ type: 'text', text: 'visible result' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'PRIVATE_NESTED_BASE64' } }, null] }] }]);
+  assert.match(nested.preview.first.text, /visible result\n\[image\]/);
+  assert.doesNotMatch(JSON.stringify(nested.preview), /PRIVATE_NESTED_BASE64|tool_use_id|Claude historical/);
 });

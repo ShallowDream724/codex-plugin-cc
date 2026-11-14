@@ -47,10 +47,15 @@ claude --plugin-dir "/absolute/path/to/codex-subagents"
 | `wait_agent` | 在程序里等待重要事件，不反复采样 Claude |
 | `answer_agent` | 按原请求 ID 回答问题或审批 |
 | `interrupt_agent` | 中断当前轮，保留历史与文件修改 |
+| `close_agent` | 从当前会话移除闲置代理，保留 Codex 历史 |
 | `list_agents` | 简短状态，供恢复 ID 或诊断 |
-| `list_models` | 查询当前 Codex 实际支持的模型与推理档位 |
+| `list_models` | 读取当前 Codex 配置的模型目录与推理档位 |
 
 默认等待。只有确有必要的独立工作才并行。Codex 仍能调用自己的原生子代理；其工具过程和结果不会逐层灌入 Claude。必要的后代提问或审批会归到直接代理，由同一请求 ID 回答。
+
+`wait_agent.timeout_ms` 只限制这一次等待，到时返回控制权，Codex 继续工作；省略时持续等到事件或所有代理空闲。它不是任务执行时限。空闲时的 `send_message` 成功返回 `stored`，表示已写入 Codex 历史，但没有启动模型；运行时的 `steered` 带有接收消息的 turn ID。错误的 `answer_agent` 返回 `invalid_answer` 和该请求的正确 `reply_format`，可修正后再答。
+
+模型目录由外部 Codex CLI 管理。配置了 `model_catalog_json` 时，该文件决定列表；把条目的 `visibility` 改为 `hide` 后，重启桥接进程即可隐藏。新模型通常不要求更新插件；静态目录由使用者维护，模型选择偏好也由 Claude 的指令决定。插件不内置 CLI，不另设白名单或模型排名。CLI 升级与插件升级相互独立。
 
 ## 上下文与缓存
 
@@ -60,11 +65,15 @@ claude --plugin-dir "/absolute/path/to/codex-subagents"
 
 初始快照只注入一次。续接不重新导入 Claude 历史，也不修改旧系统提示词或工具描述。通知只追加。插件不估算 token；真实超限错误触发最多一次 Codex 原生压缩恢复。压缩本身会形成新历史前缀，应与普通续接的缓存命中分开验收。
 
+新建返回的 `context_snapshot.preview` 展示实际继承范围的首尾：各最多 160 个 Unicode 字符，带原窗口中的消息序号、角色和中间省略条数。`preview_only` 表明省略只发生在预览；注入 Codex 的历史不因此裁剪。thinking、图片字节和工具参数不会出现在预览中。预览只随新建结果返回，不在后续状态列表里重复。
+
 ## 状态与生命周期
 
 Claude 界面显示简短代理状态；问题、重要通知和最终结果进入对话。没有过程读取工具，也没有递归工具日志面板。
 
 状态默认位于 `~/.claude/codex-subagents/<session-hash>/`。只保存线程标识、快照摘要、状态、未确认的重要事件和实际 usage，不另存整份 Claude 快照。Codex 的原生线程历史由 Codex 自己持久化。
+
+不再需要的失败或已完成代理可用 `close_agent` 清理；有活动任务、待回答请求或活动后代时拒绝关闭。关闭后不再出现在本插件的列表中，也不能通过本插件 followup；原生历史仍保留。需要继续协作的代理应保留。
 
 正常会话结束会关闭所属桥接进程；异常断开后租约最多约 90 秒过期。下次由 `followup_task` 恢复原线程，不自动重跑旧任务。中断等待只结束等待订阅，不中断正在工作的 Codex。
 

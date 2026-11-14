@@ -88,6 +88,22 @@ test('wait timeout is local pending state, not an agent interruption', async t =
   assert.equal(controller.calls.filter(c => c.op === 'interrupt_agent').length, 0);
 });
 
+test('a caller can shorten one wait and invalid limits never interrupt the worker', async t => {
+  const { post, controller } = await setup(t, { waitTimeoutMs: 10000 });
+  assert.equal((await post({ operation: 'wait', args: { timeout_ms: 0 } })).body.pending, true);
+  for (const timeout_ms of [-1, 1.5, 25001]) assert.equal((await post({ operation: 'wait', args: { timeout_ms } })).status, 400);
+  assert.equal(controller.status, 'running');
+  assert.equal(controller.calls.filter(c => c.op === 'interrupt_agent').length, 0);
+});
+
+test('invalid answers return the response format without auto-answering', async t => {
+  const { post, controller } = await setup(t);
+  const reply_format = { answers: { choice: { answers: ['<text>'] } } };
+  controller.dispatch = async () => { throw Object.assign(new Error('Answer choice.'), { code: 'invalid_answer', request_id: 'q', reply_format }); };
+  const response = await post({ operation: 'answer_agent', requestId: 'bad-answer', args: {} });
+  assert.deepEqual(response.body.error, { code: 'invalid_answer', message: 'Answer choice.', request_id: 'q', reply_format });
+});
+
 test('disconnecting a waiter leaves the Codex task running', async t => {
   const { post, controller } = await setup(t, { waitTimeoutMs: 1000 });
   const abort = new AbortController();

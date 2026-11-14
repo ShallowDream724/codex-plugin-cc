@@ -6,11 +6,12 @@ const TOOLS = [
   { name: 'spawn_agent', description: 'Start a persistent Codex agent for a task.', inputSchema: { ...OBJECT, properties: { message: STR, cwd: { ...STR, description: 'Absolute working directory; default: this session.' }, name: STR, context_mode: { type: 'string', enum: ['available', 'none'], default: 'available', description: 'available: inherit host-exported current context, up to 4096 API messages; older content may be summarized or omitted. none: task only.' }, model: { ...STR, description: 'ID from list_models; default: configured Codex model.' }, reasoning_effort: { ...STR, description: 'Optional effort from list_models.' } }, required: ['message'], additionalProperties: false } },
   { name: 'send_message', description: 'Steer a running agent; append to an idle agent’s history without starting it.', inputSchema: { ...OBJECT, properties: { target: TARGET, message: STR }, required: ['target', 'message'], additionalProperties: false } },
   { name: 'followup_task', description: 'Send a task and run the same agent with its history. Steer if already running.', inputSchema: { ...OBJECT, properties: { target: TARGET, message: STR }, required: ['target', 'message'], additionalProperties: false } },
-  { name: 'wait_agent', description: 'Wait for questions, important messages, compaction or completion. No model polling.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
+  { name: 'wait_agent', description: 'Wait for an agent question, approval, blocker, compaction or completion.', inputSchema: { ...OBJECT, properties: { timeout_ms: { type: 'integer', minimum: 0, maximum: 3600000, description: 'Limit this wait only; agents keep running. Omit to wait for an event.' } }, additionalProperties: false } },
   { name: 'list_agents', description: 'List this session’s agent IDs and brief status.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
   { name: 'interrupt_agent', description: 'Stop the current turn; keep history and file changes. Resume with followup_task.', inputSchema: { ...OBJECT, properties: { target: TARGET }, required: ['target'], additionalProperties: false } },
+  { name: 'close_agent', description: 'Remove an inactive agent from this session; preserve its Codex history.', inputSchema: { ...OBJECT, properties: { target: TARGET }, required: ['target'], additionalProperties: false } },
   { name: 'answer_agent', description: 'Answer a pending request using its request_id and reply_format.', inputSchema: { ...OBJECT, properties: { target: TARGET, request_id: STR, answer: { ...OBJECT, description: 'Object matching the event’s reply_format.' } }, required: ['target', 'request_id', 'answer'], additionalProperties: false } },
-  { name: 'list_models', description: 'List available Codex model IDs, defaults and supported reasoning efforts.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
+  { name: 'list_models', description: 'Read Codex’s configured model catalog: IDs, defaults and reasoning efforts.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
 ];
 
 let cursor = 0;
@@ -49,7 +50,7 @@ async function capture($, e) {
 function toolArgs(e, operation) {
   if (operation === 'spawn_agent') return { message: e.message, cwd: e.cwd, name: e.name, model: e.model, reasoning_effort: e.reasoning_effort, context_mode: e.context_mode || 'available' };
   if (operation === 'send_message' || operation === 'followup_task') return { target: e.target, message: e.message };
-  if (operation === 'interrupt_agent') return { target: e.target };
+  if (operation === 'interrupt_agent' || operation === 'close_agent') return { target: e.target };
   if (operation === 'answer_agent') return { target: e.target, request_id: e.request_id, answer: e.answer };
   return {};
 }
@@ -58,11 +59,16 @@ async function handle($, e, next, operation) {
   try {
     active = true;
     if (operation === 'wait_agent') {
+      if (e.timeout_ms !== undefined && (!Number.isSafeInteger(e.timeout_ms) || e.timeout_ms < 0 || e.timeout_ms > 3600000)) throw new Error('timeout_ms must be an integer from 0 to 3600000.');
+      const deadline = e.timeout_ms === undefined ? Infinity : Date.now() + e.timeout_ms;
       waiters++;
       try {
         while (!next.signal?.aborted) {
-          const result = await bridge($, 'wait');
-          if (result.pending) continue; // Local long polling; Claude is not sampled here.
+          const result = await bridge($, 'wait', { timeout_ms: Math.min(25000, Math.max(0, deadline - Date.now())) });
+          if (result.pending) {
+            if (Date.now() >= deadline) return { result: JSON.stringify({ timed_out: true, workersContinue: true }) };
+            continue; // Local long polling; Claude is not sampled here.
+          }
           if (result.cursor !== undefined) cursor = Math.max(cursor, result.cursor);
           return { result: JSON.stringify(result) };
         }
@@ -124,6 +130,7 @@ export function register(on) {
   on('tool.call', { tool: 'mcp__codex-subagents__wait_agent' }, ($, e, next) => handle($, e, next, 'wait_agent'));
   on('tool.call', { tool: 'mcp__codex-subagents__list_agents' }, ($, e, next) => handle($, e, next, 'list_agents'));
   on('tool.call', { tool: 'mcp__codex-subagents__interrupt_agent' }, ($, e, next) => handle($, e, next, 'interrupt_agent'));
+  on('tool.call', { tool: 'mcp__codex-subagents__close_agent' }, ($, e, next) => handle($, e, next, 'close_agent'));
   on('tool.call', { tool: 'mcp__codex-subagents__answer_agent' }, ($, e, next) => handle($, e, next, 'answer_agent'));
   on('tool.call', { tool: 'mcp__codex-subagents__list_models' }, ($, e, next) => handle($, e, next, 'list_models'));
 }

@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { prepareContextSnapshot } from './context.mjs';
 
-const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'answer_agent']);
+const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent']);
 const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024; // Transport bytes, never a token estimate or a truncation policy.
 
@@ -31,6 +31,8 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       return { ...listed, events: waiting ? [] : controller.eventsAfter(cursor), waiting: waiting > 0 };
     }
     if (operation === 'wait') {
+      if (args.timeout_ms !== undefined && (!Number.isSafeInteger(args.timeout_ms) || args.timeout_ms < 0 || args.timeout_ms > 25000)) throw new Error('Wait timeout_ms must be an integer from 0 to 25000.');
+      const timeout = Math.min(args.timeout_ms ?? waitTimeoutMs, waitTimeoutMs);
       await controller.ackEvents(cursor);
       const existing = controller.eventsAfter(cursor);
       if (existing.length) return { events: existing, cursor: existing.at(-1).seq };
@@ -55,7 +57,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
             if (events.length) finish({ events, cursor: events.at(-1).seq });
           };
           const abort = () => finish({ cancelled: true, cursor });
-          const timer = setTimeout(() => finish({ pending: true, cursor }), waitTimeoutMs);
+          const timer = setTimeout(() => finish({ pending: true, cursor }), timeout);
           controller.on('event', wake);
           signal.addEventListener('abort', abort, { once: true });
           wake();
@@ -110,7 +112,8 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     } catch (error) {
       if (!res.destroyed) {
         res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: { code: error.code || 'bridge_error', message: error.message } }));
+        res.end(JSON.stringify({ error: { code: error.code || 'bridge_error', message: error.message,
+          ...(error.code === 'invalid_answer' ? { request_id: error.request_id, reply_format: error.reply_format } : {}) } }));
       }
     }
   });

@@ -40,19 +40,24 @@ async function setup(t, options = {}) {
 }
 const pendingQuestion = (threadId = 'thread-1', turnId = 'turn-1') => ({ threadId, turnId, itemId: 'q-item', questions: [{ id: 'choice', header: 'Choose', question: 'Which?' }], isBlocking: true });
 
-test('default available context requires a validated snapshot and returns its summary only', async (t) => {
-  const { client, controller } = await setup(t);
+test('default available context returns preview once without retaining private history or preview', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller } = await setup(t, { statePath });
   const args = { message: 'Work', cwd: '/workspace' };
   await assert.rejects(controller.dispatch('spawn_agent', args), /validated snapshot/);
   await assert.rejects(controller.dispatch('spawn_agent', { ...args, context_mode: 'all' }), /context_mode/);
   await assert.rejects(controller.dispatch('spawn_agent', { ...args, snapshot: { history: [] } }), /validated snapshot/);
   assert.equal(client.calls.length, 0);
-  const snapshot = { history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'PRIVATE AVAILABLE HISTORY' }] }], digest: 'digest', stats: { messages: 1 } };
+  const snapshot = { history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'PRIVATE AVAILABLE HISTORY' }] }], digest: 'digest', stats: { messages: 1 }, preview: { text: 'PRIVATE PREVIEW' } };
   const agent = await controller.dispatch('spawn_agent', { ...args, snapshot });
   assert.equal(client.calls.filter((call) => call.method === 'thread/inject_items').length, 1);
-  assert.deepEqual(agent.context_snapshot, { digest: 'digest', stats: { messages: 1 } });
+  assert.deepEqual(agent.context_snapshot, { digest: 'digest', stats: { messages: 1 }, preview: snapshot.preview });
   assert.doesNotMatch(JSON.stringify(agent), /PRIVATE AVAILABLE HISTORY/);
   assert.doesNotMatch(JSON.stringify(controller.snapshot()), /PRIVATE AVAILABLE HISTORY/);
+  assert.doesNotMatch(JSON.stringify(controller.snapshot()), /PRIVATE PREVIEW/);
+  assert.doesNotMatch(JSON.stringify(await controller.dispatch('list_agents')), /PRIVATE PREVIEW/);
+  assert.doesNotMatch(await readFile(statePath, 'utf8'), /PRIVATE (?:PREVIEW|AVAILABLE HISTORY)/);
 });
 
 test('none context skips injection and cwd accepts absolute POSIX and Windows paths only', async (t) => {
@@ -83,7 +88,7 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   assert.equal(client.calls[2].params.effort, 'high'); assert.equal(client.calls[2].params.serviceTierForTurn, 'default');
   assert.match(client.calls[2].params.input[0].text, /Claude is your parent/);
   client.complete(); await tick();
-  assert.equal((await controller.dispatch('send_message', { target: agent.id, message: 'hello' })).status, 'queued');
+  assert.deepEqual(await controller.dispatch('send_message', { target: agent.id, message: 'hello' }), { agent_id: agent.id, status: 'stored', model_turn_started: false });
   assert.deepEqual(client.calls.at(-1), { method: 'thread/inject_items', params: { threadId: 'thread-1',
     items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }] } });
   assert.equal(client.calls.filter((c) => c.method === 'turn/start').length, 1);
@@ -136,7 +141,11 @@ test('native questions need exact IDs, answer once, and continue original turn',
   assert.deepEqual((await controller.dispatch('list_agents')).agents[0].pending_requests[0].reply_format, controller.eventsAfter(0)[0].reply_format);
   await assert.rejects(controller.dispatch('send_message', { target: agent.id, message: 'bypass question' }), /answer_agent/);
   await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'bypass question' }), /answer_agent/);
-  await assert.rejects(controller.dispatch('answer_agent', { target: agent.id, request_id: 7, answer: { answers: { wrong: { answers: ['x'] } } } }));
+  await assert.rejects(controller.dispatch('answer_agent', { target: agent.id, request_id: 7, answer: { answers: { wrong: { answers: ['x'] } } } }), (error) => {
+    assert.equal(error.code, 'invalid_answer'); assert.equal(error.request_id, '7');
+    assert.deepEqual(error.reply_format, { answers: { choice: { answers: ['<text>'] } } });
+    return true;
+  });
   assert.equal(controller.snapshot().agents[0].pending_requests.length, 1);
   await controller.dispatch('answer_agent', { target: agent.id, request_id: 7, answer: { answers: { choice: { answers: ['selected'] } } } });
   assert.deepEqual(client.replies[0], { id: 7, result: { answers: { choice: { answers: ['selected'] } } } });
@@ -313,8 +322,9 @@ test('notify_parent returns dynamic tool response and unknown requests are rejec
 
 test('send and followup steer running turn; interrupt never starts a new turn', async (t) => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn();
-  await controller.dispatch('send_message', { target: agent.id, message: 'steer one' });
-  await controller.dispatch('followup_task', { target: agent.id, message: 'steer two' });
+  assert.deepEqual(await controller.dispatch('send_message', { target: agent.id, message: 'steer one' }), { agent_id: agent.id, status: 'steered', turn_id: 'turn-1' });
+  client.handler = (method) => { if (method === 'turn/steer') return { turnId: 'accepted-turn' }; };
+  assert.deepEqual(await controller.dispatch('followup_task', { target: agent.id, message: 'steer two' }), { agent_id: agent.id, status: 'steered', turn_id: 'accepted-turn' });
   assert.equal(client.calls.filter((c) => c.method === 'turn/steer').length, 2);
   assert.equal(client.calls.at(-1).params.expectedTurnId, 'turn-1');
   await controller.dispatch('interrupt_agent', { target: agent.id });
@@ -402,6 +412,117 @@ test('ack removes delivered event while retaining final result and actual cached
   assert.deepEqual(controller.eventsAfter(0), []);
   assert.equal(controller.snapshot().agents[0].result, 'Verified final result');
   assert.equal(controller.snapshot().agents[0].token_usage.total.cachedInputTokens, 234);
+});
+
+test('close_agent removes idle ownership and events durably while ignoring late events', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath }); const agent = await spawn();
+  client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
+  client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  client.complete('child', 'child-turn'); client.complete();
+  const seq = controller.nextSeq;
+  assert.deepEqual(await controller.dispatch('close_agent', { target: agent.id }), { agent_id: agent.id, thread_id: 'thread-1', status: 'closed' });
+  assert.deepEqual(client.calls.at(-1), { method: 'thread/unsubscribe', params: { threadId: 'thread-1' } });
+  assert.deepEqual(controller.snapshot().agents, []); assert.deepEqual(controller.eventsAfter(0), []);
+  assert.equal(controller.nextSeq, seq); assert.equal(controller.threads.size, 0); assert.equal(controller.descendants.size, 0);
+  const emitLate = (source) => {
+    source.note('turn/started', { threadId: 'thread-1', turn: { id: 'late' } });
+    source.note('thread/started', { thread: { id: 'late-child', parentThreadId: 'thread-1' } });
+    source.ask('late-request', 'item/tool/requestUserInput', pendingQuestion('child', 'child-turn'));
+  };
+  emitLate(client); await tick();
+  assert.equal(controller.unlinkedThreads.size, 0); assert.deepEqual(controller.eventsAfter(0), []);
+  const restartedClient = new MockClient();
+  const restarted = new AgentController({ client: restartedClient, statePath }); await restarted.init(); t.after(() => restarted.close());
+  restarted.starting = 1; emitLate(restartedClient); await tick(); restarted.starting = 0;
+  assert.deepEqual(restarted.snapshot().agents, []); assert.deepEqual(restarted.eventsAfter(0), []);
+  assert.equal(restarted.unlinkedThreads.size, 0); assert.deepEqual(restarted.early, []);
+  assert.equal(restartedClient.rejected[0].id, 'late-request');
+});
+
+test('close_agent cleans failed starts without thread IDs and unsubscribes only loaded threads', async (t) => {
+  const { client, controller, spawn } = await setup(t);
+  client.handler = (method) => { if (method === 'thread/start') throw new Error('start failed'); };
+  await assert.rejects(spawn(), /start failed/);
+  const failed = controller.snapshot().agents[0];
+  await controller.dispatch('close_agent', { target: failed.id });
+  assert.equal(client.calls.filter((call) => call.method === 'thread/unsubscribe').length, 0);
+  client.handler = undefined;
+  const agent = await spawn(); client.complete();
+  controller.find(agent.id).loaded = false;
+  await controller.dispatch('close_agent', { target: agent.id });
+  assert.equal(client.calls.filter((call) => call.method === 'thread/unsubscribe').length, 0);
+  assert.deepEqual(controller.snapshot().agents, []);
+});
+
+test('close_agent rejects active roots, descendants and pending requests', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /idle and terminal/);
+  client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
+  client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  client.complete();
+  await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /active descendant/);
+  client.ask('child-q', 'item/tool/requestUserInput', pendingQuestion('child', 'child-turn'));
+  await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /pending requests/);
+  assert.equal(client.calls.filter((call) => call.method === 'thread/unsubscribe').length, 0);
+  client.complete('child', 'child-turn');
+  await controller.dispatch('close_agent', { target: agent.id });
+});
+
+test('close_agent accepts failed and interrupted turns without deleting their saved history', async (t) => {
+  const { client, controller, spawn } = await setup(t);
+  for (const status of ['failed', 'interrupted']) {
+    const agent = await spawn();
+    client.complete(agent.thread_id, agent.turn_id, status, status === 'failed' ? { message: 'Task failed' } : undefined);
+    await controller.dispatch('close_agent', { target: agent.id });
+  }
+  assert.deepEqual(controller.snapshot().agents, []);
+  assert.deepEqual(client.calls.filter((call) => call.method !== 'thread/start' && call.method !== 'turn/start').map((call) => call.method), ['thread/unsubscribe', 'thread/unsubscribe']);
+});
+
+test('close_agent excludes in-flight send, start and concurrent sends during unsubscribe', async (t) => {
+  for (const mode of ['steer', 'store', 'followup', 'spawn']) {
+    const { client, controller, spawn } = await setup(t);
+    let agent, release;
+    if (mode !== 'spawn') { agent = await spawn(); if (mode !== 'steer') client.complete(); }
+    client.handler = (method) => {
+      if (method === ({ steer: 'turn/steer', store: 'thread/inject_items', followup: 'turn/start', spawn: 'turn/start' })[mode]) {
+        return new Promise((resolve) => { release = resolve; });
+      }
+    };
+    const operation = mode === 'spawn' ? spawn() : controller.dispatch(mode === 'followup' ? 'followup_task' : 'send_message', { target: agent.id, message: 'pending' });
+    await tick(); agent ??= controller.snapshot().agents[0];
+    if (mode === 'steer') client.complete();
+    if (mode === 'followup' || mode === 'spawn') client.complete('thread-1', 'pending-turn');
+    await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /idle and terminal/);
+    release({ turn: { id: 'pending-turn' } }); await operation;
+    let finishUnsubscribe;
+    client.handler = (method) => { if (method === 'thread/unsubscribe') return new Promise((resolve) => { finishUnsubscribe = resolve; }); };
+    const closing = controller.dispatch('close_agent', { target: agent.id });
+    await tick();
+    await assert.rejects(controller.dispatch('send_message', { target: agent.id, message: 'racing send' }), /closing/);
+    await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'racing start' }), /closing/);
+    await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /already closing/);
+    finishUnsubscribe({}); await closing;
+  }
+});
+
+test('close_agent preserves ownership if unsubscribe fails or a descendant starts during it', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+  client.handler = (method) => { if (method === 'thread/unsubscribe') throw new Error('unsubscribe failed'); };
+  await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /unsubscribe failed/);
+  assert.equal(controller.find(agent.id).status, 'completed');
+  client.handler = (method) => {
+    if (method === 'thread/unsubscribe') {
+      client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
+      client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+      return {};
+    }
+  };
+  await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /active descendant/);
+  assert.equal(controller.find(agent.id).status, 'completed');
+  assert.equal(controller.descendantTurns.get('child'), 'child-turn');
 });
 
 test('automatic compaction emits once per item without claiming an overflow', async (t) => {

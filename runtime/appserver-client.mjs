@@ -112,7 +112,7 @@ export class AppServerClient extends EventEmitter {
         this.#resolveExit();
       });
       const result = await this.request('initialize', {
-        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.1.0' },
+        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.1.1' },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       await this.#send({ method: 'initialized', params: {} });
