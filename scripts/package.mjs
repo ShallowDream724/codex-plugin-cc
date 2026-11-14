@@ -1,0 +1,12 @@
+import { mkdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+const root = resolve(import.meta.dirname, '..');
+const { version } = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
+const output = resolve(root, 'artifacts', `codex-subagents-${version}.zip`);
+const status = spawnSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8', windowsHide: true });
+if (status.status !== 0 || status.stdout.trim()) throw new Error('Package a clean, committed working tree.');
+mkdirSync(resolve(root, 'artifacts'), { recursive: true });
+const archived = spawnSync('git', ['archive', '--format=zip', '--output', output, 'HEAD'], { cwd: root, windowsHide: true, stdio: 'inherit' });
+if (archived.status !== 0) throw new Error('git archive failed.');
+console.log(output);

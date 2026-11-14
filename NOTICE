@@ -1,3 +1,5 @@
+Upstream notice:
+
 Copyright 2026 OpenAI
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,3 +13,18 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Codex Subagents
+
+This project preserves the source history of y-cruce/codex-plugin-cc,
+which derives from OpenAI's codex-plugin-cc. The working tree was
+replaced with a smaller Claude Code / Codex-only implementation.
+
+Upstream references:
+https://github.com/y-cruce/codex-plugin-cc
+https://github.com/openai/codex-plugin-cc
+https://github.com/openai/codex
+
+OpenAI Codex app-server protocol types generated from codex-cli 0.153.4
+were used as an implementation reference. No generated type bundle,
+Claude installation source, credentials, or user conversations are included.

@@ -1,0 +1,556 @@
+import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+
+const ROLE = 'Claude is your parent agent. Work independently first. Ask the parent for necessary decisions using request_user_input. Use notify_parent only for a real blocker; omit routine progress reports. Finish with a concise result and validation report.\n\n';
+const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
+const ACTIVE = new Set(['starting', 'running', 'waiting', 'compacting']);
+const APPROVALS = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'mcpServer/elicitation/request']);
+const object = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+const nonempty = (x) => typeof x === 'string' && x.trim().length > 0;
+const copy = (x) => structuredClone(x);
+const input = (text) => [{ type: 'text', text }];
+const isOverflow = (error) => error?.codexErrorInfo === 'contextWindowExceeded' || error?.code === 'contextWindowExceeded';
+
+/** Owns directly-created Codex threads; never forwards nested agents or tool traces. */
+export class AgentController extends EventEmitter {
+  constructor({ client, statePath } = {}) {
+    super();
+    if (!client) throw new TypeError('client is required.');
+    this.client = client;
+    this.statePath = statePath;
+    this.agents = new Map();
+    this.threads = new Map();
+    this.descendants = new Map();
+    this.unlinkedThreads = new Map();
+    this.descendantTurns = new Map();
+    this.pendingEvents = [];
+    this.nextSeq = 1;
+    this.starting = 0;
+    this.early = [];
+    this.persistTail = Promise.resolve();
+    this.closed = false;
+    this.closedPromise = new Promise((resolve) => { this.resolveClosed = resolve; });
+    this.onNotification = (m) => this.observe(m);
+    this.onRequest = (m) => { this.serverRequest(m).catch((error) => this.emit('controllerError', error)); };
+    this.onClosed = () => this.disconnected();
+    client.on('notification', this.onNotification);
+    client.on('request', this.onRequest);
+    client.on('closed', this.onClosed);
+  }
+
+  async init() {
+    if (!this.statePath) return this;
+    let data;
+    try { data = JSON.parse(await readFile(this.statePath, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return this; throw error; }
+    if (data.version !== 1 || !Array.isArray(data.agents) || !Array.isArray(data.pendingEvents)) throw new Error('Invalid agent state.');
+    this.pendingEvents = data.pendingEvents;
+    this.nextSeq = data.pendingEvents.reduce((next, event) => Math.max(next, event.seq + 1), data.nextSeq ?? 1);
+    for (const saved of data.agents) {
+      const a = { ...saved, pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
+      this.agents.set(a.id, a);
+      this.threads.set(a.threadId, a);
+      if (ACTIVE.has(a.status)) {
+        a.status = 'interrupted'; a.turnId = null; a.activity = 'stale_pending';
+        this.publish(a, 'interrupted', { reason: 'controller_restarted', stale_pending: true });
+      }
+    }
+    await this.persist();
+    return this;
+  }
+
+  view(a, metrics = false) {
+    const result = { id: a.id, agent_id: a.id, thread_id: a.threadId, name: a.name, cwd: a.cwd,
+      model: a.model, reasoning_effort: a.effort, status: a.status, activity: a.activity,
+      turn_id: a.turnId, error: a.error ?? null,
+      pending_requests: a.pending.map(({ id, method, params }) => ({ method, ...copy(params), request_id: id,
+        reply_format: replyFormat(method, params), ...(params.threadId !== a.threadId ? { source_thread_id: params.threadId } : {}) })) };
+    if (metrics) {
+      result.token_usage = copy(a.tokenUsage ?? null); result.result = a.result ?? null;
+      result.context_snapshot = copy(a.snapshot ?? null);
+    }
+    return result;
+  }
+
+  snapshot() { return { agents: [...this.agents.values()].map((a) => this.view(a, true)), pendingEvents: copy(this.pendingEvents), nextSeq: this.nextSeq }; }
+  eventsAfter(cursor = 0, targets = []) {
+    if (!Number.isSafeInteger(cursor) || cursor < 0 || !Array.isArray(targets)) throw new TypeError('Invalid event cursor or targets.');
+    const ids = new Set(targets.map((target) => this.find(target).id));
+    return copy(this.pendingEvents.filter((e) => e.seq > cursor && (!ids.size || ids.has(e.agent_id))));
+  }
+  async ackEvents(cursor) {
+    if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor >= this.nextSeq) throw new TypeError('Invalid event acknowledgement cursor.');
+    this.pendingEvents = this.pendingEvents.filter((event) => event.seq > cursor);
+    await this.persist();
+    return { acknowledged: cursor };
+  }
+
+  async dispatch(operation, args = {}) {
+    if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
+    switch (operation) {
+      case 'spawn_agent': return this.spawn(args);
+      case 'list_agents': return { agents: [...this.agents.values()].map((a) => this.view(a)) };
+      case 'list_models': return this.models();
+      case 'send_message': return this.send(this.find(args.target), args.message, false);
+      case 'followup_task': return this.send(this.find(args.target), args.message, true);
+      case 'interrupt_agent': return this.interrupt(this.find(args.target));
+      case 'answer_agent': return this.answer(this.find(args.target), args.request_id, args.answer);
+      default: throw new Error(`Unknown operation: ${operation}`);
+    }
+  }
+
+  find(target) {
+    const matches = [...this.agents.values()].filter((a) => a.id === target || a.threadId === target || a.name === target);
+    if (matches.length !== 1) throw new Error(matches.length ? 'Ambiguous agent target.' : 'Unknown agent target.');
+    return matches[0];
+  }
+
+  async rpc(method, params) {
+    if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
+    return Promise.race([this.client.request(method, params, { timeoutMs: 120000 }), this.closedPromise.then(() => { throw new Error('App-server connection closed.'); })]);
+  }
+
+  async spawn({ message, cwd, model, reasoning_effort, name, context_mode = 'available', snapshot }) {
+    if (!nonempty(message) || !nonempty(cwd)) throw new TypeError('message and cwd are required.');
+    if (!path.posix.isAbsolute(cwd) && !path.win32.isAbsolute(cwd)) throw new TypeError('cwd must be an absolute path.');
+    if (!['available', 'none'].includes(context_mode)) throw new TypeError('context_mode must be available or none.');
+    if (context_mode === 'available' && (!object(snapshot) || !Array.isArray(snapshot.history) || !nonempty(snapshot.digest) || !object(snapshot.stats))) {
+      throw new Error('context_mode available requires a validated snapshot.');
+    }
+    if (name && [...this.agents.values()].some((a) => a.name === name)) throw new Error('Agent name is already in use.');
+    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, status: 'starting', activity: 'starting',
+      pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: true, recoveryUsed: false, interrupted: false };
+    this.agents.set(a.id, a);
+    this.starting++;
+    try {
+      const response = await this.rpc('thread/start', { cwd, ...(model ? { model } : {}), ephemeral: false, serviceTier: 'default',
+        config: { 'features.default_mode_request_user_input': true }, dynamicTools: [{ type: 'function', name: 'notify_parent',
+          description: 'Report a real blocker to the Claude parent.', inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'], additionalProperties: false } }] });
+      if (!nonempty(response.thread?.id)) throw new Error('thread/start returned no thread id.');
+      a.threadId = response.thread.id;
+      this.threads.set(a.threadId, a);
+      this.linkDescendants();
+      this.replayEarly(a.threadId);
+      if (context_mode === 'available') {
+        await this.rpc('thread/inject_items', { threadId: a.threadId, items: snapshot.history });
+        a.snapshot = { digest: snapshot.digest, stats: snapshot.stats };
+        a.injected = true;
+      }
+      if (!a.interrupted) await this.startTurn(a, ROLE + message, true);
+      return { ...this.view(a), context_snapshot: copy(a.snapshot ?? null) };
+    } catch (error) {
+      if (ACTIVE.has(a.status)) this.finish(a, this.closing ? 'interrupted' : 'failed', { message: error.message });
+      throw error;
+    } finally {
+      this.starting--;
+      if (!this.starting) {
+        const early = this.early.splice(0);
+        for (const entry of early) if (entry.request) await this.client.reject(entry.message.id, -32601, 'Thread is not owned by this controller.').catch(() => {});
+      }
+      await this.persist();
+    }
+  }
+
+  replayEarly(threadId) {
+    const owns = (e) => this.threadId(e.message.params) === threadId || this.descendants.get(this.threadId(e.message.params))?.threadId === threadId;
+    const matching = this.early.filter(owns);
+    this.early = this.early.filter((e) => !owns(e));
+    for (const entry of matching) entry.request ? this.onRequest(entry.message) : this.observe(entry.message);
+  }
+
+  async startTurn(a, text, newTask = false) {
+    if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
+    if (newTask) { a.recoveryUsed = false; a.interrupted = false; a.error = null; a.terminalEmitted = false; }
+    a.result = null;
+    a.unclassifiedResult = null;
+    a.status = a.pending.length ? 'waiting' : 'running'; a.activity = a.pending.length ? 'waiting for parent' : 'working'; a.turnId = null; a.overflow = false;
+    a.startingTurn = true;
+    let response;
+    try { response = await this.rpc('turn/start', { threadId: a.threadId, input: input(text),
+      ...(a.effort ? { effort: a.effort } : {}), serviceTierForTurn: 'default' }); }
+    finally { a.startingTurn = false; }
+    // Notifications may already have completed this turn while its RPC was pending.
+    const turn = response.turn;
+    if (turn?.id && !a.completedTurns.has(turn.id) && ACTIVE.has(a.status) && !a.turnId) a.turnId = turn.id;
+    if (a.interrupted && a.turnId) await this.requestInterrupt(a);
+    await this.persist();
+  }
+
+  async send(a, message, followup) {
+    if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
+    if (ACTIVE.has(a.status)) {
+      if (!a.turnId || a.status === 'compacting') throw new Error('Agent turn is not steerable yet.');
+      await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: a.turnId, input: input(message) });
+      return { agent_id: a.id, status: 'steered' };
+    }
+    if (a.resuming) throw new Error('Agent followup is already starting.');
+    a.resuming = true;
+    try {
+      if (followup || !a.loaded) await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true });
+      a.loaded = true;
+      if (!followup) {
+        await this.rpc('thread/inject_items', { threadId: a.threadId,
+          items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
+        return { agent_id: a.id, status: 'queued' };
+      }
+      await this.startTurn(a, message, true);
+      return this.view(a);
+    } finally { a.resuming = false; }
+  }
+
+  async interrupt(a) {
+    a.interrupted = true;
+    if (!ACTIVE.has(a.status)) return { agent_id: a.id, status: 'not_running' };
+    if (a.turnId) await this.requestInterrupt(a);
+    // A recovery between turns must not restart after the user interrupts it.
+    if (!a.turnId && !a.startingTurn) this.finish(a, 'interrupted', { reason: 'parent_interrupt' });
+    return { agent_id: a.id, status: 'interrupting' };
+  }
+
+  async requestInterrupt(a) {
+    if (!a.turnId || a.interruptSentTurn === a.turnId) return;
+    const turnId = a.turnId;
+    a.interruptSentTurn = turnId;
+    try { await this.rpc('turn/interrupt', { threadId: a.threadId, turnId }); }
+    catch (error) { if (a.interruptSentTurn === turnId) a.interruptSentTurn = null; throw error; }
+  }
+
+  threadId(params = {}) { return params.threadId ?? params.thread?.id; }
+  linkDescendants() {
+    let changed;
+    do {
+      changed = false;
+      for (const [id, parentId] of this.unlinkedThreads) {
+        const root = this.threads.get(parentId) ?? this.descendants.get(parentId);
+        if (!root || id === root.threadId) continue;
+        this.descendants.set(id, root); this.unlinkedThreads.delete(id); changed = true;
+      }
+    } while (changed);
+  }
+
+  observeDescendant(a, message, p) {
+    if (!['turn/started', 'turn/completed', 'serverRequest/resolved'].includes(message.method)) return;
+    const sourceId = this.threadId(p);
+    if (message.method === 'turn/started') this.descendantTurns.set(sourceId, p.turn.id);
+    if (message.method === 'turn/completed') {
+      if (this.descendantTurns.get(sourceId) === p.turn?.id) this.descendantTurns.delete(sourceId);
+      a.pending = a.pending.filter((r) => r.params.threadId !== sourceId || r.params.turnId !== p.turn?.id);
+    }
+    if (message.method === 'serverRequest/resolved') a.pending = a.pending.filter((r) => r.wireId !== p.requestId);
+    if (!a.pending.length) {
+      if (a.status === 'waiting') a.status = 'running';
+      a.activity = ACTIVE.has(a.status) ? 'working' : a.status;
+    }
+    this.persist().catch((error) => this.emit('controllerError', error));
+  }
+
+  observe(message) {
+    if (this.closed) return;
+    const p = message.params ?? {};
+    if (message.method === 'thread/started' && p.thread?.id) {
+      const source = p.thread.source?.subAgent;
+      const parentId = p.thread.parentThreadId ?? source?.thread_spawn?.parent_thread_id ?? source?.parentThreadId;
+      if (parentId) { this.unlinkedThreads.set(p.thread.id, parentId); this.linkDescendants(); }
+    }
+    const sourceId = this.threadId(p), a = this.threads.get(sourceId);
+    if (!a) {
+      const root = this.descendants.get(sourceId);
+      if (root) { this.observeDescendant(root, message, p); return; }
+      if (this.starting && this.important(message)) this.early.push({ message: copy(message) });
+      return;
+    }
+    switch (message.method) {
+      case 'turn/started':
+        if (a.completedTurns.has(p.turn.id)) return;
+        a.turnId = p.turn.id;
+        if (!a.recovery && !a.terminalEmitted) { a.status = a.pending.length ? 'waiting' : 'running'; a.activity = a.pending.length ? 'waiting for parent' : 'working'; }
+        if (a.interrupted) this.requestInterrupt(a).catch((error) => this.emit('controllerError', error));
+        break;
+      case 'thread/tokenUsage/updated': a.tokenUsage = copy(p.tokenUsage); break;
+      case 'error':
+        if (isOverflow(p.error)) a.overflow = true;
+        a.lastError = p.error ? { message: p.error.message, codexErrorInfo: p.error.codexErrorInfo } : null;
+        break;
+      case 'item/started': case 'item/completed': {
+        if (a.terminalEmitted) return;
+        const item = p.item ?? {};
+        if (a.turnId && p.turnId && a.turnId !== p.turnId) return;
+        if (item.type === 'agentMessage' && message.method === 'item/completed') {
+          if (['final_answer', 'finalAnswer'].includes(item.phase)) a.result = item.text;
+          else if (item.phase == null) a.unclassifiedResult = item.text;
+        }
+        if (item.type === 'contextCompaction') {
+          if (!a.compactItems.has(item.id)) {
+            a.compactItems.add(item.id);
+            this.publish(a, 'compacting', { item_id: item.id, ...(a.overflow || a.recovery ? { reason: 'contextWindowExceeded' } : {}) });
+          }
+          if (a.recovery && message.method === 'item/completed') a.recovery.compacted = true;
+          a.activity = 'compacting context';
+        } else if (item.type === 'collabAgentToolCall' || item.type === 'subAgentActivity') a.activity = 'delegated to subagent';
+        else if (item.type !== 'agentMessage' && item.type !== 'reasoning' && item.type !== 'userMessage') a.activity = item.type ?? 'working';
+        break;
+      }
+      case 'thread/compacted': if (a.recovery) a.recovery.compacted = true; break;
+      case 'serverRequest/resolved':
+        a.pending = a.pending.filter((r) => r.wireId !== p.requestId);
+        if (!a.pending.length && a.status === 'waiting') a.status = 'running';
+        break;
+      case 'turn/completed': this.turnCompleted(a, p.turn); break;
+      default: return;
+    }
+    this.persist().catch((error) => this.emit('controllerError', error));
+  }
+
+  important(message) {
+    return ['thread/started', 'turn/started', 'turn/completed', 'error', 'thread/tokenUsage/updated', 'thread/compacted', 'serverRequest/resolved'].includes(message.method)
+      || (['item/started', 'item/completed'].includes(message.method) && ['agentMessage', 'contextCompaction'].includes(message.params?.item?.type));
+  }
+
+  turnCompleted(a, turn) {
+    if (!turn?.id || a.completedTurns.has(turn.id)) return;
+    if (a.turnId && a.turnId !== turn.id) return;
+    a.completedTurns.add(turn.id); a.turnId = null;
+    a.pending = a.pending.filter((request) => request.params.threadId !== a.threadId || request.params.turnId !== turn.id);
+    if (this.closing || a.interrupted || turn.status === 'interrupted') { a.recovery = null; this.finish(a, 'interrupted', {}); return; }
+    if (a.recovery) {
+      if (turn.status !== 'completed' || !a.recovery.compacted) {
+        a.recovery = null;
+        this.finish(a, 'failed', { message: turn.error?.message ?? 'Context compaction did not complete.' });
+      } else {
+        a.recovery = null;
+        this.startTurn(a, CONTINUE).catch((error) => { if (!this.closing && ACTIVE.has(a.status)) this.finish(a, 'failed', { message: error.message }); });
+      }
+      return;
+    }
+    if (turn.status === 'failed' && (a.overflow || isOverflow(turn.error)) && !a.recoveryUsed) {
+      a.recoveryUsed = true; a.overflow = true; a.recovery = { compacted: false }; a.status = 'compacting';
+      a.activity = 'compacting context';
+      this.rpc('thread/compact/start', { threadId: a.threadId }).catch((error) => {
+        if (a.recovery && !a.interrupted && !this.closing) { a.recovery = null; this.finish(a, 'failed', { message: `Context compaction failed: ${error.message}` }); }
+      });
+      return;
+    }
+    if (turn.status === 'completed') { a.result ??= a.unclassifiedResult ?? ''; this.finish(a, 'completed', { result: a.result }); }
+    else this.finish(a, 'failed', { message: turn.error?.message ?? a.lastError?.message ?? 'Codex turn failed.', codexErrorInfo: turn.error?.codexErrorInfo ?? a.lastError?.codexErrorInfo });
+  }
+
+  finish(a, kind, details) {
+    if (a.terminalEmitted) return;
+    a.terminalEmitted = true;
+    a.status = kind; a.activity = kind; a.turnId = null; a.recovery = null;
+    // Descendants can outlive the root turn. Their wire IDs remain answerable
+    // until their own turn ends, the server resolves them, or the controller closes.
+    a.pending = a.pending.filter((request) => request.params.threadId !== a.threadId);
+    if (kind === 'failed') a.error = details;
+    this.publish(a, kind, details);
+  }
+
+  async serverRequest(message) {
+    if (this.closed || this.closing) {
+      await this.client.reject(message.id, -32000, 'Agent controller is closing.').catch(() => {});
+      return;
+    }
+    const p = message.params ?? {}, sourceId = this.threadId(p), direct = this.threads.get(sourceId), a = direct ?? this.descendants.get(sourceId);
+    if (!a) {
+      if (this.starting) { this.early.push({ request: true, message: copy(message) }); return; }
+      await this.client.reject(message.id, -32601, 'Thread is not owned by this controller.'); return;
+    }
+    const activeTurnId = direct ? a.turnId : this.descendantTurns.get(sourceId);
+    if (activeTurnId && p.turnId && p.turnId !== activeTurnId) { await this.client.reject(message.id, -32602, 'Stale agent turn.'); return; }
+    if (direct && a.terminalEmitted) { await this.client.reject(message.id, -32602, 'Agent has no active turn.'); return; }
+    if (message.method === 'item/tool/call' && p.tool === 'notify_parent') {
+      const valid = nonempty(p.arguments?.message);
+      if (valid && direct) this.publish(a, 'message', { message: p.arguments.message });
+      await this.client.respond(message.id, { contentItems: [{ type: 'inputText', text: valid ? direct ? 'Delivered to parent.' : 'Report this blocker to your Codex parent agent.' : 'A nonempty message is required.' }], success: valid });
+      return;
+    }
+    const kind = message.method === 'item/tool/requestUserInput' ? 'question' : APPROVALS.has(message.method) ? 'approval' : null;
+    if (!kind) { await this.client.reject(message.id, -32601, 'Unsupported server request.'); return; }
+    const id = String(message.id);
+    const existing = [...this.agents.values()].flatMap((agent) => agent.pending).find((r) => r.id === id);
+    if (existing) {
+      if (existing.wireId !== message.id || existing.params.threadId !== sourceId) await this.client.reject(message.id, -32600, 'Request id collides after string normalization.');
+      return;
+    }
+    if (direct && !a.turnId && p.turnId) a.turnId = p.turnId;
+    a.pending.push({ id, wireId: message.id, method: message.method, params: copy(p) });
+    if (ACTIVE.has(a.status)) a.status = 'waiting';
+    a.activity = `${direct ? '' : 'subagent '}waiting for parent ${kind}`;
+    this.publish(a, kind, { method: message.method, ...copy(p), request_id: id,
+      reply_format: replyFormat(message.method, p), ...(direct ? {} : { source_thread_id: sourceId }) });
+  }
+
+  async answer(a, id, answer) {
+    const pending = a.pending.find((r) => r.id === String(id));
+    if (!pending || pending.responding) throw new Error('No matching pending request.');
+    const result = validateAnswer(pending, answer);
+    pending.responding = true;
+    try { await this.client.respond(pending.wireId, result); }
+    catch (error) { pending.responding = false; throw error; }
+    a.pending = a.pending.filter((r) => r !== pending);
+    if (!a.pending.length) {
+      if (a.status === 'waiting') a.status = 'running';
+      a.activity = ACTIVE.has(a.status) ? 'working' : a.status;
+    }
+    await this.persist();
+    return { agent_id: a.id, request_id: pending.id, answered: true };
+  }
+
+  async models() {
+    const models = [], seen = new Set(); let cursor;
+    do {
+      const page = await this.rpc('model/list', { ...(cursor ? { cursor } : {}) });
+      for (const model of page.data ?? []) models.push({ id: model.model || model.id, name: model.displayName, default: model.isDefault,
+        efforts: (model.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort), default_effort: model.defaultReasoningEffort });
+      cursor = page.nextCursor;
+      if (cursor && seen.has(cursor)) throw new Error('model/list returned a repeated cursor.');
+      seen.add(cursor);
+    } while (cursor);
+    return { models };
+  }
+
+  publish(a, kind, details) {
+    const event = { seq: this.nextSeq++, agent_id: a.id, kind, ...details };
+    this.pendingEvents.push(event);
+    // Keep every important event until a future explicit retention policy exists.
+    // No tool output, thinking, or input prompt enters this durable journal.
+    this.persist().then(() => this.emit('event', copy(event))).catch((error) => this.emit('controllerError', error));
+  }
+
+  persist() {
+    if (!this.statePath) return Promise.resolve();
+    const data = { version: 1, nextSeq: this.nextSeq, pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
+      id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, status: a.status,
+      activity: a.activity, turnId: a.turnId, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
+      snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed,
+    })) };
+    const write = this.persistTail.then(async () => {
+      await mkdir(path.dirname(this.statePath), { recursive: true });
+      const temp = `${this.statePath}.tmp`;
+      await writeFile(temp, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
+      await rename(temp, this.statePath);
+    });
+    this.persistTail = write.catch(() => {});
+    return write;
+  }
+
+  disconnected() {
+    if (this.closed) return;
+    this.closed = true; this.resolveClosed();
+    for (const a of this.agents.values()) {
+      a.pending = [];
+      if (ACTIVE.has(a.status)) this.finish(a, 'failed', { message: 'App-server connection closed.' });
+    }
+  }
+
+  close() {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = Promise.resolve().then(() => this.shutdown());
+    return this.closePromise;
+  }
+
+  async shutdown() {
+    if (!this.closed) {
+      const turns = new Map(this.descendantTurns);
+      for (const a of this.agents.values()) {
+        if (ACTIVE.has(a.status)) {
+          a.interrupted = true;
+          if (a.turnId) turns.set(a.threadId, a.turnId);
+        }
+      }
+      // Use the connection directly: normal RPCs are refused while closing.
+      // Bound shutdown even if a transport fails to enforce its timeout.
+      await Promise.allSettled([...turns].map(async ([threadId, turnId]) => {
+        let timer;
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => this.closed ? undefined : this.client.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 1500 })),
+            new Promise((resolve) => { timer = setTimeout(resolve, 1500); }),
+            this.closedPromise,
+          ]);
+        } finally { clearTimeout(timer); }
+      }));
+    }
+    if (!this.closed) {
+      this.closed = true; this.resolveClosed();
+      for (const a of this.agents.values()) {
+        a.pending = [];
+        if (ACTIVE.has(a.status)) this.finish(a, 'interrupted', { reason: 'controller_closed' });
+      }
+    }
+    this.client.off('notification', this.onNotification);
+    this.client.off('request', this.onRequest);
+    this.client.off('closed', this.onClosed);
+    this.descendantTurns.clear();
+    await this.persistTail;
+  }
+}
+
+function replyFormat(method, params) {
+  if (method === 'item/tool/requestUserInput') return { answers: Object.fromEntries(params.questions.map((question) => [question.id, { answers: ['<text>'] }])) };
+  if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    return { decision: params.availableDecisions?.length ? '<one value from availableDecisions>' : 'accept|acceptForSession|decline|cancel' };
+  }
+  if (method === 'item/permissions/requestApproval') return { permissions: '<granted subset of requested permissions>', scope: 'turn|session' };
+  if (method === 'mcpServer/elicitation/request') return { action: 'accept|decline|cancel', content: '<form data or null>', _meta: null };
+  throw new TypeError('Unsupported response format.');
+}
+
+function validateAnswer({ method, params }, answer) {
+  if (!object(answer)) throw new TypeError('answer must be a protocol response object.');
+  if (method === 'item/tool/requestUserInput') {
+    const ids = params.questions.map((q) => q.id), answers = answer.answers;
+    if (!object(answers) || Object.keys(answers).length !== ids.length || !ids.every((id) =>
+      Array.isArray(answers[id]?.answers) && answers[id].answers.length > 0 && answers[id].answers.every(nonempty))) {
+      throw new TypeError('Answer every question by its exact ID with nonempty strings.');
+    }
+    return { answers: copy(answers) };
+  }
+  if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    const decision = answer.decision;
+    let valid = ['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision);
+    if (method === 'item/commandExecution/requestApproval' && object(decision)) {
+      const exec = decision.acceptWithExecpolicyAmendment?.execpolicy_amendment;
+      const network = decision.applyNetworkPolicyAmendment?.network_policy_amendment;
+      valid = Object.keys(decision).length === 1 && ((Array.isArray(exec) && exec.length > 0 && exec.every(nonempty))
+        || (object(network) && nonempty(network.host) && ['allow', 'deny'].includes(network.action)));
+    }
+    if (!valid) throw new TypeError('Invalid approval decision.');
+    return { decision: copy(decision) };
+  }
+  if (method === 'item/permissions/requestApproval') {
+    const permissions = answer.permissions;
+    if (!object(permissions) || !['turn', 'session'].includes(answer.scope) || Object.keys(permissions).some((k) => !['network', 'fileSystem'].includes(k))
+      || (permissions.network !== undefined && (!object(permissions.network) || !Object.hasOwn(permissions.network, 'enabled') || (permissions.network.enabled !== null && typeof permissions.network.enabled !== 'boolean')))
+      || (permissions.fileSystem !== undefined && !validFilePermissions(permissions.fileSystem))
+      || (answer.strictAutoReview !== undefined && typeof answer.strictAutoReview !== 'boolean')) throw new TypeError('Invalid permissions response.');
+    return copy(answer);
+  }
+  if (method === 'mcpServer/elicitation/request') {
+    if (!['accept', 'decline', 'cancel'].includes(answer.action) || !Object.hasOwn(answer, 'content') || !Object.hasOwn(answer, '_meta')) throw new TypeError('Invalid elicitation response.');
+    return copy(answer);
+  }
+  throw new TypeError('Unsupported answer method.');
+}
+
+function validFilePermissions(value) {
+  if (!object(value) || !['read', 'write'].every((key) => Object.hasOwn(value, key) && (value[key] === null || (Array.isArray(value[key]) && value[key].every(nonempty))))) return false;
+  if (Object.keys(value).some((key) => !['read', 'write', 'globScanMaxDepth', 'entries'].includes(key))) return false;
+  if (value.globScanMaxDepth !== undefined && (!Number.isSafeInteger(value.globScanMaxDepth) || value.globScanMaxDepth < 0)) return false;
+  if (value.entries !== undefined && (!Array.isArray(value.entries) || !value.entries.every((entry) => {
+    if (!object(entry) || !['read', 'write', 'deny'].includes(entry.access) || !object(entry.path)) return false;
+    const p = entry.path;
+    if (p.type === 'path') return nonempty(p.path);
+    if (p.type === 'glob_pattern') return nonempty(p.pattern);
+    if (p.type !== 'special' || !object(p.value)) return false;
+    const v = p.value;
+    if (['root', 'minimal', 'tmpdir', 'slash_tmp'].includes(v.kind)) return true;
+    if (v.kind === 'project_roots') return v.subpath === null || typeof v.subpath === 'string';
+    return v.kind === 'unknown' && typeof v.path === 'string' && (v.subpath === null || typeof v.subpath === 'string');
+  }))) return false;
+  return true;
+}

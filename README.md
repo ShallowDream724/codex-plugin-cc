@@ -1,654 +1,83 @@
-# Codex plugin for Claude Code
+# Codex Subagents
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+让 Claude Code 负责沟通、判断和调度，让 Codex 执行任务。支持连续发消息、等待、提问回传、中断，以及沿用原历史继续工作。
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
+这是从 `y-cruce/codex-plugin-cc` 精简出的独立插件。运行时只依赖 Node 和 Codex CLI；没有 ACP、Qoder、Antigravity、DSH、额外管理代理、固定模型清单或旧模型提示教程。
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+## 安装条件
 
-## What You Get
+- Node.js 22 或更新版本。
+- 已配置并登录的 Codex CLI。协议以 `0.153.4` 的 App Server 为基线，使用 `thread/inject_items`。
+- 支持 JavaScript mods 的 Claude Code。开发适配对象为本机 `@cometix/claude-code 2.1.303`。
 
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:answer`, `/codex:message`, and `/codex:cancel` to hand off sessions and steer or manage background jobs
-- delegation itself is driven by the [code-director](https://github.com/y-cruce/code-director) workflow: it starts a Codex task through the companion and leaves it running, while the `task-pane` mod watches every job of the session, draws its live trace and raises the events the director must act on
+终端和 Desktop 使用同一份插件，宿主需要提供 mods 与 `session.messages({as:'api'})` 能力。插件不修改 Claude Code 的安装文件。Desktop 的实际内核和通知呈现由使用者验收，不用 CLI 测试代替 Desktop 验收。
 
-## Requirements
+## 上下文范围
 
-- **ChatGPT subscription (incl. Free) or OpenAI API key.**
-  - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
+默认 `context_mode: available`：继承 Claude 公开接口当前能提供的上下文。已核验内核最多返回最近 4,096 条正规化后的 API 消息，并可能向后移动到合适的用户消息边界。它不保证包含整段会话的全部历史，因此不用 `all` 命名。
 
-## Install
+4,096 数的是 API 消息，不是人类对话轮数或工具执行次数。一条消息可以包含多个工具块；一次执行通常包含调用和结果。压缩后的当前摘要、保留消息和后续内容仍由 Claude 自己选择，插件不回填已丢弃的历史、不额外请求摘要、不估算 token。
 
-Add the marketplace in Claude Code:
+`context_mode: none` 用于只需要当前任务说明的独立工作。Codex 如果缺少必要细节，会通过问题回传给 Claude。
 
-```bash
-/plugin marketplace add y-cruce/codex-plugin-cc
-```
+## 加载
 
-Install the plugin:
+从当前目录加载到一次 Claude Code 会话：
 
 ```bash
-/plugin install codex@y-cruce-codex
+claude --plugin-dir "/absolute/path/to/codex-subagents"
 ```
 
-Reload plugins:
+在 Claude 中加载 `/codex-subagents:codex-delegation`，然后正常说明工作。工具定义按需通过 ToolSearch 加载。
 
-```bash
-/reload-plugins
-```
-
-Then run:
-
-```bash
-/codex:setup
-```
-
-`/codex:setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
-
-If you prefer to install Codex yourself, use:
-
-```bash
-npm install -g @openai/codex
-```
-
-If Codex is installed but not logged in yet, run:
-
-```bash
-!codex login
-```
-
-After install, you should see the slash commands listed below.
-
-One simple first run is:
-
-```bash
-/codex:review --background
-/codex:status
-/codex:result
-```
-
-## Usage
-
-### Live task input
-
-With Claude Code 2.1.299 or later, task completion, failure and pending questions use your notification channel. The task name and status in the pane are one clickable control. Sessions without a drawing surface report why the pane cannot be shown.
-
-When entering a target for `/codex:tasks`, `/codex:tasks forget` or `/codex:message`, type part of its name or ID and press Tab to insert its ID. Message suggestions include only running tasks; answer pending questions with `/codex:answer`.
-
-Use the job ID from `/codex:status` to control an already running task:
+从 GitHub 分支安装时，使用该分支作为 marketplace 来源：
 
 ```text
-/codex:message <job-id> Use the latest plan from the plan center, not the stored chargeId.
-/codex:message <job-id> --interrupt Stop this approach and inspect the new requirement first.
-/codex:status <job-id> --wait
-/codex:answer <job-id> --request-id <id> --answers-file /absolute/path/answers.json
+/plugin marketplace add ShallowDream724/codex-plugin-cc#feat/codex-subagents
+/plugin install codex-subagents@codex-subagents
 ```
 
-For Codex, `message` uses native `turn/steer`: inputs stay ordered and are consumed before a later model request, not necessarily before tools already issued by the model. The acknowledgement means accepted, not executed. `--interrupt` cancels the current turn and starts a new turn in the same job and thread with the new input and the original write permission. Existing changes remain; its report includes observed file changes and the workspace's Git status, including pre-existing edits.
+## 工具
 
-The director's `mcp__codex__message` tool also defaults to steering when
-`delivery` is omitted. Qoder supports it when its initialize response advertises
-`agentCapabilities._meta.qoder.promptQueueing: true` and the plugin reports
-`midTurnSteer: true`: the plugin submits another `session/prompt` in the same
-session and keeps the original prompt response as the job and turn completion
-boundary. Qoder can consume an added message while leaving its RPC pending;
-that pending RPC does not delay completion. Its receipt is
-`sent: true, accepted: null, consumed: null`; it confirms local submission, with
-no separate acknowledgement of acceptance or model consumption. A later request
-rejection received before the original prompt completes fails the turn. Use `delivery: "queue"` for an explicitly requested
-next turn or an ACP agent without steering support; use
-`delivery: "interrupt"` when the current turn must stop.
+| 工具 | 行为 |
+|---|---|
+| `spawn_agent` | 新建 Codex；`available` 继承接口提供的当前上下文，`none` 独立开始 |
+| `send_message` | 运行时 steering；空闲时仅将消息写入原历史 |
+| `followup_task` | 续接同一线程，运行时直接 steering |
+| `wait_agent` | 在程序里等待重要事件，不反复采样 Claude |
+| `answer_agent` | 按原请求 ID 回答问题或审批 |
+| `interrupt_agent` | 中断当前轮，保留历史与文件修改 |
+| `list_agents` | 简短状态，供恢复 ID 或诊断 |
+| `list_models` | 查询当前 Codex 实际支持的模型与推理档位 |
 
-`delivery: "queue"` (or `/codex:message <job-id> --queue`) also works after the task has ended. When the thread has no active round, it starts a background follow-up in the same thread and returns `queuedJobId`, retaining the task name, write permissions and executor configuration.
+默认等待。只有确有必要的独立工作才并行。Codex 仍能调用自己的原生子代理；其工具过程和结果不会逐层灌入 Claude。必要的后代提问或审批会归到直接代理，由同一请求 ID 回答。
 
-主 agent 的 `mcp__codex__message` 省略 `delivery` 时，默认引导当前任务。Qoder 初始化声明
-`agentCapabilities._meta.qoder.promptQueueing: true`，且插件报告 `midTurnSteer: true` 时，
-插件向同一会话追加 `session/prompt`，以原始请求的响应作为同一个 job 和 turn 的完成边界。
-Qoder 可能已消费追加消息但一直不结束其 RPC，该未结束请求不会阻止任务完成。
-回执 `sent: true, accepted: null, consumed: null` 只确认本地已提交，代理接受与模型消费没有独立确认；
-原始请求完成前收到追加请求的明确拒绝，会使当前轮失败。未提供引导能力的 ACP 执行器，或明确要求下一轮执行时，
-使用 `delivery: "queue"`；需要停止当前轮时使用 `delivery: "interrupt"`。
+## 上下文与缓存
 
-任务结束后也可以使用 `delivery: "queue"` 或 `/codex:message <job-id> --queue`。线程没有活动轮次时，会在同一线程启动后台续跑并返回 `queuedJobId`，沿用任务名、写入权限和执行器配置。
+每次新建都重新读取 Claude 的当前可用窗口。连续四五次压缩后，在接口返回范围内传入当前摘要、明确保留的消息及后续消息，不拼接此前快照。返回的用户消息、Claude 回复、工具参数和结果不再被插件截短；thinking 不传。工具调用作为历史证据，不会被重新执行。图片字节只作为图片传递一次，不另塞一份 base64 正文。
 
-ACP agents can advertise `_meta.steering.supported: true` at the initialize response's top level or under `agentCapabilities`. The plugin then calls the pre-standard `_session/steering` extension with `idleBehavior: "promptRequired"`. Only `outcome: "injected"` confirms insertion (`accepted: true`, `consumed: null`); `promptRequired` leaves the message with the caller. DSH's community adapter expose mid-turn input through this route. Servers that do not advertise it keep queue/interrupt behavior.
+已记录在有效窗口里的项目说明和引用会随消息传递；Claude 独立的系统提示词和工具定义不复制。Codex 使用自己的运行时和工具。无法表示的二进制附件（例如原始 PDF document block）会明确报错，避免静默丢失；可以改用已提取文本或明确指定文件任务。
 
-ACP 服务可通过握手顶层或 `agentCapabilities` 下的 `_meta.steering.supported: true` 声明引导扩展。插件调用 `_session/steering` 并要求 `idleBehavior: "promptRequired"`，只有 `injected` 结果才记为已插入（`accepted: true`，模型消费仍未知）；`promptRequired` 表示消息未送入，需要调用方决定后续操作。DSH 社区适配器通过此入口连接运行时的追加输入能力，未声明能力的服务继续使用 queue/interrupt。
+初始快照只注入一次。续接不重新导入 Claude 历史，也不修改旧系统提示词或工具描述。通知只追加。插件不估算 token；真实超限错误触发最多一次 Codex 原生压缩恢复。压缩本身会形成新历史前缀，应与普通续接的缓存命中分开验收。
 
-[Antigravity CLI setup](plugins/codex/scripts/agy-acp/README.md) uses native concurrent `session/prompt` for steering. The driver waits for the newest prompt before ending the same job and turn. DSH uses [@8kugames/dsh-zed-acp](https://github.com/8kugames/dsh-zed-acp) in its isolated profile; its built-in steering replaces the local DSH adapter patch for new tasks.
+## 状态与生命周期
 
-[Antigravity CLI 接入说明](plugins/codex/scripts/agy-acp/README.md)使用原生并发 `session/prompt` 纠偏；驱动等待最新 prompt 后才结束原 job 和 turn。DSH 使用独立 profile 中的 [@8kugames/dsh-zed-acp](https://github.com/8kugames/dsh-zed-acp)，新任务直接使用其内置 steering。
+Claude 界面显示简短代理状态；问题、重要通知和最终结果进入对话。没有过程读取工具，也没有递归工具日志面板。
 
-`status <job-id>` shows pending messages, questions, and interruption state. Messages leave the pending list when their user-message event is observed; this confirms entry into thread history, not model execution. `status --wait` returns early for questions. Answer files contain an answers map such as `{"source":{"answers":["Use the latest plan."]}}`. Answers must match the pending request and question IDs. Questions time out after 10 minutes and interrupt the turn; the plugin does not fabricate an answer or auto-approve permissions. After answering, wait on the same job again and collect `/codex:result <job-id>`.
+状态默认位于 `~/.claude/codex-subagents/<session-hash>/`。只保存线程标识、快照摘要、状态、未确认的重要事件和实际 usage，不另存整份 Claude 快照。Codex 的原生线程历史由 Codex 自己持久化。
 
-Codex tasks require the shared broker. Active-turn controls use the existing runtime; an idle queued follow-up resumes the same thread through the normal task runner. The broker enables `default_mode_request_user_input` for its Codex process without editing global configuration. Existing sessions must restart to load an updated broker. `task --thread <id> --write` applies workspace-write on `turn/start`; omitting `--write` explicitly restores read-only. `task --fork-thread <id>` forks an idle thread in the same repository into a new independent job and thread, inheriting its executor, ACP launch configuration, mode, permissions, model and effort unless overridden, and recording `forkedFrom: { threadId, jobId }` on the job; it conflicts with `--thread`, `--resume-last`/`--resume` and `--fresh`. Native `thread/queue/*` (follow-up turns after completion) is separate and is not exposed by these mid-turn controls.
+正常会话结束会关闭所属桥接进程；异常断开后租约最多约 90 秒过期。下次由 `followup_task` 恢复原线程，不自动重跑旧任务。中断等待只结束等待订阅，不中断正在工作的 Codex。
 
-Run `npm test` and `npm run build` for local checks. The optional `CODEX_REAL_APP_SERVER_TEST=1 node --test tests/real-app-server.test.mjs` uses an installed Codex CLI with isolated temporary configuration and a local mock model, including actual file writing and syntax validation. It does not contact a real model service.
+可配置环境变量：`CODEX_SUBAGENTS_NODE_COMMAND`、`CODEX_SUBAGENTS_CODEX_COMMAND`、`CODEX_SUBAGENTS_STATE_DIR`。可执行文件路径与参数分开传递，不通过 shell 拼接。保持用户现有 Codex 凭据、sandbox 和审批策略；不启用 fast/priority。
 
-### Director tools
-
-When code-director's `dispatch.sh` is installed at `~/.claude/skills/code-director/scripts/dispatch.sh`, the plugin gives the director native tools of its own: `mcp__codex__dispatch`, `mcp__codex__message`, `mcp__codex__answer`, `mcp__codex__result`, `mcp__codex__status`, `mcp__codex__tasks` and `mcp__codex__cancel`. They sit in the tool list from the start of the session, with no ToolSearch step. `dispatch` takes the headers as fields (`mode`, `name`, `cwd`, `brief`, and optionally `thread`, `base`, `write`, `effort`, `model`, `siblings`, `sandbox`, `executor`, `executor_mode`, `executor_effort`, `executor_command`, `executor_args`, `executor_permissions`) and passes the brief to `dispatch.sh dispatch` on stdin. It returns the same `STATUS` / `JOB` / `NAME` / `THREAD` lines, and the tasks pane picks up the job at its next poll. `message` and `answer` write the correction or the answers map to a temporary file, run `dispatch.sh message` or `dispatch.sh answer` on it, and remove it afterwards. `result`, `status` and `cancel` run this plugin's own companion; `cancel` needs the job id and ends that job, which TaskStop cannot. A failure comes back as a tool error carrying the script's own line. Every tool runs the plugin's own `codex-companion.mjs`, not whichever version is newest in the plugin cache. The Bash route still works where the tools are absent (the skill not installed, or mods unavailable).
-
-A task dispatched by a Claude subagent records its `directorAgentId`. Channel, Monitor and pane events go back to that agent through `session.send`, which can resume it after it ends. If the host refuses delivery, the main session receives the event with the original agent and the failure reason. Older jobs and tasks dispatched by the main loop keep their session delivery.
-
-`dispatch.sh` 安装在上述位置时，插件为主 agent 注册 `mcp__codex__dispatch`、`message`、`answer`、`result`、`status`、`tasks`、`cancel` 七个工具，会话开始即可直接调用，不必先经过 ToolSearch。派单的各个头部字段变成结构化参数，brief 通过 stdin 交给 `dispatch.sh`，不再经过 shell 命令行；返回的内容与原来相同，任务面板在下一次轮询时显示该任务。纠正消息和答案会先写入临时文件，执行完毕后删除。`cancel` 必须给出任务 ID，用来结束该任务（TaskStop 停不了 Codex 任务）。所有工具都使用本插件自带的 companion。没有这些工具时，原来的 Bash 用法照常可用。
-
-`mcp__codex__tasks` finds a thread to continue or checks what this Claude session has running across repositories. It returns one line per thread with its name, thread id (`pending` until known), executor, status, latest job and repository, appending `forked from=<thread>` for forked threads. Queued follow-up rounds share one line with their thread. The newest 20 threads appear first, with a count of older matches; optional `query` filters the name without regard to case, `cwd` limits the repository, `limit` accepts 1–100, and `all: true` includes other sessions' tasks created in the last 3 days with an `other session=<id>` marker. Set `days` to a positive integer to widen that window. This session's threads have no age limit. The first listing migrates older unindexed jobs once; later listings read this session's index. Indexes idle for 7 days expire independently of state retention.
-
-At session start, a detached cleanup runs at most once every 24 hours under a process lock. It deletes only this plugin's `$CLAUDE_PLUGIN_DATA/state` directories whose recorded workspaces are gone and whose entire contents have been idle for 3 days, plus equally old directories with no job records. Existing workspaces, queued/running jobs with live or unknown owners, unreadable metadata and directories containing symlinks are kept. Deleted directories' references are removed from every session index; `director-delivery` and other plugins' data are untouched. Preview each directory and its file bytes with `CLAUDE_PLUGIN_DATA=<this-plugin-data> node plugins/codex/scripts/codex-companion.mjs gc --dry-run` (add `--json` for totals by rule and session). Omit `--dry-run` to clean up, subject to the same daily throttle. Session byte totals count whole directories shared with that session; file bytes exclude directory metadata and filesystem allocation overhead.
-
-会话开始时，插件在后台清理，每 24 小时最多运行一次，进程锁防止并发重复执行。仅清理本插件数据中已删除工作区、全部内容闲置满 3 天的状态目录，以及同样闲置满 3 天且没有 job 记录的目录；保留仍存在的工作区、owner 存活或无法确认的排队/运行中任务、无法读取的记录和含 symlink 的目录。删除后同步移除各会话索引中的引用。运行上述 `gc --dry-run` 可只读预览目录及字节数，去掉该参数执行清理，仍受每日节流限制。
-
-`mcp__codex__tasks` 默认列出本 Claude 会话跨仓库派出的线程，每个线程一行，包含名称、线程 ID（尚未获得时为 `pending`）、执行器、状态、最新 job 和仓库路径，分叉出的线程末尾追加 `forked from=<thread>`。排队的后续轮次合并到同一线程。默认从新到旧显示 20 条并提示未显示的数量；`query` 按名称筛选且忽略大小写，`cwd` 限定仓库，`limit` 可设为 1–100，`all: true` 包含其他会话最近 3 天创建的任务并标出会话 ID，`days` 可用正整数扩大范围。本会话的线程不设时间窗口。首次列表会一次性迁移旧任务，后续读取会话索引；闲置 7 天的索引会被清理，状态目录按上述 3 天规则回收。用它查找要继续的线程或查看本会话正在运行的任务。
-
-### Director channel
-
-Native lifecycle and command hooks keep task ownership and the channel bound to the current
-session, including after `/clear` and `/resume`. The command `SessionStart` hook
-exports the transcript path. If it is unavailable, `/codex:transfer` asks for
-`--source`; a path left over from another session is cleared.
-
-普通生命周期与命令 hooks 负责同步当前会话的任务归属和 channel 绑定，包括 `/clear`、`/resume`
-之后的会话。命令式 `SessionStart` 导出会话文件路径；路径缺失时 `/codex:transfer` 提示提供
-`--source`，上一会话遗留的路径会被清除。
-
-After `/reload-plugins`, the pane stops leftover event Monitors at the end of a turn once the channel is confirmed and that repository needs no fallback watch. Long Monitor notifications carry their delivery receipt on the same stdout line; ingress restores the full event text before delivery.
-
-`/reload-plugins` 后，channel 确认且对应仓库无需后备监听时，面板在本轮结束时停止残留的事件 Monitor。长通知的正文摘要与去重标记放在同一行，入口从事件记录恢复全文后投递。
-
-From 1.4.58 the plugin also ships a [channel](https://code.claude.com/docs/en/channels) MCP server, `director`. Start Claude Code with the plugin named among its channels:
+## 验证
 
 ```bash
-claude --dangerously-load-development-channels plugin:codex@y-cruce-codex
+npm test
+npm run check
+claude plugin validate .
 ```
 
-This marketplace is not on the approved channels allowlist, so it needs the development flag, and Claude Code asks you to confirm it at every start. Once the startup probe confirms the route, the broker pushes questions and notes directly from their tool handlers, and job endings from the explicit job finish path. Command output and the tasks pane's replay cursor cannot delay those messages. They arrive as `<channel source="plugin:codex:director" event="question_opened" job="task-…" id="…">` messages, joining a running turn at its next step or starting one when idle. Questions include the request id, every question id, full text and option descriptions; notes include `pending_request=` when a question is open. The tool reply says “Accepted for the director”; it does not prove the director read the message.
+默认测试均为本地模拟，不调用真实模型。显式 host 集成测试使用本地假模型服务器、假 Codex 和隔离 Claude 配置，拒绝非回环网络连接。真实模型输出质量、费用、缓存命中及 Desktop 验收由使用者按 [验收步骤](docs/ACCEPTANCE.md) 完成。
 
-Each Claude session has a durable outbox and shared delivery receipts under the plugin data directory. Brokers connect to the channel's socket; its ACK confirms transport only. The session consumer also watches its outbox and retries failed or unaccepted items, recovering acceptance even if the publisher dies before IPC. A slow rescan repairs missed watch notifications. The prompt.submit ingress writes the final receipt only after accepting a channel message or Monitor notification; a frame dropped after Monitor retirement or a session change stays pending for recovery. Delivery is at least once: a crash between ingress acceptance and persisting its receipt can repeat the stable id. The receipt does not prove model reading or an atomic durable enqueue inside Claude Code. Answered, closed and expired questions are persisted and excluded from replay. ACP/Qoder questions, permissions and job endings use the same publisher, using the persisted job's owner session. Producers declare push support in the jobs they own; jobs from an older broker without that declaration retain pane/Monitor fallback. A running old broker is reused without replacement. Session hooks rebind on `/clear` and `/resume`; one fenced consumer owns each session, and multiple repository brokers can use it. The pane keeps displaying progress and stops producing director lines while the channel is confirmed. Once the channel is confirmed, repositories whose live jobs declare push support keep no Monitor, for both Codex and ACP. Broker idle exit still works.
-
-Until the probe returns (up to fifteen seconds), the pane holds its fallback. Without confirmation, or after the channel's heartbeat expires, the Monitor route remains available. Both routes write the same per-event receipt, so changing routes does not repeat an already reported event. Settled or accepted items are removed from the outbox while their tombstones and receipts remain. Producers push once and leave recovery to the consumer. Inactive sessions expire 30 days after their last activity; a live consumer lease always keeps its session. Retention runs at channel startup and once an hour, separately from the current-session 30-second recovery rescan. Channels work in interactive sessions only; `claude -p`, the SDK and sessions without the flag keep the Monitor route.
-
-本 marketplace 不在官方 channel 白名单里，需要用上面的开发参数启动，每次启动都会要求确认。启动探针回到会话后，broker 会从提问和通知的工具处理函数直接推送消息，从明确的任务结束路径推送完成、失败或取消消息。命令输出和任务面板的回放进度不会阻塞它们。消息在回合进行中插到下一步，会话空闲时启动新回合。提问携带 request id、全部 question id、完整问题和选项说明；存在待答问题时，通知携带 `pending_request=`。工具返回“Accepted for the director”只说明已接受，不能证明主 agent 已阅读。
-
-每个 Claude 会话在插件数据目录中保存持久 outbox 和统一的投递记录。broker 主动连接 channel socket，ACK 仅确认传输。会话消费者还会监听 outbox 并重试发送失败或未被接受的事件，发布者在 IPC 前退出也能恢复；低频重扫只修复遗漏的文件通知。prompt.submit ingress 接受 channel 消息或 Monitor 通知后才保存最终投递记录，被退休 Monitor 或会话校验丢弃的帧保留待恢复。交付保证为至少一次：ingress 接受后、保存记录前崩溃，可能重复同一 id；记录不能证明模型已阅读或 Claude 内部已原子完成持久入队。已回答、关闭和过期的问题会持久记录并排除回放。ACP/Qoder 的提问、权限请求和任务结束也共用 publisher，owner session 从持久化的 job 读取。producer 在自己拥有的 job 上声明 push 能力；旧 broker 没有声明时保留 pane/Monitor fallback，继续复用正在运行的 broker。独立 hook 在 `/clear`、`/resume` 时重新绑定会话，每个会话由一个带实例校验的消费者处理，同一会话可连接多个仓库的 broker。面板继续显示任务，channel 确认后停止生成主 agent 消息。channel 确认后，Codex 和 ACP 仓库都不再保留 Monitor；未声明 push 能力的任务仍保留 fallback。broker 仍按原条件空闲退出。
-
-探针等待期间（最多 15 秒）面板暂缓 fallback。未确认 channel 或心跳过期时使用 Monitor；两条路径共用逐事件投递记录，切换时不会重新报告已有记录的事件。已接受或已结束的事件移出 outbox，保留 receipt 和 tombstone。producer 只直接推送一次，恢复由消费者负责。inactive session 在最后活动 30 天后清理，有活跃 consumer lease 的会话始终保留；清理在 channel 启动时及每小时执行，与当前会话的 30 秒恢复重扫分开。channel 只在交互模式下生效，`-p`、SDK 和未带参数启动的会话继续使用 Monitor。
-
-
-To reach a session's channel without a Codex job, for example from another session working in the same checkouts, run `node plugins/codex/scripts/notify-session.mjs <claude-session-id> <message-file> [--from <name>] [--wait-ms <ms>]`. It publishes a `director.notified` event into that session's outbox, labelled `message from <name>, not a Codex job`, and waits up to `--wait-ms` (default 15000) for the receipt. It prints `NOTIFIED` once the session accepted the note, or `QUEUED` with the outbox path when its channel is not running; the channel replays queued notes when it comes up. An installed copy finds its data directory from its own path; elsewhere set `CLAUDE_PLUGIN_DATA`.
-
-不经过 Codex 任务给某个会话的 channel 发消息（例如另一个会话在同一批仓库里工作时），运行 `node plugins/codex/scripts/notify-session.mjs <claude-session-id> <消息文件> [--from <名称>] [--wait-ms <毫秒>]`。脚本往该会话的 outbox 发布一条 `director.notified` 事件，标签为 `message from <名称>, not a Codex job`，最多等 `--wait-ms`（默认 15000）拿投递记录。会话接受后输出 `NOTIFIED`；channel 未运行时输出 `QUEUED` 和 outbox 路径，channel 启动后补投。安装后的副本按自身路径找到数据目录，其他位置运行时设置 `CLAUDE_PLUGIN_DATA`。
-
-A Claude session on another machine (for example a remote pod driving this machine's Codex through a forwarded port) can receive its jobs' events through its own channel with `plugins/codex/scripts/remote-relay.mjs`. It is opt-in and loaded by nothing, so local sessions are unaffected. Dispatch with `CODEX_COMPANION_SESSION_ID=<remote session id>`; those events then wait in this machine's outbox for that session. On this machine run `node remote-relay.mjs serve --session <remote session id> [--port 13005]` (it listens on 127.0.0.1 only and serves only the named sessions; `--session "*"` serves any, since a remote session's id changes on `/clear`, and a session change retires the previous session's watch). On the remote machine, with the session started with the plugin's channel, run `node remote-relay.mjs bridge --session <remote session id> [--url http://127.0.0.1:13005]`. The bridge copies each pending event into the remote session's outbox, where its channel delivers it; once the remote receipt exists it acks, and `serve` writes the local receipt. An event the source settles first, such as a question answered from elsewhere, is withdrawn from the remote outbox. Where the remote machine has no channels, create `~/.claude/codex-remote-relay.json` there with `{"url": "http://127.0.0.1:13005"}` instead of running the bridge: the tasks pane then keeps one Monitor running `remote-relay.mjs watch` for the session, which prints each event as a line the Monitor delivers and acks it, and re-arms it when it ends. Without that file nothing is armed.
-
-运行在另一台机器上的 Claude 会话（例如通过端口转发驱动本机 Codex 的远程 pod）可以用 `plugins/codex/scripts/remote-relay.mjs`，经自己的 channel 接收任务事件。该脚本需要手动启用，不被任何配置加载，本地会话不受影响。派单时设 `CODEX_COMPANION_SESSION_ID=<远程会话 id>`，这些事件会留在本机该会话的 outbox。本机运行 `node remote-relay.mjs serve --session <远程会话 id> [--port 13005]`（只监听 127.0.0.1，只服务指定会话；`--session "*"` 服务任意会话，远程会话 `/clear` 后会换 id，mod 会停掉旧会话的 watch）；远程机器上以插件 channel 启动会话，再运行 `node remote-relay.mjs bridge --session <远程会话 id> [--url http://127.0.0.1:13005]`。bridge 把待投递事件复制进远程会话的 outbox，由其 channel 投递；远程写下投递记录后确认，`serve` 再写本机投递记录。来源先行结束的事件（例如已在别处回答的问题）会从远程 outbox 撤回。远程机器没有 channel 时，不运行 bridge，改为在该机器创建 `~/.claude/codex-remote-relay.json`，内容为 `{"url": "http://127.0.0.1:13005"}`：任务面板会为当前会话保持一个运行 `remote-relay.mjs watch` 的 Monitor，每个事件打印成一行由 Monitor 投递并确认，结束后自动重新挂载。没有该文件时不挂载任何东西。
-
-### Parallel worktrees
-
-The director prepares a separate worktree for each writer and passes it as the task's `CWD`. With code-director installed:
-
-```bash
-bash ~/.claude/skills/code-director/scripts/dispatch.sh worktree /abs/source-repo /abs/new-worktree worker/topic
-```
-
-The plugin's `scripts/worktree.mjs <source-repo> <new-directory> <new-branch>` registers the worktree with Git, pins source HEAD, and clones unchanged tracked files. macOS uses native `clonefile` through Python 3 batches; other platforms use `COPYFILE_FICLONE_FORCE`. Unsupported cloning falls back to ordinary copies and reports separate `clonedFiles`, `copiedFiles` and `checkoutFiles` counts. Source edits and missing files come from the pinned Git commit. Untracked or ignored dependencies, outputs and session data are excluded. Keep the source stable during creation; a verification failure retains the incomplete tree for inspection.
-
-From 1.4.45, nested submodules are initialized at their parent's recorded commits, with private Git directories, indexes and objects. Available source submodules provide local clones; otherwise Git uses their configured URLs and normal network permissions. Missing pinned commits are fetched from the configured URL even when the source is initialized. Git's initial object hard links are replaced by independent copy-on-write files where available, or ordinary copies, counted separately as `clonedObjectFiles` / `copiedObjectFiles`; no hard links or alternates remain on success. The `submodules` receipt lists each path, commit, local/remote source and `fetchedFromRemote`. Normal submodule initialization may add registrations to the main repository's shared config. Failed clones remain for inspection. A `.gitmodules` file without gitlink entries does not block creation.
-
-Executors stay in their assigned directory and check symlinks and absolute paths before builds. Writable dependencies and outputs belong to that directory; do not share them through hard links or symlinks. Commit submodule edits before updating the parent gitlink. After stopping tasks and integrating commits, the director uses `dispatch.sh worktree remove <source-repo> <worktree>` (or `node scripts/worktree.mjs remove ...`). Removal checks every repository for uncommitted, untracked and ignored files, and refuses to discard submodule commits outside its recorded initial refs and remote-tracking refs. Git's force flag for initialized submodules is used only after those checks. The parent branch is kept. Hiding a pane row does not remove its tree; keep the original directory while its thread needs further turns.
-
-主 agent 为每个写入者准备独立 worktree，并通过任务的 `CWD` 分配。上述入口先由 Git 登记工作树，再克隆未修改的跟踪文件；macOS 上需要 Python 3 调用 APFS 原生接口，不支持时明确报告普通复制数量。源目录已有修改与缺失文件从固定的 HEAD 提交检出，未跟踪或忽略的依赖、产物和会话数据不复制。支持嵌套子模块，每个子模块固定到父仓记录的提交，并拥有独立 Git 目录、索引和对象库；优先使用本地源子模块，否则按配置 URL 克隆，需要正常的网络和权限。对象文件克隆数单独报告，`submodules` 回执列出路径、提交和来源。初始化可能补全主仓共享配置中的子模块登记；失败时保留目录供检查，不因存在 `.gitmodules` 文件就拒绝创建。
-
-Executor 只在分配目录工作，构建前检查符号链接和绝对路径，可写依赖和产物分别维护；先提交子模块修改，再更新主仓 gitlink。主 agent 停止任务并集成提交后，通过 `dispatch.sh worktree remove <source-repo> <worktree>` 回收目录。入口检查各仓库的未提交、未跟踪、忽略文件及不在初始引用和远端跟踪引用中的子模块新增提交，发现需要保留的数据即拒绝删除；检查通过后才使用 Git 对已初始化子模块要求的 force 参数。主仓分支保留，线程仍需续接时保留原目录，面板隐藏不会回收目录。
-
-### `/codex:review`
-
-Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
-
-> [!NOTE]
-> Code review especially for multi-file changes might take a while. It's generally recommended to run it in the background.
-
-Use it when you want:
-
-- a review of your current uncommitted changes
-- a review of your branch compared to a base branch like `main`
-
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
-
-Both review commands run read-only by default; `--sandbox <read-only|workspace-write|danger-full-access>` widens that so Codex can build or run tests while verifying findings. Each review keeps its Codex thread, so `task --thread <id>` can follow up on the findings in the same context, and its full output is also written next to the job record as `<job-id>.review.md` (the path is the job's `reportFile` and is appended to monitor `DONE` lines as `report=<path>`).
-
-Examples:
-
-```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
-```
-
-This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
-
-### `/codex:adversarial-review`
-
-Runs a **steerable** review that questions the chosen implementation and design.
-
-It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
-
-It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
-
-Use it when you want:
-
-- a review before shipping that challenges the direction, not just the code details
-- review focused on design choices, tradeoffs, hidden assumptions, and alternative approaches
-- pressure-testing around specific risk areas like auth, data loss, rollback, race conditions, or reliability
-
-Examples:
-
-```bash
-/codex:adversarial-review
-/codex:adversarial-review --base main challenge whether this was the right caching and retry design
-/codex:adversarial-review --background look for race conditions and question the chosen approach
-```
-
-This command is read-only. It does not fix code.
-
-### `/codex:transfer`
-
-Creates a persistent Codex thread from the current Claude Code session and prints a `codex resume <session-id>` command.
-
-Use it when you started a debugging or implementation conversation in Claude Code and want to continue that same context directly in Codex.
-
-Examples:
-
-```bash
-/codex:transfer
-/codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
-```
-
-The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
-
-### `/codex:tasks`
-
-Opens or closes the tasks pane for this session. Select a task by its row number
-or a case-insensitive part of its name. Live rows are reconciled with job files
-and live views on each poll.
-
-When a thread continues, its list row and name completions show the latest task name.
-
-线程续接后，列表名称和名称补全随最新实际任务名称更新。
-
-Task names and executor names appear in the list; the pane footer shows the current
-activity, elapsed time and compact usage such as `↓45.3k`. Each running thread independently generates a short activity summary with
-`qoder -p --model dfmodel` after two minutes, then two minutes after each attempt when
-its activity changes. Summaries target 12–30 characters, with a hard limit of 60,
-including English, spaces and punctuation; longer results are rejected. Threads run concurrently without a panel-wide limit. Calls
-use a dedicated system prompt, disable thinking, bypass proxy environment variables
-and do not persist Qoder sessions. The footer omits `running`; waiting and terminal
-states remain explicit. Disable summaries with the `activitySummary` plugin option.
-The pane shows native context usage as `700k/1000k (70%)` when reported. Codex
-supplies `tokenUsage.last.totalTokens` and `modelContextWindow`; ACP supplies
-`usage_update.used` and `size`. Antigravity `view_file` rows include the file path
-and requested line range.
-
-任务名称和执行器名称显示在列表中，面板底部状态行显示当前活动、耗时及 `↓45.3k` 形式的用量。每个 running thread
-独立通过 `qoder -p --model dfmodel` 生成短摘要：运行2分钟后首次请求，此后每次尝试结束
-再等2分钟，活动未变就跳过。摘要目标12至30个字符，硬上限60个字符，英文、空格和标点也计入，超长结果不采用。
-thread 之间并行，不设面板级上限。调用使用专用系统提示词，
-关闭思考、清除代理环境变量并直连，不保存 Qoder 会话。状态栏省略 `running`，等待和
-结束状态继续明确显示；可通过插件选项 `activitySummary` 关闭摘要。执行器上报原生上下文数据时，
-状态栏显示如 `700k/1000k (70%)` 的已用量、容量和占比。Codex 取
-`tokenUsage.last.totalTokens` 和 `modelContextWindow`，ACP 取 `usage_update.used`
-和 `size`。Antigravity 的 `view_file` 行显示文件路径和请求读取的行范围。
-
-The pane leaves two columns of space on the right, shows the director's delivered
-answers after the questions, and displays durations in whole seconds.
-
-面板右侧保留两个字符的空白；提问后显示主 agent 送达的回复内容，耗时显示到整秒。
-
-Commands with a nonzero exit code show `exit N`. The pane and inline traces
-omit command output and output preview controls.
-
-命令非零退出时显示 `exit N`；面板与内联轨迹均不展示命令输出及输出预览入口。
-
-The pane and inline traces use the same block layout for `◆ ↓ Director reply`,
-`◆ ↓ Director message`, `◆ ↓ Director interrupt` and `◇ ↑ Executor notification`.
-Headings align on the left and bodies indent two columns. All four use cyan for both
-headings and bodies, including completed notification cards. Messages retain
-their complete text and wrap in traces.
-Queued director messages stay at the bottom, one row per message, with
-`◆ ↓ Director message · queued`. Line breaks collapse to spaces and long messages
-are truncated with an ellipsis; queued rows have no blank lines between them.
-When execution starts, each message appears between the preceding answer and its
-own turn's output with the complete body. Queued follow-up jobs show their briefs in the same waiting area.
-When a Codex turn ends, all messages then waiting are sent together to the next
-turn in arrival order. Messages received during that turn form the next batch.
-Completed, failed and cancelled tasks stay in the pane for three minutes after ending.
-Completed Markdown tables use bordered columns with wrapping cells, or labelled
-rows when the viewport is too narrow. Cell formatting and links use native Markdown.
-While Codex compacts its context, the trace, task list and status hint show
-`正在压缩上下文` with elapsed time in the trace and hint. The state clears when
-compaction completes or the turn or task ends.
-
-面板与内联轨迹用统一块式布局显示 `◆ ↓ Director reply`、`◆ ↓ Director message`、
-`◆ ↓ Director interrupt` 和 `◇ ↑ Executor notification`。英文标题左对齐，正文统一缩进两列；
-四类的标题与正文统一使用青色，已结束的通知卡片也使用同一样式。
-消息保留完整正文，在轨迹中换行显示。
-主 agent 的排队消息显示在底部，标为 `◆ ↓ Director message · queued`，每条只占一行。
-换行合并为空格，超长内容以省略号截断，排队条目之间不留空行。
-开始执行后，消息在上一轮回复与本轮输出之间显示完整正文；后续任务的排队正文也显示在底部等待区。
-Codex 当前轮结束时，会将当时积压的全部消息按发送顺序一起交给下一轮；该轮执行期间新收到的消息进入下一批。
-已完成、失败和取消的任务在结束后保留三分钟，再从面板隐藏。
-完整 Markdown 表格显示为带边框且单元格换行的分列布局；窗口过窄时按列名逐条展示。
-单元格内的格式和链接继续使用宿主 Markdown 渲染。
-Codex 压缩上下文期间，轨迹、任务列表和状态提示显示 `正在压缩上下文`，轨迹与提示同时显示耗时。
-压缩完成或本轮、任务结束后清除该状态。
-
-```text
-/codex:tasks
-/codex:tasks 2
-/codex:tasks refresh
-/codex:tasks forget 2
-/codex:tasks forget batch 74
-```
-
-`refresh` clears the pane's cache and rebuilds the list from disk. `forget` hides
-the matching row without changing job data. It stays hidden until refresh or a
-new session.
-
-A shell in the same session reaches the pane with
-`node scripts/codex-companion.mjs pane [list|refresh|forget <n|name|task id>]`.
-`list` prints each row's status in the pane next to its job file's status on
-disk and marks the rows that disagree `STALE`. The pane answers after its next
-poll, within a few seconds.
-
-### `/codex:status`
-
-Shows running and recent Codex jobs for the current repository.
-
-Examples:
-
-```bash
-/codex:status
-/codex:status task-abc123
-```
-
-Use it to:
-
-- check progress on background work
-- see the latest completed job
-- confirm whether a task is still running
-
-### `/codex:result`
-
-Shows the final stored Codex output for a finished job.
-When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
-
-Examples:
-
-```bash
-/codex:result
-/codex:result task-abc123
-```
-
-### `/codex:cancel`
-
-Cancels an active background Codex job.
-
-Examples:
-
-```bash
-/codex:cancel
-/codex:cancel task-abc123
-```
-
-### `/codex:setup`
-
-Checks whether Codex is installed and authenticated.
-If Codex is missing and npm is available, it can offer to install Codex for you.
-
-You can also use `/codex:setup` to manage the optional review gate.
-
-#### Enabling review gate
-
-```bash
-/codex:setup --enable-review-gate
-/codex:setup --disable-review-gate
-```
-
-When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
-
-> [!WARNING]
-> The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
-
-## Typical Flows
-
-### Review Before Shipping
-
-```bash
-/codex:review
-```
-
-### Start Something Long-Running
-
-```bash
-/codex:adversarial-review --background
-```
-
-Then check in with:
-
-```bash
-/codex:status
-/codex:result
-```
-
-## Codex Integration
-
-### Live task history / 实时任务轨迹
-
-The companion records complete app-server event payloads, including text deltas, even without a viewer. Each job has its own durable cursor and atomic `live-view.json` projection. Existing `status`, `result`, `events`, and job logs retain their interfaces.
-
-Observation reads first use the current state directory, then discover the same repository key under `$CLAUDE_CONFIG_DIR/plugins/data/*/state` (default `~/.claude`) and the temporary companion directory. If multiple fallback roots contain a job, the newest job JSON wins. Without `CLAUDE_PLUGIN_DATA`, `observe list` merges these roots. Execution writes keep their existing location.
-
-observe 读取优先使用当前状态目录；找不到任务时，回退查找 Claude 插件数据目录及临时目录下相同 repo-key，并按 job JSON 的修改时间选最新副本。未注入 `CLAUDE_PLUGIN_DATA` 时，list 合并这些目录；写入位置保持不变。
-
-```bash
-node plugins/codex/scripts/codex-companion.mjs observe list --cwd /path/to/repo --json
-node plugins/codex/scripts/codex-companion.mjs observe follow JOB --cwd /path/to/repo --max-seconds 540
-node plugins/codex/scripts/codex-companion.mjs observe follow JOB --cwd /path/to/repo --after CURSOR --until done
-node plugins/codex/scripts/codex-companion.mjs observe replay JOB --cwd /path/to/repo --limit 200 --jsonl
-node plugins/codex/scripts/codex-companion.mjs observe view-path JOB --cwd /path/to/repo
-```
-
-`follow` prints compact item events; `--verbose` includes deltas. It emits `CURSOR:` before DONE, FAILED, QUESTION, NOTIFIED, or TIMEOUT. `--until done` keeps following through notifications. Closing the process closes its subscription; it does not interrupt the Codex task. Completed histories remain readable after the broker exits. Old brokers return `OBSERVATION_UNSUPPORTED` and are never replaced to enable observation.
-
-`QUESTION job=<id> request=<id> ...` is emitted only while that request remains pending. If the same request is encountered again while still pending, `follow` and `events` emit `QUESTION_PENDING job=<id> request=<id> still unanswered: ...` (periodic `events` reminders retain their elapsed-time format). Answered requests are skipped. `NOTIFIED job=<id> thread=<id> pending_request=<id> <note>` includes the request pending when the notification was created; the field is omitted when there was none. Explicit `--after` cursors continue to select their exact history position.
-
-`events --session <id>` saves the first snapshot's already finished jobs as a
-historical baseline, even when it emits no notification. It keeps that baseline
-and terminal output receipts across restarts in the repository's state directory.
-A replacement Monitor reports later completions, failures and cancellations from
-that session, including jobs finished between watches, and skips historical and
-already reported terminals. Existing 1.4.35 receipt files keep their deduplication
-state. The pane also re-arms repositories with recently finished tasks so the last
-task's completion is caught. Watches without `--session` continue to report only
-jobs they observed active.
-
-`events --session <id>` 首次读取任务状态时，把已结束任务保存为历史基线，即使没有通知输出也保存；基线和后续已输出终态的记录在仓库状态目录跨重启保留。监听重挂时补报当前会话在基线之后完成、失败或取消的任务，包括监听空档内结束的任务，跳过历史和已报告终态。已有 1.4.35 回执继续去重。pane 对近期已结束任务所在的仓库也会重挂监听。未指定会话的监听继续只报告自己见过运行中的任务。
-
-Use `--quiet` for relay agents: only the cursor and terminal line are emitted, with a one-line heartbeat every 60 seconds while waiting. DONE does not include result text in this mode; read it separately with `result`. Default display hides token updates, user-message echoes and empty reasoning, and bounds command output previews to 120 characters and assistant rows to 300. Full event payloads and `lastMessage.text` remain unchanged; `--verbose` retains full output.
-
-The live view unwraps recognized `zsh/bash/sh -lc/-c` command wrappers for active commands and tail rows. Completed command rows carry `exitCode` and `durationMs` instead of embedding the exit code in text. Pending questions include ISO `openedAt` and `expiresAt` (the broker's actual deadline, or the shared ten-minute default when absent). Turn lifecycle lines remain in follow output but not in the tail. Raw event payloads are unchanged.
-
-live-view 的活动命令和 tail 会剥除可识别的 shell 包装，无法可靠解析时保留原文；命令完成行通过 exitCode/durationMs 字段提供退出码与耗时，不再拼进 tail 文本。待答问题新增 openedAt/expiresAt 时间字段，turn 起止只在 follow 中展示，不占 tail 行。原始事件 payload 不变。
-
-Native subagent activity binds the child thread to the same job, including notifications buffered before its identity arrived. Child events retain `derived.agent` and render with `[agent-name]` prefixes; tail rows also expose `agent`. The optional `subAgents` projection lists thread ID, short path, activity status and lifecycle timestamps. Child messages and questions do not replace the parent task's current message, question or status. Ownership is retained after child completion/interruption to capture late notifications.
-
-原生子 agent 的 started/interacted/interrupted/completed 活动均会建立同一 job 归属并回放缓冲通知；子线程事件以 derived.agent 标识来源，tail/follow 显示名称前缀。live-view 的可选 subAgents 字段记录生命周期，子线程内容不覆盖父线程的 lastMessage、待答问题或状态；完成后保留归属以记录迟到通知。
-
-事件全程保存，不依赖观察者。`follow` 适用于原生后台 agent 的阻塞 Bash 行；默认展示命令、消息预览、非空推理摘要、文件改动和调度者控制消息，`--verbose` 保留完整展示并输出 delta。`--quiet` 仅输出游标和终结行，等待时每60秒一行心跳，DONE 后不附结果；主线程另用 result 读取。默认命令输出预览最多120字符，assistant行最多300字符，完整事件与 lastMessage.text 不截断。`--max-seconds 540` 可在 Bash 时限前输出游标，下一次用 `--after` 续跟。`view-path` 返回 mod 可直接读取的原子投影文件，最多每秒更新五次，终态额外刷新。
-
-Writes are batched at 50 ms or 256 KiB and become visible only after durable commit. Histories rotate at 64 MiB, retain up to 1 GiB per job, and keep completed jobs for 30 days within a 20 GiB total budget. Retention removes oldest segments/jobs, never truncates individual payloads; expired cursors return `CURSOR_EXPIRED` and `earliestAvailableCursor`. Crashes or retention are marked as partial history. Legacy jobs do not acquire invented event history.
-
-At startup, the broker reconciles unfinished legacy histories in their original
-format. New dispatches use thread records. Startup failures retain their stack
-trace in `broker-start-failure.log` in the workspace's plugin state directory.
-
-broker 启动时按原有格式补齐未结束的旧任务历史，新派单使用线程记录。
-启动失败的调用栈保存在工作区插件状态目录的 `broker-start-failure.log`。
-
-Each repository retains its newest 150 jobs, always keeping queued and running jobs even if they exceed that cap. When a thread record has no retained or live round and no active writer, pruning removes it and its indexes; daily GC also reclaims records orphaned by earlier versions. Persisted events omit `source.raw` and keep command text output in `payload.outputText`. Resuming a pruned thread with `--thread` explains that its local history is unavailable; `--allow-other-repo` lets the executor try its own session history.
-
-写入以 50ms/256KiB 批量提交，公开游标只指向已持久化的数据。异常退出可能丢失尚未提交的批次，上游未提供重放的通知也无法补造。保留策略为单任务 1GiB、64MiB 分段、已结束任务 30 天、总量 20GiB；超限清理最旧历史并明确标记缺口。`job.log` 继续作为兼容文本日志，新增消费者不应解析它。
-
-每个仓库保留最近 150 个任务，排队和运行中的任务始终保留，必要时超过上限。线程记录的所有轮次均已淘汰、均已结束且没有活跃写入者时，清理记录及其索引；每日 GC 也回收旧版本遗留的孤儿记录。持久化事件移除 `source.raw`，命令文本输出保存在 `payload.outputText`。用 `--thread` 续接已清理线程时会提示本地历史不可用，加 `--allow-other-repo` 可让执行器尝试恢复自己的会话历史。
-
-The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
-
-### Common Configurations
-
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
-
-```toml
-model = "gpt-5.4-mini"
-model_reasoning_effort = "high"
-```
-
-Your configuration will be picked up based on:
-
-- user-level config in `~/.codex/config.toml`
-- project-level overrides in `.codex/config.toml`
-- project-level overrides only load when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
-
-Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
-
-### Moving The Work Over To Codex
-
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
-
-This way you can review the Codex work or continue the work there.
-
-## FAQ
-
-### Do I need a separate Codex account for this plugin?
-
-If you are already signed into Codex on this machine, that account should work immediately here too. This plugin uses your local Codex CLI authentication.
-
-If you only use Claude Code today and have not used Codex yet, you will also need to sign in to Codex with either a ChatGPT account or an API key. [Codex is available with your ChatGPT subscription](https://developers.openai.com/codex/pricing/), and [`codex login`](https://developers.openai.com/codex/cli/reference/#codex-login) supports both ChatGPT and API key sign-in. Run `/codex:setup` to check whether Codex is ready, and use `!codex login` if it is not.
-
-### Does the plugin use a separate Codex runtime?
-
-No. This plugin delegates through your local [Codex CLI](https://developers.openai.com/codex/cli/) and [Codex app server](https://developers.openai.com/codex/app-server/) on the same machine.
-
-That means:
-
-- it uses the same Codex install you would use directly
-- it uses the same local authentication state
-- it uses the same repository checkout and machine-local environment
-
-### Will it use the same Codex config I already have?
-
-Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
-
-### Can I keep using my current API key or base URL setup?
-
-Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
-
-If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
-
-## Antigravity executor / Antigravity 执行器
-
-`antigravity` is the canonical executor name; `agy` is an equivalent alias in native dispatch fields and the skill's `EXECUTOR` header. Both launch the same ACP server and can continue the same session.
-
-执行器正式名称为 `antigravity`，`agy` 是等价别名；原生派单字段和技能的 `EXECUTOR` 头部均支持，两种名称可以续接同一会话。
-
-The updated code-director skill assigns frontend design, implementation, debugging, verification and reviews to agy by default, including small changes. Frontend reviews use an `investigate` task with a read-only review brief.
-
-更新后的 code-director 技能默认将前端设计、实现、排障、验证和评审交给 agy，小改动同样适用。前端评审通过 `investigate` 任务配只读审查任务书执行。
-
-New Antigravity sessions default to `$CODEX_COMPANION_ANTIGRAVITY_MODEL`, else `gemini-4-carbon`, with `high` thinking. Selecting an Opus model defaults its thinking to `medium`. Pass `--executor-model` and `--executor-effort` to override those defaults; the director's fields are `model` and `executor_effort`. The ACP driver recognizes the CLI server's `thought_level` option. Resuming a session preserves its model unless explicitly overridden.
-
-Antigravity 新会话默认使用 `$CODEX_COMPANION_ANTIGRAVITY_MODEL` 指定的模型，未设置时用 `gemini-4-carbon`，思考强度 `high`；选择 Opus 模型时，思考强度默认 `medium`。可用 `--executor-model`、`--executor-effort` 显式覆盖，Director 原生工具对应 `model`、`executor_effort` 字段。ACP 驱动支持 CLI 服务的 `thought_level` 选项。续接会话时，只有显式指定模型才切换。
-
-The CLI server returns the signed-in account's full model catalog to `codex-companion`; no client-name override is needed.
-
-CLI 服务直接向 `codex-companion` 返回账号可用的完整模型列表。
-
-Dispatch with `executor: "antigravity"` to run the installed CLI's `agy acp` (verified with 1.5.6), reusing its login and MCP configuration. The preset prefers `~/.local/bin/agy`, then PATH, avoiding terminal wrappers when the local binary exists. Override it with `executor_command` or `CODEX_DIRECTOR_ANTIGRAVITY_COMMAND`; `executor_args` defaults to `["acp"]`, permissions to `allow-once`. Continue with the returned session id. For direct companion calls:
-
-When agy ends a prompt with unfinished commands, the job waits for their native statuses and automatically continues in the same job, sharing a 30-minute limit; native `IsDaemon: true` commands are excluded. Steering is refused while a command runs: choose queue or interrupt. See [background recovery and rollback](plugins/codex/scripts/agy-acp/README.md).
-
-```bash
-node plugins/codex/scripts/codex-companion.mjs task --executor acp --executor-command "$HOME/.local/bin/agy" --executor-args '["acp"]' --executor-permissions allow-once --json "Inspect the project"
-```
-
-派单传 `executor: "antigravity"`，启动 CLI 自带的 `agy acp`（已验证 1.5.6），复用 CLI 登录和 MCP 配置。优先使用 `~/.local/bin/agy`，其次查 PATH；可用 `executor_command` 或 `CODEX_DIRECTOR_ANTIGRAVITY_COMMAND` 指定程序。`executor_args` 默认 `["acp"]`，权限默认 `allow-once`。后续使用返回的 session id 继续对话。
-
-The subprocess inherits the companion's network environment and reads `~/.gemini/config/mcp_config.json` itself, including `serverUrl` entries.
-
-子进程继承 companion 的网络环境，原生读取 `~/.gemini/config/mcp_config.json`，包括 `serverUrl` 配置。
-
-The plugin adds HOME and linked skill directories to agy's additional directories for both new and resumed sessions. File tools can read and write those roots; edit approval remains separate.
-
-agy sorts the workspace list shown to its model, so changing the order of additional roots does not preserve cwd as primary. The plugin uses agy's supported appended system prompt on both new and resumed sessions to name the task's cwd as the default directory for shell commands.
-
-插件在 agy 新建及续接会话时把 HOME 和链接技能的实际目录合并进额外目录，保留已有来源和 cwd。文件工具的读写范围随之扩大，编辑批准仍独立。新 CLI 不生成旧版 workflow 技能，插件也不再写入相应 Git 排除规则。
-
-## DeepSeek Harness executor / DSH 执行器
-
-With the updated code-director skill, `mcp__codex__dispatch` accepts `executor: "dsh"`. It launches `$HOME/.local/share/dsh-fork/dsh --profile acp-fork`. This launcher sets `DSH_HOME=$HOME/.local/share/dsh-fork/home` and uses the isolated runtime in `runtime/`: dsh `0.2.2-rc.1`, Cordis `4.1.0`, and `@8kugames/dsh-zed-acp` `0.3.10`. Override the executable with `executor_command` or `CODEX_DIRECTOR_DSH_COMMAND`, and launch arguments with the `executor_args` string array. For direct companion calls:
-
-```sh
-node plugins/codex/scripts/codex-companion.mjs task --executor acp --executor-command "$HOME/.local/share/dsh-fork/dsh" --executor-args '["--profile","acp-fork"]' --executor-permissions allow-once --json "Inspect the project"
-```
-
-Continue with the returned session id (`mode: "continue"`, `thread: "<session-id>"`); the plugin restores its original executor, command and arguments, including the old launch configuration for existing DSH threads. DSH restores model context through `session/resume`, with local event replay. The community adapter supports `default`/`plan` modes, `session/load`, `session/fork` (`mode: "fork"` / `task --fork-thread <session-id>`, re-applying mode, model and effort on the forked session) and mid-turn steering. Steering keeps the original prompt open until the turn ends. Its default permission policy selects only an offered `allow_once`; `ask` forwards tool permission requests. No model is forced when omitted. Thoughts and answers sharing a source message id remain separate.
-
-派单工具支持 `executor: "dsh"`，默认运行 `$HOME/.local/share/dsh-fork/dsh --profile acp-fork`。启动器设置独立的 `DSH_HOME=$HOME/.local/share/dsh-fork/home`，运行时位于同目录的 `runtime/`，固定 dsh `0.2.2-rc.1`、Cordis `4.1.0`、社区插件 `0.3.10`。可用 `executor_command` 或 `CODEX_DIRECTOR_DSH_COMMAND` 指定程序。续接时恢复原始命令和参数，已有 DSH 线程沿用旧启动配置。社区适配器提供 `default`/`plan` 模式、load、fork（`mode: "fork"` 或 `task --fork-thread <session-id>`，分叉后重新应用模式、模型与强度）和 steering。steering 仍由原 prompt 响应结束回合。默认只应答单次工具许可，`ask` 转交权限请求；省略模型时沿用 DSH 配置。
-
-Keep the new runtime's credentials and sessions in its own home. Credentials can be copied from the existing installation; its session store must stay separate. To roll back new dispatches, set `executor_command` to the original `dsh` path and `executor_args` to `["--profile","acp"]`. Continue each existing thread with its recorded launcher; sessions in the two homes are separate.
-
-新版凭据和会话保存在独立 home；凭据可从现有安装拷贝，会话存储单独使用。回退新派单时，将程序指定为原 `dsh` 路径，参数设为 `["--profile","acp"]`。已有线程继续使用记录的启动器，两套 home 的会话分别管理。
-
-## ACP director controls
-
-Omitting dispatch's executor uses `CODEX_DIRECTOR_EXECUTOR`, else Codex. Select `executor: "codex"` explicitly when needed. Review ignores this default; continue restores its thread and rejects an executor or launch-configuration mismatch. New agy effort defaults in the driver to Carbon high / Opus medium; continuation preserves the existing effort unless explicitly supplied.
-
-ACP workers inject `CODEX_ACP_CONTROL_ENDPOINT` and `CODEX_ACP_COMPANION_PATH` before spawning the agent.
-
-The endpoint exposes task controls, including answer and approval interfaces; it relies on the ACP executor not invoking those interfaces on its own.
-
-A shell sends a nonempty note of at most 400 characters with:
-
-```bash
-node "$CODEX_ACP_COMPANION_PATH" notify-director "Decision or blocker requiring director action"
-```
-
-It returns after publishing `director.notified` and continues work. Codex keeps its native `notify_director` tool. agy uses native form questions that always wait for the director, including under allow-once. Qoder's native questions use elicitation and also wait under yolo. DSH or another ACP agent without a native question tool uses:
-
-```bash
-node "$CODEX_ACP_COMPANION_PATH" ask-director --question "Choose a source" --options '["First","Second"]'
-```
-
-The command blocks, prints the selected or free-text answer, and exits nonzero on cancellation or its ten-minute timeout. All ACP question/permission timeouts close the request and interrupt the active turn. For dsh bash set `timeoutMs:600000`: its default is 120000 ms and usual cap 600000 ms. If it promotes the command to a background job, use `job_output` on that job. Without jobs the shell may kill the command first; report that and check pending status rather than rerunning or inferring an answer.
-
-ACP and Codex refuse steer while a question is pending; queue is allowed. Active ACP queue returns a separate `queuedJobId` per instruction; active Codex queue uses the same job. Idle queue creates a new job for either. ACP interrupt keeps files but reports no partialChanges; inspect the assigned checkout. Default full access permits writes even without `write:true`; read-only is brief intent, and ACP permissions are controlled by the agent rather than Codex sandbox flags. Qoder `ask` does not remove its default bypass mode.
-
-The pane's existing poll detects confirmed-dead ACP owner PIDs and publishes a stable failure event to their owning session. Check `ownerAlive` and `lastProgressAt` after fifteen minutes of silence. Periodic question reminders exist only in Monitor mode. Cancellation reason wording, Monitor DONE summaries, missing-message-id assistant grouping, execution cwd normalization and missing partial file lists retain their current behavior. There is no ACP `session/load` fallback or numeric/boolean form conversion; transcript transfer remains Codex-only.
-
-省略执行器受 `CODEX_DIRECTOR_EXECUTOR` 控制；需要 Codex 时显式填写，review 与 continue 不受该默认值影响。ACP 用上述命令通知和提问；agy/Qoder 保留原生提问，dsh 使用阻塞命令。超时、取消均不能作为授权。只读意图、排队 job id、interrupt 信息范围和 Monitor 提醒规则以上述实际行为为准。
-
-Real-agent smoke is opt-in and excluded from `npm test`:
-
-```bash
-CODEX_REAL_ACP_SMOKE=1 CODEX_COMPANION="$PWD/plugins/codex/scripts/codex-companion.mjs" \
-  CODEX_SMOKE_MEMORY_INDEX=/absolute/path/to/memory/MEMORY.md node scripts/smoke-acp.mjs
-```
-
-It uses isolated Git/data/session directories, receives notifications before completion, answers the second option for all three agents, verifies final output and skill reads, and checks agy's local exclusion. `CODEX_SMOKE_OUTPUT` selects the evidence directory; missing capabilities are reported as SKIP.
-
-Set `CODEX_SMOKE_MONITOR=1` to exercise Monitor fallback, including a seven-second ingress delay. Monitor attempts use a thirty-second window for every event: delayed ingress avoids duplicate frames within that window, while unaccepted frames can still be retried afterwards.
-
-Protocol reference: [DSH ACP contract](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/acp/acp/README.md).
+[架构与边界](docs/ARCHITECTURE.md) 记录协议选择、上下文范围和恢复语义。[验证记录](docs/VERIFICATION.md) 列出已通过的检查与消息计数实测。

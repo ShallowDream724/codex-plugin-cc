@@ -1,28 +1,14 @@
 {
-  "name": "@openai/codex-plugin-cc",
-  "version": "1.4.141",
+  "name": "codex-subagents",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "license": "Apache-2.0",
-  "engines": {
-    "node": ">=18.18.0"
-  },
+  "description": "Delegate persistent Codex agents from Claude Code with compact coordination and current-context inheritance.",
+  "engines": { "node": ">=22" },
   "scripts": {
-    "bump-version": "node scripts/bump-version.mjs",
-    "check-version": "node scripts/bump-version.mjs --check",
-    "prebuild": "mkdir -p plugins/codex/.generated/app-server-types && codex app-server generate-ts --experimental --out plugins/codex/.generated/app-server-types",
-    "build": "tsc -p tsconfig.app-server.json && npm run --silent build:hooks",
-    "test": "node scripts/run-tests.mjs",
-    "build:hooks": "test -f .claude/types/claude-code.d.ts || { echo 'WARNING: hooks NOT type-checked -- .claude/types/claude-code.d.ts is absent (Claude Code writes it; CI has no copy)'; exit 0; }; tsc -p tsconfig.hooks.json",
-    "deploy": "bash scripts/deploy.sh"
-  },
-  "devDependencies": {
-    "@types/node": "^25.5.0",
-    "typescript": "^6.0.2"
-  },
-  "dependencies": {
-    "@agentclientprotocol/sdk": "1.4.0",
-    "zod": "^4.6.5"
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "package": "node scripts/package.mjs"
   }
 }
