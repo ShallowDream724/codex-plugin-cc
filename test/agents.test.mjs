@@ -40,6 +40,242 @@ async function setup(t, options = {}) {
 }
 const pendingQuestion = (threadId = 'thread-1', turnId = 'turn-1') => ({ threadId, turnId, itemId: 'q-item', questions: [{ id: 'choice', header: 'Choose', question: 'Which?' }], isBlocking: true });
 
+test('user stop isolates the tree, waits for descendants, and resumes with user attribution', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const first = await spawn(), other = await spawn();
+  client.note('thread/started', { thread: { id: 'child', parentThreadId: first.thread_id } });
+  client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  const actions = []; controller.on('agentAction', action => actions.push(action));
+  const result = await controller.dispatch('ui_interrupt', { target: first.id });
+  assert.equal(result.status, 'stopping');
+  assert.deepEqual(client.calls.filter(c => c.method === 'turn/interrupt').map(c => c.params.threadId).sort(), ['child', first.thread_id].sort());
+  await assert.rejects(controller.dispatch('followup_task', { target: first.id, message: 'continue' }), /paused by the user/);
+  client.complete(first.thread_id, first.turn_id, 'interrupted');
+  assert.equal(controller.view(controller.find(first.id)).user_control_status, 'stopping');
+  await assert.rejects(controller.dispatch('ui_send', { target: first.id, message: 'resume' }), /not yet confirmed/);
+  client.complete('child', 'child-turn', 'interrupted');
+  assert.equal(controller.view(controller.find(first.id)).user_control_status, 'stopped');
+  assert.equal(controller.find(other.id).status, 'running');
+  await controller.dispatch('ui_send', { target: first.id, message: 'resume' });
+  assert.equal(client.calls.filter(c => c.method === 'turn/start').at(-1).params.input[0].text, '[Direct message from the user]\n\nresume');
+  assert.ok(actions.some(a => a.kind === 'send' && a.origin === 'user' && a.message === 'resume'));
+  assert.ok(controller.eventsAfter().some(e => e.origin === 'user' && e.action === 'send' && e.message === 'resume' && e.phase === 'delivered'));
+});
+
+test('failed user stop remains unconfirmed, retries, and catches late descendants', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); let fail = true;
+  client.handler = method => { if (method === 'turn/interrupt' && fail) throw new Error('offline'); };
+  assert.equal((await controller.dispatch('ui_interrupt', { target: agent.id })).status, 'unconfirmed');
+  fail = false;
+  assert.equal((await controller.dispatch('ui_interrupt', { target: agent.id })).status, 'stopping');
+  client.note('thread/started', { thread: { id: 'late-child', parentThreadId: agent.thread_id } });
+  client.note('turn/started', { threadId: 'late-child', turn: { id: 'late-turn' } });
+  await tick();
+  assert.ok(client.calls.some(c => c.method === 'turn/interrupt' && c.params.threadId === 'late-child'));
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  client.complete('late-child', 'late-turn', 'interrupted');
+  assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopped');
+  assert.equal(controller.eventsAfter().filter(e => e.action === 'interrupt' && e.phase === 'requested').length, 1);
+  assert.equal(controller.eventsAfter().filter(e => e.action === 'interrupt' && e.phase === 'confirmed').length, 1);
+});
+
+test('user pause persists across restart and prevents Claude from resuming', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-pause-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath });
+  const agent = await spawn();
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  await controller.persist();
+  const second = new AgentController({ client: new MockClient(), statePath, nativeRoleResolver: async () => undefined });
+  await second.init(); t.after(() => second.close());
+  assert.equal(second.view(second.find(agent.id)).user_paused, true);
+  await assert.rejects(second.dispatch('send_message', { target: agent.id, message: 'continue' }), /paused by the user/);
+  await second.dispatch('ui_send', { target: agent.id, message: 'proceed' });
+  assert.equal(second.view(second.find(agent.id)).user_paused, false);
+});
+
+test('user stop cancels an in-flight followup before it can start', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); client.complete(agent.thread_id, agent.turn_id); await tick();
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  client.handler = method => { if (method === 'thread/resume') return gate; };
+  const send = controller.dispatch('followup_task', { target: agent.id, message: 'continue' });
+  await tick();
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  release({ thread: { status: { type: 'idle' } } });
+  await assert.rejects(send, /paused by the user/);
+  await tick();
+  assert.equal(client.calls.filter(c => c.method === 'turn/start').length, 1);
+  assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopped');
+});
+
+test('user message cannot bypass a pending question', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn();
+  client.ask('question', 'item/tool/requestUserInput', pendingQuestion()); await tick();
+  await assert.rejects(controller.dispatch('ui_send', { target: agent.id, message: 'answer?' }), /pending request/);
+  assert.equal(client.calls.filter(c => c.method === 'turn/steer').length, 0);
+  assert.equal(controller.find(agent.id).pending.length, 1);
+});
+
+test('connection loss cannot confirm a user interruption', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn();
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.emit('closed');
+  const view = controller.view(controller.find(agent.id));
+  assert.equal(view.status, 'unknown');
+  assert.equal(view.user_control_status, 'unconfirmed');
+  assert.equal(controller.hasActiveWork(), true);
+});
+
+test('unconfirmed native state stays unknown and occupies capacity after user stop', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn();
+  const a = controller.find(agent.id); a.status = 'unknown'; a.turnId = null;
+  client.handler = method => { if (method === 'thread/read') throw new Error('offline'); };
+  const result = await controller.dispatch('ui_interrupt', { target: agent.id });
+  assert.equal(result.status, 'unconfirmed'); assert.equal(a.status, 'unknown'); assert.equal(controller.occupies(a), true);
+});
+
+test('paused pending requests cannot be answered by Claude', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn();
+  client.ask('question', 'item/tool/requestUserInput', pendingQuestion()); await tick();
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  await assert.rejects(controller.dispatch('answer_agent', { target: agent.id, request_id: 'question', answer: { answers: { choice: { answers: ['yes'] } } } }), /paused by the user/);
+  assert.equal(client.replies.length, 0);
+});
+
+test('user resume holds an exclusive barrier while pause persistence is pending', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted'); await tick();
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const persist = controller.persist.bind(controller); controller.persist = () => gate;
+  const userSend = controller.dispatch('ui_send', { target: agent.id, message: 'resume' });
+  await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'Claude followup' }), /direct user message/);
+  assert.equal(client.calls.filter(c => c.method === 'turn/start').length, 1);
+  controller.persist = persist; release(); await userSend;
+  assert.equal(client.calls.filter(c => c.method === 'turn/start').length, 2);
+});
+
+test('closed paused ownership remains paused on native thread adoption', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const nativeId = '12345678-1234-4234-8234-123456789abc';
+  client.handler = method => { if (method === 'thread/start') return { thread: { id: nativeId } }; };
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(nativeId, agent.turn_id, 'interrupted'); await tick();
+  await controller.dispatch('close_agent', { target: agent.id });
+  client.handler = (method, params) => {
+    if (method === 'thread/read') return { thread: { id: params.threadId, cwd: '/workspace', status: { type: 'idle' } } };
+    if (method === 'thread/resume') return { thread: { status: { type: 'idle' } } };
+  };
+  await assert.rejects(controller.dispatch('followup_task', { target: nativeId, message: 'continue' }), /remains paused by the user/);
+  const adopted = controller.find(nativeId);
+  assert.equal(adopted.userPaused, true);
+  assert.equal(client.calls.filter(c => c.method === 'turn/start').length, 1);
+  await controller.dispatch('ui_send', { target: adopted.id, message: 'resume' });
+  assert.equal(adopted.userPaused, false);
+});
+
+test('closed paused thread tombstone survives controller restart', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-paused-close-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json'), nativeId = '12345678-1234-4234-8234-123456789abc';
+  const { client, controller, spawn } = await setup(t, { statePath });
+  client.handler = method => { if (method === 'thread/start') return { thread: { id: nativeId } }; };
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(nativeId, agent.turn_id, 'interrupted'); await controller.dispatch('close_agent', { target: agent.id });
+  const otherClient = new MockClient();
+  otherClient.handler = (method, params) => { if (method === 'thread/read') return { thread: { id: params.threadId, cwd: '/workspace', status: { type: 'idle' } } }; };
+  const second = new AgentController({ client: otherClient, statePath, nativeRoleResolver: async () => undefined });
+  await second.init(); t.after(() => second.close());
+  await assert.rejects(second.dispatch('followup_task', { target: nativeId, message: 'continue' }), /remains paused by the user/);
+  assert.equal(second.find(nativeId).userPaused, true);
+});
+
+test('late root turn changes a confirmed stop until that turn completes', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  client.note('turn/started', { threadId: agent.thread_id, turn: { id: 'late-root' } }); await tick();
+  assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopping');
+  assert.ok(client.calls.some(c => c.method === 'turn/interrupt' && c.params.turnId === 'late-root'));
+  client.complete(agent.thread_id, 'late-root', 'interrupted');
+  assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopped');
+});
+
+test('paused descendants remain protected after root ownership closes', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(), child = '12345678-1234-4234-8234-123456789abc';
+  client.note('thread/started', { thread: { id: child, parentThreadId: agent.thread_id } });
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  await controller.dispatch('close_agent', { target: agent.id });
+  client.handler = (method, params) => { if (method === 'thread/read') return { thread: { id: params.threadId, cwd: '/workspace', status: { type: 'idle' } } }; };
+  await assert.rejects(controller.dispatch('followup_task', { target: child, message: 'continue' }), /remains paused by the user/);
+  assert.equal(controller.find(child).userPaused, true);
+});
+
+test('ambiguous user resume restores interception and interrupts an observed start', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  client.handler = (method, params) => {
+    if (method === 'turn/start') {
+      client.note('turn/started', { threadId: params.threadId, turn: { id: 'lost-reply-turn' } });
+      throw new Error('transport lost');
+    }
+  };
+  await assert.rejects(controller.dispatch('ui_send', { target: agent.id, message: 'resume' }), /transport lost/);
+  assert.equal(controller.find(agent.id).userPaused, true);
+  assert.ok(client.calls.some(c => c.method === 'turn/interrupt' && c.params.turnId === 'lost-reply-turn'));
+  assert.notEqual(controller.view(controller.find(agent.id)).user_control_status, 'stopped');
+});
+
+test('persisted terminal root with a late turn is reconciled on restart', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-late-root-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath });
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  client.note('turn/started', { threadId: agent.thread_id, turn: { id: 'late-root' } });
+  await controller.persist();
+  const nextClient = new MockClient();
+  nextClient.handler = method => { if (method === 'thread/read') return { thread: { status: { type: 'idle' } } }; };
+  const second = new AgentController({ client: nextClient, statePath, nativeRoleResolver: async () => undefined });
+  await second.init(); t.after(() => second.close());
+  assert.equal(second.find(agent.id).turnId, null);
+  assert.equal(second.view(second.find(agent.id)).user_control_status, 'stopped');
+});
+
+test('late unlinked descendant turn is stopped only after ownership is established', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); await controller.dispatch('ui_interrupt', { target: agent.id });
+  client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  client.note('turn/started', { threadId: 'late', turn: { id: 'late-turn' } });
+  assert.equal(client.calls.filter(c => c.method === 'turn/interrupt' && c.params.threadId === 'late').length, 0);
+  client.note('thread/started', { thread: { id: 'late', parentThreadId: agent.thread_id } }); await tick();
+  assert.equal(client.calls.filter(c => c.method === 'turn/interrupt' && c.params.threadId === 'late').length, 1);
+  assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopping');
+  client.complete('late', 'late-turn', 'interrupted');
+  assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopped');
+});
+
+test('native interruption waits for the user pause to become durable', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn(); let release; const gate = new Promise(resolve => { release = resolve; });
+  const persist = controller.persist.bind(controller); controller.persist = () => gate;
+  const stop = controller.dispatch('ui_interrupt', { target: agent.id });
+  client.note('thread/started', { thread: { id: 'child-gated', parentThreadId: agent.thread_id } });
+  client.note('turn/started', { threadId: 'child-gated', turn: { id: 'child-turn' } });
+  await tick(); assert.equal(client.calls.filter(c => c.method === 'turn/interrupt').length, 0);
+  controller.persist = persist; release(); await stop; await tick();
+  assert.equal(client.calls.filter(c => c.method === 'turn/interrupt').length, 2);
+});
+
 test('an asynchronous interruption rejection stays local to its agent', async t => {
   const { client, controller, spawn } = await setup(t);
   const first = await spawn(), second = await spawn();

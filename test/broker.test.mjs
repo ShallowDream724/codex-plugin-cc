@@ -41,6 +41,22 @@ test('UI reads never claim or confirm Claude events, even with extraneous restor
   assert.equal(wait.body.events.length, 1);
 });
 
+test('direct user controls use durable receipts without acknowledging Claude events', async t => {
+  const { post, controller } = await setup(t);
+  controller.publish();
+  const request = { operation: 'ui_send', requestId: 'human-message', args: { target: 'a', message: 'Keep the original data.' }, restore: { legacy_events: controller.events } };
+  assert.equal((await post(request)).status, 200);
+  assert.equal((await post(request)).status, 200);
+  assert.equal(controller.calls.filter(call => call.op === 'ui_send').length, 1);
+  assert.equal(controller.events.length, 1); assert.deepEqual(controller.acks, []);
+  const conflict = await post({ ...request, args: { ...request.args, message: 'Changed text' } });
+  assert.equal(conflict.body.error.code, 'request_id_conflict');
+  assert.equal((await post({ operation: 'ui_interrupt', requestId: 'human-stop', args: { target: 'a' }, restore: request.restore })).status, 200);
+  assert.deepEqual(controller.acks, []);
+  const delivery = await post({ operation: 'wait', args: { timeout_ms: 0 } });
+  assert.equal(delivery.body.events[0].seq, 1);
+});
+
 test('default preset is normalized before snapshot capture without weakening normal context validation', async t => {
   const { post, controller } = await setup(t);
   const result = await post({ operation: 'spawn_agent', requestId: 'scout', args: { role: 'default' } });

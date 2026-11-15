@@ -213,7 +213,7 @@ export async function main(argv = process.argv.slice(2)) {
   endpoint ||= await ensureBroker(body.owner, body.cwd || process.cwd());
   try { return await call(endpoint, body, body.operation === 'wait' ? 35000 : 150000); }
   catch (error) {
-    if (['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent'].includes(body.operation)) {
+    if (['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', 'ui_interrupt', 'ui_send'].includes(body.operation)) {
       return { error: { code: 'action_status_unknown', message: 'The local connection ended before confirmation. The action may already have been submitted. Use list_agents before issuing another action.' } };
     }
     throw error;

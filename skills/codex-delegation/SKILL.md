@@ -15,7 +15,7 @@ Default `context_mode: available` copies the host-exported current context, up t
 
 After dispatch, wait unless necessary independent work remains. Do not poll status, invent busywork or narrate unchanged updates. A compaction notice normally needs another wait. Wait timeout returns control without stopping work.
 
-Use one wait for all agents; match events by agent_id. A repeated seq is the same event.
+Use one wait for all agents; match events by agent_id. A repeated seq is the same event. Respect user stops: wait for the user to resume, and do not start replacement work.
 
 Continue an agent when its existing context helps the same task. Start fresh for unrelated work or independent red/blue-team review; supply the material and constraints without the prior verdict. `send_message` does not start an idle agent; `followup_task` does. Both preserve history. A native thread ID or `codex://threads/<id>` can be passed to `followup_task` to adopt an idle external conversation without reinjecting Claude context.
 

@@ -1,27 +1,81 @@
 import { requestBridge as bridge } from './bridge.js';
+import { agentIcon, retainIcons, clearIcons } from './presentation.js';
 
 const PANE = 'codex_subagent_activity';
 const MAX_PAGES = 50;
 const safe = (value) => String(value).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
-const label = (agent) => safe(agent.name || agent.agent_id || agent.id || 'Codex').replace(/\s+/g, ' ').slice(0, 32);
 const idOf = (agent) => agent.agent_id || agent.id;
-const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), name: agent.name, status: agent.status }));
+const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), name: agent.name, model: agent.model, reasoning_effort: agent.reasoning_effort, status: agent.status, user_paused: agent.user_paused, user_control_status: agent.user_control_status }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
-const groupable = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'webSearch']);
+const groupable = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch']);
+const fastctxTitles = { inspect_local_file: '读取本地文件', grep: '搜索文件内容', glob: '匹配文件路径', run: '运行命令', run_background: '启动后台任务', job_output: '读取任务输出', job_list: '查看后台任务', job_kill: '停止后台任务', replace: '替换文件内容' };
+function toolTitle(data) {
+  if (typeof data.display_title === 'string' && data.display_title.trim()) return data.display_title;
+  if (typeof data.appContext?.actionName === 'string' && data.appContext.actionName.trim()) return data.appContext.actionName;
+  const tool = typeof data.tool === 'string' ? data.tool : '', server = typeof data.server === 'string' ? data.server : '';
+  const name = tool.split('__').at(-1);
+  if ((/fastctx/i.test(server) || /fastctx/i.test(tool)) && fastctxTitles[name]) return fastctxTitles[name];
+  return tool ? `使用 ${server ? `${server} / ` : ''}${tool}` : '使用工具';
+}
+function searchDescription(data) {
+  const action = data.action && typeof data.action === 'object' ? data.action : {};
+  const query = data.query || action.query || data.title || action.title || data.url || action.url || (Array.isArray(action.queries) ? action.queries.join('、') : '');
+  const verb = ['open_page', 'openPage'].includes(action.type) ? '打开网页' : ['find_in_page', 'findInPage'].includes(action.type) ? '查找页面内容' : '搜索';
+  return `${verb}${typeof query === 'string' && query ? `：${query}` : ''}`;
+}
+function planText(data) {
+  if (typeof data.text === 'string') return data.text;
+  const steps = data.steps ?? data.plan;
+  if (typeof steps === 'string') return steps;
+  if (Array.isArray(steps)) return steps.map((step) => `- ${typeof step === 'string' ? step : step?.step ?? step?.description ?? ''}${step?.status ? `（${step.status}）` : ''}`).join('\n');
+  return '';
+}
+function delegationDescription(data) {
+  const name = [data.name, ...(Array.isArray(data.names) ? data.names : [])].filter(Boolean).join('、') || '子代理';
+  const statuses = Array.isArray(data.agents) ? data.agents.map((agent) => agent?.status) : Array.isArray(data.agent_statuses) ? data.agent_statuses : typeof data.agent_status === 'string' ? [data.agent_status] : [];
+  if (statuses.length && statuses.every((status) => status === 'completed')) return `${name}已完成`;
+  if (data.tool === 'spawnAgent' || data.tool === 'followupTask' || data.tool === 'resumeAgent') return `${name}${data.stage === 'started' ? '正在启动' : '开始工作'}`;
+  const action = { wait: '等待子代理', sendInput: '发送消息', sendMessage: '发送消息', interruptAgent: '请求停止', closeAgent: '关闭子代理', listAgents: '查看子代理' }[data.tool];
+  return action ? `${action}：${name}` : `${name}已更新`;
+}
+function changeLabel(change) {
+  const diff = typeof change.diff === 'string' && change.diff.length < 4096 && !change.diff.includes('[truncated]') ? change.diff : null;
+  const lines = diff === null ? [] : diff.split('\n');
+  const added = lines.filter((line) => line.startsWith('+') && !line.startsWith('+++')).length;
+  const removed = lines.filter((line) => line.startsWith('-') && !line.startsWith('---')).length;
+  const hasCounts = Number.isInteger(change.added) && Number.isInteger(change.removed);
+  return `✎ 已编辑 ${safe(change.path || '文件')}${hasCounts ? ` +${change.added} -${change.removed}` : lines.length ? ` +${added} -${removed}` : ''}`;
+}
 const description = (entry) => {
   const d = entry.data || {};
   if (entry.type === 'parentMessage') return 'Claude';
+  if (entry.type === 'directUserMessage') return '你';
   if (entry.type === 'userMessage') return 'Claude';
   if (entry.type === 'agentMessage') return 'Codex';
-  if (entry.type === 'commandExecution') return `Command: ${d.command || ''}`;
-  if (entry.type === 'mcpToolCall' || entry.type === 'dynamicToolCall') return `Tool: ${d.server ? d.server + '/' : ''}${d.tool || ''}`;
-  if (entry.type === 'fileChange') return 'File changes';
-  if (entry.type === 'collabAgentToolCall' || entry.type === 'collabToolCall') return `Delegation: ${[d.name, ...(d.names || [])].filter(Boolean).join(', ') || d.tool || 'agent'}`;
-  if (entry.type === 'imageView' || entry.type === 'imageGeneration') return `Image: ${d.path || d.savedPath || ''}`;
-  return String(entry.type || 'Activity');
+  if (entry.type === 'commandExecution') return `运行命令 ${d.command || ''}`;
+  if (entry.type === 'mcpToolCall' || entry.type === 'dynamicToolCall') return toolTitle(d);
+  if (entry.type === 'fileChange') return `修改文件 ${Array.isArray(d.changes) ? d.changes.map((change) => change.path).filter(Boolean).join('、') : ''}`;
+  if (entry.type === 'collabAgentToolCall' || entry.type === 'collabToolCall') return delegationDescription(d);
+  if (entry.type === 'imageView' || entry.type === 'imageGeneration') return `图片 ${[d.path || d.savedPath || d.saved_path, d.contentType || d.content_type].filter((value) => typeof value === 'string').join(' · ')}`;
+  if (entry.type === 'webSearch') return searchDescription(d);
+  if (entry.type === 'contextCompaction') return d.stage === 'started' ? '上下文正在压缩' : d.stage === 'completed' ? '上下文已压缩' : '上下文压缩记录';
+  if (entry.type === 'subAgentActivity') return `${d.name || d.agentPath || '子代理'}${({ started: '开始工作', interacted: '已互动', interrupted: '已停止', completed: '已完成' })[d.kind] || '已更新'}`;
+  if (entry.type === 'plan') return '计划';
+  if (entry.type === 'functionCallOutput') return `工具返回${d.name ? `：${d.name}` : ''}`;
+  if (entry.type === 'hookPrompt') return '补充指令';
+  if (entry.type === 'sleep') return '等待';
+  if (entry.type === 'enteredReviewMode') return '开始审查';
+  if (entry.type === 'exitedReviewMode') return '审查结束';
+  return typeof d.display_title === 'string' && d.display_title.trim() ? d.display_title : '活动';
 };
 const body = (entry) => {
   const d = entry.data || {};
+  if (entry.type === 'webSearch') {
+    const action = d.action && typeof d.action === 'object' ? d.action : {};
+    const results = Array.isArray(d.results) ? d.results.flatMap((result) => result && typeof result === 'object' ? [result.title, result.url] : []) : [];
+    return [d.query, action.query, ...(Array.isArray(action.queries) ? action.queries : []), action.pattern, d.title, action.title, d.url, action.url, ...results].filter((v) => typeof v === 'string' && v).join('\n') || entry.preview || '';
+  }
+  if (entry.type === 'plan') return planText(d) || entry.preview || '';
   if (typeof entry.preview === 'string') return entry.preview;
   if (typeof d.text === 'string') return d.text;
   if (entry.type === 'userMessage' && Array.isArray(d.content)) return d.content.map((part) => part.text || '').filter(Boolean).join('\n\n');
@@ -41,7 +95,52 @@ export function groupEntries(entries) {
 
 // The caller feeds its existing low-frequency observe result to observeUI.
 // There are no session hooks, model calls, or delivery acknowledgements here.
-const state = { agents: [], selected: null, opened: false, timer: null, pages: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
+const state = { agents: [], selected: null, opened: false, timer: null, pages: new Map(), controls: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
+let actionSequence = 0;
+const actionId = () => `ui-${Date.now().toString(36)}-${++actionSequence}-${Math.random().toString(36).slice(2)}`;
+const controlFor = (id) => {
+  if (!state.controls.has(id)) state.controls.set(id, { draft: '', inputVersion: 0, sending: false, stopping: false, stopEpoch: 0, mutationEpoch: 0, sendResult: '' });
+  return state.controls.get(id);
+};
+const active = (agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent?.status);
+function updateAgent(id, fields) {
+  const agent = state.agents.find((a) => idOf(a) === id);
+  if (!agent) return false;
+  let changed = false;
+  for (const key of ['name', 'model', 'reasoning_effort', 'status', 'user_paused', 'user_control_status']) {
+    if (Object.hasOwn(fields, key) && agent[key] !== fields[key]) { agent[key] = fields[key]; changed = true; }
+  }
+  return changed;
+}
+async function stopAgent($, id) {
+  const control = controlFor(id);
+  if (control.stopping) return;
+  control.stopping = true; control.stopEpoch++; control.mutationEpoch++; updateAgent(id, { user_control_status: 'stopping' }); invalidate($);
+  try {
+    const result = await bridge($, 'ui_interrupt', { target: id }, { requestId: actionId() });
+    const status = result.user_control_status ?? result.status;
+    const known = ['stopping', 'stopped', 'unconfirmed'].includes(status);
+    if (state.controls.get(id) === control) updateAgent(id, { ...(typeof result.user_paused === 'boolean' ? { user_paused: result.user_paused } : known ? { user_paused: true } : {}), user_control_status: known ? status : 'unconfirmed' });
+  } catch { if (state.controls.get(id) === control) updateAgent(id, { user_control_status: 'unconfirmed' }); }
+  finally { control.stopping = false; if (state.opened && state.selected === id) invalidate($); }
+}
+async function sendAgent($, id) {
+  const control = controlFor(id), message = control.draft, stopEpoch = control.stopEpoch;
+  const selected = state.agents.find((agent) => idOf(agent) === id);
+  if (control.sending || control.stopping || selected?.user_control_status === 'stopping' || !message.trim()) return;
+  control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; invalidate($);
+  try {
+    const result = await bridge($, 'ui_send', { target: id, message }, { requestId: actionId() });
+    if (result.error || result.offline) {
+      control.sendResult = result.offline || result.error?.code === 'action_status_unknown' ? '发送状态未知，请查看活动后再试。' : '发送失败，草稿已保留。';
+    } else if (result.agent_id === id && typeof result.status === 'string') {
+      control.sendResult = result.status === 'steered' || result.user_paused || control.stopEpoch !== stopEpoch ? '消息已发送。' : '消息已发送，代理继续工作。';
+      if (control.draft === message) { control.draft = ''; control.inputVersion++; }
+      if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
+    } else control.sendResult = '发送状态未知，请查看活动后再试。';
+  } catch { control.sendResult = '发送状态未知，请查看活动后再试。'; }
+  finally { control.sending = false; if (state.opened && state.selected === id) invalidate($); }
+}
   const pageFor = (id) => {
     if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, busy: false, historyGeneration: 0, detailGeneration: 0, detail: null });
     const page = state.pages.get(id); state.pages.delete(id); state.pages.set(id, page);
@@ -54,22 +153,23 @@ const state = { agents: [], selected: null, opened: false, timer: null, pages: n
   const toggle = (key) => { if (!state.folds.delete(key)) { state.folds.add(key); if (state.folds.size > 512) state.folds.delete(state.folds.values().next().value); } };
   const reading = (id, page) => page.live.some((entry) => {
     const key = `${id}:${entryKey(entry)}`;
-    return state.folds.has(key) || state.folds.has(`${key}:group`);
+    return state.folds.has(key) || state.folds.has(`${key}:group`) || [...state.folds].some((fold) => fold.startsWith(`${key}:file:`));
   });
   function invalidate($) { $.ui.invalidate('ui.render'); }
   async function poll($) {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
-    const page = pageFor(id);
-    if (page.busy || page.mode !== 'live' || reading(id, page)) return;
+    const page = pageFor(id), control = controlFor(id), mutationEpoch = control.mutationEpoch;
+    if (page.busy) return;
     page.busy = true;
     try {
       const result = await bridge($, 'ui_revision', { target: id, revision: page.revision });
-      if (!state.opened || state.selected !== id || state.generation !== gen || page.mode !== 'live' || reading(id, page) || result.error || result.offline) return;
-      if (result.entries) {
+      if (!state.opened || state.selected !== id || state.generation !== gen || result.error || result.offline) return;
+      const changed = result.agent && control.mutationEpoch === mutationEpoch && !control.stopping && !control.sending && updateAgent(id, result.agent);
+      if (page.mode === 'live' && result.entries && result.revision !== page.revision && !reading(id, page)) {
         page.revision = result.revision; page.live = result.entries;
         invalidate($);
-      }
+      } else if (changed) invalidate($);
     } finally { page.busy = false; }
   }
   async function history($, id, direction = 'latest') {
@@ -83,7 +183,7 @@ const state = { agents: [], selected: null, opened: false, timer: null, pages: n
     try {
       const result = await bridge($, 'ui_history', { target: id, ...(cursor ? { cursor } : {}) });
       if (!state.opened || state.selected !== id || state.generation !== gen || request !== page.historyGeneration) return;
-      if (result.error || result.offline) throw new Error(result.error?.message || 'History unavailable');
+      if (result.error || result.offline) throw new Error('无法获取历史记录');
       page.mode = 'history'; page.entries = result.entries || []; page.cursorStack = stack; page.stackTruncated = truncated; page.detail = null;
       page.cursor = result.next_cursor; page.loaded = true; page.error = null; invalidate($);
     } catch (error) { if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) { page.error = String(error.message || error); invalidate($); } }
@@ -105,16 +205,16 @@ const state = { agents: [], selected: null, opened: false, timer: null, pages: n
     if (!state.opened || state.generation !== gen) return;
     await select($, id);
     const selectedGen = state.generation;
-    const result = await $.ui.open({ id: PANE, title: 'Codex agents', focus: true, closeOnEscape: true, rows: 24 });
+    const result = await $.ui.open({ id: PANE, title: 'Codex 代理', focus: true, closeOnEscape: true, rows: 24 });
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
     if (!state.timer) state.timer = $.clock.every(1000, () => { void poll($).catch(() => {}); });
   }
-  async function detail($, id, entry, offset = 0) {
+  async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`) {
     const page = pageFor(id), key = entryKey(entry), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailGeneration;
     const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset });
-    if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || request !== page.detailGeneration || !state.folds.has(`${id}:${key}`)) return;
-    if (result.error || result.offline) page.detail = { key, text: result.error?.message || 'Detail unavailable', next_offset: null, offset };
+    if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || request !== page.detailGeneration || !state.folds.has(foldKey)) return;
+    if (result.error || result.offline) page.detail = { key, text: '无法获取完整内容', next_offset: null, offset };
     else page.detail = { key, text: result.text || '', next_offset: result.next_offset, offset };
     invalidate($);
   }
@@ -122,15 +222,15 @@ export function registerUI(on) {
   on('command.run', { command: 'codex-agents' }, async ($) => {
     try {
       const result = await bridge($, 'ui_list', {});
-      if (result.error || result.offline) { $.ui.toast('Codex agents are unavailable.'); return {}; }
+      if (result.error || result.offline) { $.ui.toast('无法获取 Codex 代理。'); return {}; }
       const agents = Array.isArray(result.agents) ? result.agents : [];
-      if (!agents.length) { $.ui.toast('No Codex agents in this session.'); return {}; }
+      if (!agents.length) { $.ui.toast('当前会话没有 Codex 代理。'); return {}; }
       state.agents = summaries(agents);
       const selected = agents.find((agent) => idOf(agent) === state.selected)
         || [...agents].reverse().find((agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent.status))
         || agents.at(-1);
       await openAgent($, idOf(selected));
-    } catch { $.ui.toast('Codex agents are unavailable.'); }
+    } catch { $.ui.toast('无法获取 Codex 代理。'); }
     return {};
   });
   on('ui.close', async ($, e, next) => {
@@ -144,58 +244,103 @@ export function registerUI(on) {
   });
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     if (e.requestId !== PANE) return next(e);
-    const { Box, Text, Button } = $.ui.resolve(e), id = state.selected, page = pageFor(id);
+    const { Box, Text, Button, Input, Markdown, Image } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
     const all = page.mode === 'history' ? page.entries : page.live;
     // The action gives immediate feedback while native history catches up. Once
     // the same message is persisted, retain the native copy for pagination.
-    const nativeMessages = all.filter((entry) => entry.type === 'userMessage').map(body);
-    const entries = all.filter((entry) => entry.type !== 'parentMessage' || !nativeMessages.some((text) => entry.data?.text && text.includes(entry.data.text)));
+    const nativeMessages = (type) => all.filter((entry) => entry.type === type && !String(entry.id).startsWith('action:')).map(body);
+    const nativeParent = nativeMessages('userMessage'), nativeUser = nativeMessages('directUserMessage');
+    const entries = all.filter((entry) => !String(entry.id).startsWith('action:') || !['parentMessage', 'directUserMessage'].includes(entry.type) || !(entry.type === 'parentMessage' ? nativeParent : nativeUser).some((text) => entry.data?.text && text.includes(entry.data.text)));
     const rows = [];
     const selected = state.agents.find((a) => idOf(a) === id);
-    rows.push(Text({ children: [safe(selected?.name || id || 'Codex')] }));
-    if (page.mode === 'live') rows.push(Button({ key: 'codex_history', label: 'Browse history', onPress: () => history($, id) }));
+    const stopStatus = selected?.user_control_status;
+    const stopLabel = ['stopping', 'unconfirmed'].includes(stopStatus) ? '重试停止' : '停止';
+    const stopButton = (key) => !control.stopping && stopStatus !== 'stopped' ? Button({ key, plain: true, label: stopLabel, onPress: () => stopAgent($, id) }) : Text({ dimColor: true, children: [control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'] });
+    const model = [selected?.model, selected?.reasoning_effort].filter(Boolean).join(' · ');
+    rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: [Button({ key: 'codex_back', plain: true, label: '← 返回', onPress: () => $.ui.close({ id: PANE }) }), Text({ children: [`${agentIcon(id)} ${safe(selected?.name || id || 'Codex')}`], bold: true }), ...(model ? [Text({ dimColor: true, children: [safe(model)] })] : []), stopButton(`codex_stop_header_${id}`)] }));
+    if (stopStatus === 'unconfirmed') rows.push(Text({ dimColor: true, children: ['停止状态未确认，工作可能仍在进行。'] }));
+    if (page.mode === 'live') rows.push(Button({ key: 'codex_history', plain: true, label: '查看历史', onPress: () => history($, id) }));
     else {
-      rows.push(Button({ key: 'codex_live', label: 'Live activity', onPress: () => { page.mode = 'live'; page.historyGeneration++; page.detail = null; void poll($).catch(() => {}); invalidate($); } }));
-      if (page.cursor) rows.push(Button({ key: 'codex_older', label: 'Earlier activity', onPress: () => history($, id, 'older') }));
-      if (page.cursorStack.length > (page.stackTruncated ? 1 : 0)) rows.push(Button({ key: 'codex_newer', label: 'Newer activity', onPress: () => history($, id, 'newer') }));
-      if (page.cursorStack.length) rows.push(Button({ key: 'codex_latest', label: 'Latest history', onPress: () => history($, id) }));
+      rows.push(Button({ key: 'codex_live', plain: true, label: '实时活动', onPress: () => { page.mode = 'live'; page.historyGeneration++; page.detail = null; void poll($).catch(() => {}); invalidate($); } }));
+      if (page.cursor) rows.push(Button({ key: 'codex_older', plain: true, label: '更早的活动', onPress: () => history($, id, 'older') }));
+      if (page.cursorStack.length > (page.stackTruncated ? 1 : 0)) rows.push(Button({ key: 'codex_newer', plain: true, label: '较新的活动', onPress: () => history($, id, 'newer') }));
+      if (page.cursorStack.length) rows.push(Button({ key: 'codex_latest', plain: true, label: '最新历史', onPress: () => history($, id) }));
     }
     if (page.error) rows.push(Text({ children: [page.error] }));
     for (const group of groupEntries(entries)) {
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
       if (group.items.length > 1) {
-        rows.push(Button({ key: `group_${groupKey}`, label: `${safe(description(first)).slice(0, 120)} (${group.items.length}) ${folded ? '▸' : '▾'}`, onPress: () => { toggle(groupKey); invalidate($); } }));
+        const sameFastctx = group.items.every((item) => /fastctx/i.test(`${item.data?.server || ''} ${item.data?.tool || ''}`));
+        const groupLabel = ['mcpToolCall', 'dynamicToolCall'].includes(group.type) ? (sameFastctx ? '使用 FastCtx' : '使用工具') : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
+        rows.push(Button({ key: `group_${groupKey}`, plain: true, label: `${groupLabel} (${group.items.length}) ${folded ? '▸' : '▾'}`, onPress: () => { toggle(groupKey); invalidate($); } }));
         if (folded) continue;
       }
       for (const entry of group.items) {
-        if (['collabAgentToolCall', 'collabToolCall'].includes(entry.type)) { rows.push(Text({ children: [safe(description(entry))] })); continue; }
+        if (['collabAgentToolCall', 'collabToolCall', 'subAgentActivity'].includes(entry.type)) {
+          const d = entry.data || {}, target = d.agentThreadId || d.agent_id || d.agentId || d.agents?.[0]?.id || d.receiverThreadIds?.[0] || d.name || d.names?.[0] || entry.id;
+          rows.push(Text({ children: [`${agentIcon(target)} ${safe(description(entry))}`] }));
+          continue;
+        }
+        if (entry.type === 'contextCompaction') { rows.push(Text({ dimColor: true, children: [safe(description(entry))] })); continue; }
         const key = `${id}:${entryKey(entry)}`, expanded = state.folds.has(key);
-        rows.push(Button({ key: `item_${key}`, label: `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, onPress: () => { toggle(key); if (expanded) page.detailGeneration++; invalidate($); } }));
+        if (['agentMessage', 'userMessage', 'parentMessage', 'directUserMessage', 'plan'].includes(entry.type)) {
+          const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
+          rows.push(Text({ dimColor: true, children: [description(entry)] }));
+          rows.push(Markdown({ key: `message_${key}`, text: safe(loaded?.text ?? body(entry)) }));
+          if (loaded?.offset > 0) rows.push(Button({ key: `message_prev_${key}`, plain: true, label: '上一页正文', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000)) }));
+          if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) rows.push(Button({ key: `item_${key}`, plain: true, label: loaded ? '下一页正文' : '展开全文', onPress: () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); } }));
+          continue;
+        }
+        const fileList = entry.data?.fileSummary?.length ? entry.data.fileSummary : entry.data?.changes;
+        if (entry.type === 'fileChange' && Array.isArray(fileList) && fileList.length) {
+          fileList.forEach((change, index) => {
+            const fileKey = `${key}:file:${index}`, open = state.folds.has(fileKey);
+            rows.push(Button({ key: `file_${fileKey}`, plain: true, label: `${changeLabel(change)} ${open ? '▾' : '▸'}`, onPress: () => { toggle(fileKey); invalidate($); } }));
+            const diff = entry.data?.changes?.find((item) => item.path === change.path)?.diff ?? change.diff;
+            if (open) {
+              rows.push(Box({ borderStyle: 'round', borderDimColor: true, paddingX: 1, children: [Text({ children: [safe(diff || '请查看完整内容')] })] }));
+              const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
+              if (loaded) rows.push(Text({ children: [safe(loaded.text)] }));
+              if (loaded?.offset > 0) rows.push(Button({ key: `file_prev_${fileKey}`, plain: true, label: '上一页输出', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000), fileKey) }));
+              if (!String(entry.id).startsWith('action:') && (!loaded || loaded.next_offset != null)) rows.push(Button({ key: `file_detail_${fileKey}`, plain: true, label: loaded ? '下一页输出' : '查看完整内容', onPress: () => detail($, id, entry, loaded?.next_offset ?? 0, fileKey) }));
+            }
+          });
+          continue;
+        }
+        rows.push(Button({ key: `item_${key}`, plain: true, label: `${group.items.length > 1 ? '│  ' : '⌘  '}${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, onPress: () => { toggle(key); if (expanded) page.detailGeneration++; invalidate($); } }));
         if (expanded) {
           const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
-          rows.push(Text({ children: [safe(loaded?.text ?? body(entry))] }));
+          rows.push(Box({ borderStyle: 'round', borderDimColor: true, paddingX: 1, children: [Text({ children: [safe(loaded?.text ?? body(entry))] })] }));
           const imagePath = entry.data?.path || entry.data?.savedPath || entry.data?.saved_path;
-          if (['imageView', 'imageGeneration'].includes(entry.type) && typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/)/i.test(imagePath)) {
-            rows.push(Button({ key: `copy_${key}`, label: 'Copy image path', onPress: press => $.ui.copy({ text: imagePath, surface: press.surface }) }));
+          const localImage = typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(imagePath);
+          if (['imageView', 'imageGeneration'].includes(entry.type) && localImage) {
+            if (typeof Image === 'function' && /\.png$/i.test(imagePath)) rows.push(Image({ key: `image_${key}`, source: { file: imagePath, format: 'png' }, columns: 48, rows: 18, alt: `图片：${safe(imagePath)}` }));
+            rows.push(Button({ key: `copy_${key}`, plain: true, label: '复制图片路径', onPress: press => $.ui.copy({ text: imagePath, surface: press.surface }) }));
           }
-          if (loaded?.offset > 0) rows.push(Button({ key: `detail_prev_${key}`, label: 'Previous output page', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000)) }));
-          if (entry.type !== 'parentMessage' && (!loaded || loaded.next_offset != null)) rows.push(Button({ key: `detail_${key}`, label: loaded ? 'Next output page' : 'Load full item', onPress: () => detail($, id, entry, loaded?.next_offset ?? 0) }));
+          if (loaded?.offset > 0) rows.push(Button({ key: `detail_prev_${key}`, plain: true, label: '上一页输出', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000)) }));
+          if (!String(entry.id).startsWith('action:') && (!loaded || loaded.next_offset != null)) rows.push(Button({ key: `detail_${key}`, plain: true, label: loaded ? '下一页输出' : '查看完整内容', onPress: () => detail($, id, entry, loaded?.next_offset ?? 0) }));
         }
       }
     }
+    const sendLabel = active(selected) && !selected?.user_paused ? '发送' : '发送并继续';
+    rows.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, label: '消息', placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '发送中…' : control.stopping || stopStatus === 'stopping' ? '等待停止' : sendLabel, onInput: (value) => { control.draft = value; }, onSubmit: (value) => { control.draft = value; return sendAgent($, id); } }));
+    rows.push(stopButton(`codex_stop_${id}`));
+    if (control.sendResult) rows.push(Text({ dimColor: true, children: [control.sendResult] }));
     if (state.restore) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
-    return Box({ flexDirection: 'column', children: [Box({ flexDirection: 'row', flexWrap: 'wrap', children: state.agents.map((agent) => Button({ key: `codex_select_${idOf(agent)}`, label: label(agent), onPress: () => select($, idOf(agent)) })) }), ...rows] });
+    return Box({ flexDirection: 'column', children: rows });
   });
 }
-export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; }
+export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; clearIcons(); }
 export function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
-    const before = JSON.stringify(state.agents.map(({ agent_id, name }) => ({ agent_id, name })));
+    const before = JSON.stringify(state.agents);
     state.agents = summaries(result.agents);
     const ids = new Set(state.agents.map(idOf));
+    retainIcons([...ids], state.agents.filter((agent) => active(agent) || agent.status === 'unknown').map(idOf));
+    for (const id of state.controls.keys()) if (!ids.has(id)) state.controls.delete(id);
     for (const id of state.pages.keys()) if (!ids.has(id)) {
       state.pages.delete(id); state.scroll.delete(id);
       for (const key of state.folds) if (key.startsWith(`${id}:`)) state.folds.delete(key);
     }
-    if (state.opened && before !== JSON.stringify(state.agents.map(({ agent_id, name }) => ({ agent_id, name })))) invalidate($);
+    if (state.opened && before !== JSON.stringify(state.agents)) invalidate($);
 }

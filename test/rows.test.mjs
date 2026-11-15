@@ -49,3 +49,16 @@ test('wrapped MCP results decode; oversized or invalid results preserve native f
   assert.equal(describeCall(full('wait_agent'), {}, 'not JSON'), null);
   assert.equal(describeCall(full('wait_agent'), {}, 'x'.repeat(524289)), null);
 });
+
+test('user interruption and message events have accurate distinct timeline labels', () => {
+  const events = [
+    { agent_id: 'a', kind: 'interrupted' },
+    ...['requested', 'confirmed', 'unconfirmed'].map(phase => ({ agent_id: 'a', kind: 'message', origin: 'user', action: 'interrupt', phase })),
+    { agent_id: 'a', kind: 'message', origin: 'user', action: 'send', phase: 'delivered' },
+  ];
+  const labels = describeCall(full('wait_agent'), {}, { events }).map(entry => entry.text);
+  assert.deepEqual(labels, ['本轮已停止', '你已请求停止', '已按你的要求停止', '停止状态未确认', '已收到你的消息']);
+  const h = setup();
+  const tree = h.render('UserMessage', { origin: { kind: 'plugin', name: 'codex-subagents' }, text: EVENT_PREFIX + JSON.stringify({ events }) });
+  assert.ok(nodes(tree).some(node => node.type === 'Text' && node.props.children[0] === '停止状态未确认'));
+});

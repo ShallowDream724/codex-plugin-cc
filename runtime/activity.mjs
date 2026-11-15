@@ -29,9 +29,26 @@ function clean(value, limit = PREVIEW_BUDGET) {
   }
   return visit(value, 0);
 }
-const imageFields = (item) => Object.fromEntries(['id', 'type', 'status', 'generationId', 'generation_id', 'savedPath', 'saved_path', 'path', 'failure'].filter((key) => item[key] != null).map((key) => [key, item[key]]));
-const delegationFields = (item) => ({ id: item.id, type: item.type, tool: item.tool, status: item.status, names: Object.entries(item.agentsStates ?? {}).map(([id, a]) => a?.name ?? a?.nickname ?? id).slice(0, 20), name: item.name ?? item.agentName });
-const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item;
+const imageFields = (item) => Object.fromEntries(['id', 'type', 'status', 'generationId', 'generation_id', 'savedPath', 'saved_path', 'path', 'failure', 'contentType', 'mimeType'].filter((key) => item[key] != null).map((key) => [key, item[key]]));
+const delegationFields = (item) => {
+  const ids = [...new Set([...(item.receiverThreadIds ?? []), ...Object.keys(item.agentsStates ?? {})])].slice(0, 20);
+  const agents = ids.map(id => ({ id, name: item.displayAgentNames?.[id] ?? item.agentsStates?.[id]?.name ?? item.agentsStates?.[id]?.nickname, status: item.agentsStates?.[id]?.status }));
+  return { id: item.id, type: item.type, tool: item.tool, status: item.status, receiverThreadIds: ids, agents, names: agents.map(a => a.name ?? a.id), name: item.name ?? item.agentName };
+};
+const subagentFields = (item) => ({ id: item.id, type: item.type, kind: item.kind, agentThreadId: item.agentThreadId, agentPath: item.agentPath, name: item.name, model: item.model, reasoningEffort: item.reasoningEffort });
+const fileSummary = (item) => (item.changes ?? []).map((change) => {
+  const summary = { path: change.path };
+  if (typeof change.diff === 'string') {
+    let added = 0, removed = 0;
+    for (const line of change.diff.matchAll(/^[+-].*$/gm)) {
+      if (line[0].startsWith('+++ ') || line[0].startsWith('--- ')) continue;
+      if (line[0][0] === '+') added++; else removed++;
+    }
+    Object.assign(summary, { added, removed });
+  }
+  return summary;
+});
+const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item.type === 'subAgentActivity' ? subagentFields(item) : item.type === 'fileChange' ? { fileSummary: fileSummary(item), ...item } : item;
 const binaryString = (value) => typeof value === 'string' && /^data:[^,]*;base64,/i.test(value);
 const textValue = (value) => {
   if (binaryString(value)) return '[binary omitted]';
@@ -50,23 +67,31 @@ const outputValue = (value) => {
 export function formatItem(item) {
   const d = project(item);
   switch (d.type) {
-    case 'parentMessage': case 'agentMessage': return d.text ?? '';
+    case 'parentMessage': case 'directUserMessage': case 'agentMessage': return d.text ?? '';
     case 'userMessage': return (d.content ?? []).map((part) => part.text ?? '').filter(Boolean).join('\n\n');
     case 'commandExecution': return [`Command: ${d.command ?? ''}`, d.cwd && `Directory: ${d.cwd}`, d.exitCode != null && `Exit code: ${d.exitCode}`, d.status && `Status: ${d.status}`, d.aggregatedOutput != null && `Output:\n${d.aggregatedOutput}`].filter(Boolean).join('\n');
     case 'fileChange': return (d.changes ?? []).map((change) => `${change.path ?? 'File'}${change.kind ? ` (${typeof change.kind === 'string' ? change.kind : change.kind.type ?? 'change'})` : ''}\n${change.diff ?? ''}`).join('\n\n');
     case 'mcpToolCall': case 'dynamicToolCall': return [`Tool: ${d.server ? d.server + '/' : ''}${d.tool ?? ''}`, d.arguments != null && `Input:\n${textValue(d.arguments)}`, d.result != null && `Output:\n${outputValue(d.result)}`, d.contentItems != null && `Output:\n${outputValue(d.contentItems)}`, d.error != null && `Error:\n${textValue(d.error)}`].filter(Boolean).join('\n');
     case 'imageGeneration': case 'imageView': return [`Image: ${d.savedPath ?? d.saved_path ?? d.path ?? ''}`, d.status && `Status: ${d.status}`, d.failure && `Error: ${textValue(d.failure)}`].filter(Boolean).join('\n');
     case 'collabAgentToolCall': case 'collabToolCall': return `Delegation: ${[d.name, ...(d.names ?? [])].filter(Boolean).join(', ') || d.tool || 'agent'}`;
+    case 'subAgentActivity': return `Subagent: ${d.name || d.agentPath || d.agentThreadId || 'agent'} (${d.kind || 'activity'})`;
+    case 'plan': return d.text ?? '';
+    case 'contextCompaction': return 'Context compaction';
+    case 'functionCallOutput': return outputValue(d.output);
     default: return textValue(d);
   }
 }
-const visible = (item) => item && item.type !== 'reasoning' && item.type !== 'subAgentActivity';
-const simplify = (item, turnId, deferred = false) => {
-  const data = clean(project(item), PREVIEW_BUDGET / 2);
+const visible = (item) => item && item.type !== 'reasoning';
+const simplify = (item, turnId, deferred = false, stage) => {
+  const data = clean({ ...(stage ? { stage } : {}), ...project(item) }, PREVIEW_BUDGET / 2);
   return { id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
+  const directPrefix = '[Direct message from the user]\n\n';
+  if (item.content[0]?.text?.startsWith(directPrefix)) {
+    return { ...item, type: 'directUserMessage', text: item.content.map((part, index) => typeof part.text === 'string' ? index === 0 ? part.text.slice(directPrefix.length) : part.text : '').filter(Boolean).join('\n\n') };
+  }
   const prefixes = [guidance?.collaboration?.trim(), 'Claude is your parent agent.', guidance?.default?.instructions?.trim()].filter(Boolean);
   return { ...item, content: item.content.map((part) => {
     if (typeof part.text !== 'string') return part;
@@ -80,6 +105,7 @@ export class ActivityStore {
   static attach(client, controller) { return new ActivityStore({ client, controller }); }
   constructor({ client, controller }) {
     this.client = client; this.controller = controller; this.live = new Map(); this.nextRevision = 1;
+    this.agentNames = new Map(); this.turnStates = new Map();
     this.notification = (message) => this.observe(message);
     this.action = (action) => this.recordAction(action);
     client.on('notification', this.notification);
@@ -89,13 +115,16 @@ export class ActivityStore {
     this.client.off('notification', this.notification);
     this.controller.off('agentAction', this.action);
     this.live.clear();
+    this.agentNames.clear(); this.turnStates.clear();
   }
   find(target) {
     const agent = this.controller.find(target);
     if (!agent?.threadId || this.controller.threads.get(agent.threadId) !== agent) throw new Error('Agent thread is unavailable.');
     return agent;
   }
-  summary(a) { return { id: a.id, agent_id: a.id, name: a.name, status: a.status, activity: a.activity }; }
+  summary(a) { return { id: a.id, agent_id: a.id, name: a.name, status: a.status, activity: a.activity,
+    model: a.model, reasoning_effort: a.effort,
+    user_paused: a.userPaused === true, user_control_status: a.userControlStatus ?? null }; }
   list() { return { agents: [...this.controller.agents.values()].map((a) => this.summary(a)) }; }
   bucket(id) {
     let bucket = this.live.get(id);
@@ -116,16 +145,36 @@ export class ActivityStore {
     const agent = this.controller.agents.get(action.agent_id);
     if (action.kind === 'close') { this.live.delete(action.agent_id); return; }
     if (!agent || action.thread_id !== agent.threadId || typeof action.message !== 'string') return;
-    this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '', type: 'parentMessage', data: { text: clean(action.message) } });
+    this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '', type: action.origin === 'user' ? 'directUserMessage' : 'parentMessage', data: { text: clean(action.message) } });
+  }
+  decorate(item) {
+    if (['collabAgentToolCall', 'collabToolCall'].includes(item.type)) return { ...item, displayAgentNames: Object.fromEntries([...(item.receiverThreadIds ?? []), ...Object.keys(item.agentsStates ?? {})].filter(id => this.agentNames.has(id)).map(id => [id, this.agentNames.get(id)])) };
+    if (item.type === 'subAgentActivity') return { ...item, name: this.agentNames.get(item.agentThreadId) ?? item.name ?? item.agentPath };
+    return item;
+  }
+  remember(map, key, value) { map.delete(key); map.set(key, value); if (map.size > 256) map.delete(map.keys().next().value); }
+  stage(item, threadId, turnId) {
+    if (item.completedAtMs != null || this.turnStates.get(`${threadId}:${turnId}`) === 'completed') return 'completed';
+    return item.startedAtMs != null ? 'started' : undefined;
   }
   observe(message) {
     const p = message?.params ?? {};
+    if (message.method === 'thread/started' && p.thread?.id) {
+      const name = p.thread.name || p.thread.agentNickname;
+      if (typeof name === 'string' && name) this.remember(this.agentNames, p.thread.id, name.slice(0, 512));
+    }
     const agent = this.controller.threads.get(p.threadId);
     // Never follow descendant IDs, even when they are tracked by the controller.
     if (!agent || agent.threadId !== p.threadId) return;
     if (message.method === 'item/started' || message.method === 'item/completed') {
-      if (visible(p.item)) this.put(agent, simplify(removeGuidance(p.item, this.controller.guidance), p.turnId));
+      if (visible(p.item)) this.put(agent, simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started'));
       return;
+    }
+    if (message.method === 'turn/completed' && p.turn?.id) this.remember(this.turnStates, `${p.threadId}:${p.turn.id}`, p.turn.status);
+    if (message.method === 'thread/compacted') {
+      const bucket = this.bucket(agent.id);
+      const entry = [...bucket.entries].reverse().find(entry => entry.type === 'contextCompaction' && (!p.turnId || entry.turn_id === p.turnId));
+      if (entry && entry.data?.stage !== 'completed') this.put(agent, { ...entry, data: { ...entry.data, stage: 'completed' } });
     }
     if (['item/agentMessage/delta', 'item/commandExecution/outputDelta'].includes(message.method) && typeof p.delta === 'string' && p.itemId) {
       const bucket = this.bucket(agent.id);
@@ -138,7 +187,7 @@ export class ActivityStore {
   }
   revision({ target, revision } = {}) {
     const agent = this.find(target), bucket = this.bucket(agent.id);
-    return { revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: bucket.entries }) };
+    return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: bucket.entries }) };
   }
   async history({ target, cursor, limit = 30 } = {}) {
     const agent = this.find(target);
@@ -149,11 +198,12 @@ export class ActivityStore {
     if (!turnId) {
       const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded', ...(turnsCursor ? { cursor: turnsCursor } : {}) });
       turnId = page.data?.[0]?.id;
+      if (turnId) this.remember(this.turnStates, `${agent.threadId}:${turnId}`, page.data[0].status);
       turnsCursor = page.nextCursor ?? null;
       if (!turnId) return { agent: this.summary(agent), entries: [], next_cursor: null };
     }
     const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
-    const entries = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(removeGuidance(entry.item, this.controller.guidance), entry.turnId ?? turnId, entry.outputDeferred === true)).reverse();
+    const entries = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId))).reverse();
     const next_cursor = page.nextCursor ? { turn_id: turnId, items_cursor: page.nextCursor, turns_cursor: turnsCursor } : turnsCursor ? { turns_cursor: turnsCursor } : null;
     return { agent: this.summary(agent), entries, next_cursor };
   }

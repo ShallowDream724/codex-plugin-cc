@@ -4,7 +4,8 @@ import { prepareContextSnapshot } from './context.mjs';
 import { DeliveryStore } from './delivery.mjs';
 import { MemoryReceipts, requestFingerprint } from './receipts.mjs';
 
-const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent']);
+const UI_MUTATIONS = new Set(['ui_interrupt', 'ui_send']);
+const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', ...UI_MUTATIONS]);
 const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
@@ -52,7 +53,9 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       const method = { ui_list: 'list', ui_history: 'history', ui_detail: 'detail', ui_revision: 'revision' }[operation];
       return activity[method](args);
     }
-    if (body.restore) await delivery.confirm(body.restore);
+    // A user's UI action can publish a new event, but never acknowledges events
+    // addressed to Claude. Only the model delivery path may confirm those.
+    if (body.restore && !UI_MUTATIONS.has(operation)) await delivery.confirm(body.restore);
     if (operation === 'confirm') return delivery.confirm(args);
     if (operation === 'release') return delivery.release(args.delivery_id);
     if (operation === 'observe') {
@@ -94,7 +97,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     if (!OPERATIONS.has(operation)) throw new Error('Unknown bridge operation.');
     if (!MUTATIONS.has(operation)) return controller.dispatch(operation, args);
 
-    if (typeof requestId !== 'string' || !requestId || requestId.length > 256) throw new Error('Mutation requires a tool-call requestId.');
+    if (typeof requestId !== 'string' || !requestId || requestId.length > 256) throw new Error('Mutation requires an action requestId.');
     if (actions.has(requestId)) throw Object.assign(new Error('This action is already in progress. Use its existing result.'), { code: 'ambiguous_action' });
     actions.add(requestId);
     try {

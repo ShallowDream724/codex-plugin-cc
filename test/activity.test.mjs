@@ -97,3 +97,54 @@ test('ordinary data fields, long text and native dynamic text remain readable', 
   client.request = async () => ({ data: [{ item: { id: 'dynamic', type: 'dynamicToolCall', tool: 'notify_parent', contentItems: [{ type: 'inputText', text: 'Delivered to parent.' }] } }] });
   assert.match((await store.detail({ target: 'a', turn_id: 't', item_id: 'dynamic' })).text, /Delivered to parent\./);
 });
+
+test('user source and stop status survive the display projection without consuming events', async () => {
+  const { store, client, controller } = fixture();
+  const agent = controller.agents.get('a');
+  agent.userPaused = true; agent.userControlStatus = 'stopping';
+  controller.pendingEvents = [{ seq: 1, origin: 'user' }];
+  controller.emit('agentAction', { kind: 'send', origin: 'user', agent_id: 'a', thread_id: 'root', turn_id: 't', message: 'Keep the source files.' });
+  const before = store.revision({ target: 'a' });
+  assert.equal(before.agent.user_paused, true); assert.equal(before.agent.user_control_status, 'stopping');
+  assert.equal(before.entries[0].type, 'directUserMessage');
+  agent.userControlStatus = 'stopped';
+  const after = store.revision({ target: 'a', revision: before.revision });
+  assert.equal(after.entries, undefined); assert.equal(after.agent.user_control_status, 'stopped');
+  const item = { id: 'native-user', type: 'userMessage', content: [{ type: 'inputText', text: '[Direct message from the user]\n\nKeep the source files.' }] };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
+  const native = store.revision({ target: 'a' }).entries.at(-1);
+  assert.equal(native.type, 'directUserMessage'); assert.equal(native.preview, 'Keep the source files.');
+  client.request = async () => ({ data: [{ item }] });
+  assert.equal((await store.detail({ target: 'a', turn_id: 't', item_id: item.id })).text, 'Keep the source files.');
+  assert.deepEqual(controller.pendingEvents, [{ seq: 1, origin: 'user' }]);
+});
+
+test('file change counts use the full native diff before display truncation', () => {
+  const { store, client } = fixture();
+  const diff = '--- a/file.js\n+++ b/file.js\n@@ -1,1 +1,300 @@\n-old\n' + '+new content\n'.repeat(900);
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: { id: 'edit', type: 'fileChange', changes: [{ path: 'src/file.js', diff }, { path: 'image.png' }] } } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.deepEqual(entry.data.fileSummary, [{ path: 'src/file.js', added: 900, removed: 1 }, { path: 'image.png' }]);
+  assert.ok(entry.data.changes[0].diff.length < diff.length);
+});
+
+test('root lifecycle rows distinguish compaction stages and keep only child identity and status', () => {
+  const { store, client, controller } = fixture();
+  controller.pendingEvents = [{ seq: 1 }];
+  const emit = (method, params) => client.emit('notification', { method, params });
+  emit('thread/started', { thread: { id: 'child', agentNickname: 'Scout' } });
+  emit('item/completed', { threadId: 'root', turnId: 't', item: { id: 'delegation', type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['child'], prompt: 'private task', agentsStates: { child: { status: 'running', message: 'private descendant output' } } } });
+  emit('item/completed', { threadId: 'root', turnId: 't', item: { id: 'child-start', type: 'subAgentActivity', agentThreadId: 'child', agentPath: '/root/scout', kind: 'started' } });
+  emit('item/completed', { threadId: 'child', turnId: 'child-turn', item: { id: 'nested-call', type: 'mcpToolCall', tool: 'private' } });
+  emit('item/started', { threadId: 'root', turnId: 't', item: { id: 'compact', type: 'contextCompaction' } });
+  let entries = store.revision({ target: 'a' }).entries;
+  assert.equal(entries.at(-1).data.stage, 'started');
+  emit('thread/compacted', { threadId: 'root', turnId: 't' });
+  entries = store.revision({ target: 'a' }).entries;
+  assert.equal(entries.at(-1).data.stage, 'completed');
+  assert.equal(entries.filter(entry => entry.id === 'compact').length, 1);
+  assert.deepEqual(entries[0].data.agents, [{ id: 'child', name: 'Scout', status: 'running' }]);
+  assert.equal(entries[1].data.name, 'Scout');
+  assert.ok(!JSON.stringify(entries).includes('private'));
+  assert.deepEqual(controller.pendingEvents, [{ seq: 1 }]);
+});

@@ -33,8 +33,10 @@ export class AgentController extends EventEmitter {
     this.threads = new Map();
     this.descendants = new Map();
     this.unlinkedThreads = new Map();
+    this.unlinkedTurns = new Map();
     this.descendantTurns = new Map();
     this.retiredThreads = new Set();
+    this.pausedThreads = new Set();
     this.pendingEvents = [];
     this.nextSeq = 1;
     this.starting = 0;
@@ -59,20 +61,36 @@ export class AgentController extends EventEmitter {
     // Wire requests cannot be recovered by a new app-server connection.
     this.pendingEvents = data.pendingEvents.filter((event) => !['question', 'approval'].includes(event.kind));
     this.retiredThreads = new Set(data.retiredThreads ?? []);
+    this.pausedThreads = new Set(data.pausedThreads ?? []);
+    this.unlinkedThreads = new Map(data.unlinkedThreads ?? []);
+    this.unlinkedTurns = new Map(data.unlinkedTurns ?? []);
     this.nextSeq = data.pendingEvents.reduce((next, event) => Math.max(next, event.seq + 1), data.nextSeq ?? 1);
     for (const saved of data.agents) {
       const a = { ...saved, lastTurnId: saved.turnId, pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
+      if (a.threadId && this.pausedThreads.has(a.threadId)) a.userPaused = true;
+      if (a.userPaused) a.interrupted = true;
+      if (a.userPaused && a.threadId) this.pausedThreads.add(a.threadId);
       this.agents.set(a.id, a);
       if (a.threadId) this.threads.set(a.threadId, a);
-      if (ACTIVE.has(a.status)) {
+      if (ACTIVE.has(a.status) || a.turnId) {
         a.status = 'unknown'; a.turnId = null; a.activity = 'stale_pending';
         this.publish(a, 'unknown', { reason: 'controller_restarted', stale_pending: true });
       }
     }
+    for (const [id, rootId] of data.descendants ?? []) {
+      const root = this.agents.get(rootId);
+      if (root) this.descendants.set(id, root);
+    }
+    this.descendantTurns = new Map((data.descendantTurns ?? []).filter(([id]) => this.descendants.has(id)));
+    this.linkDescendants();
     this.pendingEvents = this.pendingEvents.filter((event) => this.agents.has(event.agent_id));
     // A restarted controller cannot assume an active turn stopped. Reconcile
     // native state now so confirmed idle threads release capacity automatically.
     await Promise.allSettled([...this.agents.values()].filter((a) => a.status === 'unknown' && a.threadId).map((a) => this.reconcileUnknown(a)));
+    await Promise.allSettled([...this.agents.values()].filter((a) => a.userPaused).map(async (a) => {
+      await this.reconcileDescendants(a);
+      return this.stopTree(a);
+    }));
     await this.persist();
     return this;
   }
@@ -81,6 +99,7 @@ export class AgentController extends EventEmitter {
     const result = { id: a.id, agent_id: a.id, thread_id: a.threadId, name: a.name, cwd: a.cwd,
       model: a.model, reasoning_effort: a.effort, status: a.status, activity: a.activity,
       turn_id: a.turnId, error: a.error ?? null,
+      user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null,
       pending_requests: a.pending.map(({ id, method, params }) => ({ method, ...copy(params), request_id: id,
         reply_format: replyFormat(method, params), ...(params.threadId !== a.threadId ? { source_thread_id: params.threadId } : {}) })) };
     if (metrics) {
@@ -125,6 +144,8 @@ export class AgentController extends EventEmitter {
       case 'send_message': return this.send(this.find(args.target), args.message, false);
       case 'followup_task': return this.followup(args.target, args.message);
       case 'interrupt_agent': return this.interrupt(this.find(args.target));
+      case 'ui_interrupt': return this.uiInterrupt(this.find(args.target));
+      case 'ui_send': return this.uiSend(this.find(args.target), args.message);
       case 'close_agent': return this.closeSelected(args);
       case 'answer_agent': return this.answer(this.find(args.target), args.request_id, args.answer);
       default: throw new Error(`Unknown operation: ${operation}`);
@@ -150,8 +171,8 @@ export class AgentController extends EventEmitter {
     return true;
   }
 
-  action(kind, a, message) {
-    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: a.turnId ?? null, name: a.name ?? null, ...(message === undefined ? {} : { message }) });
+  action(kind, a, message, origin) {
+    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: a.turnId ?? null, name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }) });
   }
 
   updateResolved(a, response) {
@@ -195,6 +216,8 @@ export class AgentController extends EventEmitter {
       if (!nonempty(response.thread?.id)) throw new Error('thread/start returned no thread id.');
       this.updateResolved(a, response);
       a.threadId = response.thread.id;
+      this.unlinkedTurns.delete(a.threadId);
+      if (a.userPaused) { this.pausedThreads.add(a.threadId); a.pauseDurable = this.persist(); await a.pauseDurable; }
       this.action('spawn', a, message);
       this.threads.set(a.threadId, a);
       this.linkDescendants();
@@ -213,6 +236,7 @@ export class AgentController extends EventEmitter {
       throw Object.assign(new Error(`Agent ${a.id}${a.threadId ? ` (thread ${a.threadId})` : ''}: ${error.message} ${recovery}`, { cause: error }), { agent_id: a.id, thread_id: a.threadId ?? null, status: a.status, recovery });
     } finally {
       a.spawning = false;
+      if (a.interrupted) this.stopTree(a).catch(() => {});
       this.starting--;
       if (!this.starting) {
         const early = this.early.splice(0);
@@ -231,6 +255,7 @@ export class AgentController extends EventEmitter {
 
   async startTurn(a, text, newTask = false) {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
+    if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
     const previousTaskTurns = newTask ? new Set(a.completedTurns) : null;
     if (newTask) { a.recoveryUsed = false; a.interrupted = false; a.error = null; a.terminalEmitted = false; }
     a.compactItems.clear();
@@ -276,7 +301,7 @@ export class AgentController extends EventEmitter {
     if (turn?.id && !a.completedTurns.has(turn.id) && ACTIVE.has(a.status) && !a.turnId) a.turnId = turn.id;
     a.lastTurnId = turn?.id ?? a.lastTurnId;
     if (previousTaskTurns) for (const id of previousTaskTurns) a.completedTurns.delete(id);
-    if (a.interrupted && a.turnId) await this.requestInterrupt(a);
+    if (a.interrupted && a.turnId) await this.requestTreeInterrupt(a, a.threadId, a.turnId);
     await this.persist();
   }
 
@@ -367,10 +392,12 @@ export class AgentController extends EventEmitter {
       const clientTools = await externalClientTools(thread);
       const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, status: 'interrupted', activity: 'adopted',
         pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: false, recoveryUsed: false, interrupted: false, terminalEmitted: true, adopting: true, externalAdopted: true, externalThread: true };
+      if (this.pausedThreads.has(id)) { a.userPaused = true; a.userControlStatus = 'stopped'; a.interrupted = true; }
       this.updateResolved(a, { thread });
       this.retiredThreads.delete(id); this.agents.set(a.id, a); this.threads.set(id, a);
       try {
         await this.persist();
+        if (a.userPaused) throw new Error(`Agent ${a.id} remains paused by the user. Resume it with a direct user message in the interface.`);
         const result = await this.send(a, message, true, reservation);
         return { ...result, client_tools_unavailable: clientTools, limitations: ['Original client dynamic tools are unavailable here. Continue in the original Codex client if those tools are needed.'] };
       } catch (error) {
@@ -382,11 +409,17 @@ export class AgentController extends EventEmitter {
     } finally { const a = this.threads.get(id); if (a) a.adopting = false; this.reservations.delete(reservation); this.adoptions.delete(id); }
   }
 
-  async send(a, message, followup, existingReservation) {
+  async send(a, message, followup, existingReservation, origin, resumeToken) {
     if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
+    if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
+    const epoch = a.controlEpoch ?? 0;
+    const wireMessage = origin === 'user' ? `[Direct message from the user]\n\n${message}` : message;
     if (a.adopting && !existingReservation) throw new Error(`Thread ${a.threadId} is being adopted.`);
     if (a.externalConflict) throw new Error(`Thread ${a.threadId} became active in another client. Close this agent and retry adoption once the native thread is idle.`);
     const reconciliation = await this.reconcileUnknown(a);
+    if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
+    if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
     if (a.status === 'unknown') throw this.unknownError(a);
     if (a.removing) throw new Error('Agent is closing.');
     if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
@@ -395,10 +428,10 @@ export class AgentController extends EventEmitter {
       const turnId = a.turnId;
       a.sending = (a.sending ?? 0) + 1;
       try {
-        const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: input(message) });
-        this.action('send', a, message);
+        const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: input(wireMessage) });
+        this.action('send', a, message, origin);
         return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
-      } finally { a.sending--; }
+      } finally { a.sending--; if (a.interrupted) this.stopTree(a).catch(() => {}); }
     }
     if (a.resuming) throw new Error('Agent followup is already starting.');
     const reservation = existingReservation ?? Symbol('followup');
@@ -416,16 +449,17 @@ export class AgentController extends EventEmitter {
       }
       a.loaded = true;
       a.externalAdopted = false;
+      if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
           items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
-        this.action('send', a, message);
+        this.action('send', a, message, origin);
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
-      await this.startTurn(a, message, true);
-      this.action('send', a, message);
+      await this.startTurn(a, wireMessage, true);
+      this.action('send', a, message, origin);
       return this.view(a);
-    } finally { a.resuming = false; }
+    } finally { a.resuming = false; if (a.interrupted) this.stopTree(a).catch(() => {}); }
   }
 
   async closeSelected(args) {
@@ -447,8 +481,9 @@ export class AgentController extends EventEmitter {
   }
 
   canClose(a) {
+    if (a.userResumeToken) throw new Error('A direct user message is being delivered; retry closing afterward.');
     if (a.status === 'unknown') throw new Error('Agent turn/start outcome is unknown; reconcile the native Codex thread before closing ownership.');
-    if (!TERMINAL.has(a.status) || a.turnId || a.pending.length || a.spawning || a.adopting || a.resuming || a.startingTurn || a.sending || a.recovery) {
+    if (!TERMINAL.has(a.status) || a.turnId || a.pending.length || a.spawning || a.adopting || a.resuming || a.startingTurn || a.sending || a.recovery || a.stopPromise) {
       throw new Error('Agent must be idle and terminal with no pending requests or operations before closing.');
     }
     for (const [threadId, root] of this.descendants) {
@@ -482,7 +517,7 @@ export class AgentController extends EventEmitter {
       } while (changed);
       for (const id of threadIds) {
         this.retiredThreads.add(id);
-        this.threads.delete(id); this.descendants.delete(id); this.unlinkedThreads.delete(id); this.descendantTurns.delete(id);
+        this.threads.delete(id); this.descendants.delete(id); this.unlinkedThreads.delete(id); this.unlinkedTurns.delete(id); this.descendantTurns.delete(id);
       }
       this.agents.delete(a.id);
       this.pendingEvents = this.pendingEvents.filter((event) => event.agent_id !== a.id);
@@ -513,43 +548,149 @@ export class AgentController extends EventEmitter {
   }
 
   async interrupt(a) {
-    await this.reconcileUnknown(a);
-    if (a.status === 'unknown') throw this.unknownError(a);
     a.interrupted = true;
-    if (!ACTIVE.has(a.status)) return { agent_id: a.id, status: 'not_running' };
-    if (a.turnId) await this.requestInterrupt(a);
-    // A recovery between turns must not restart after the user interrupts it.
-    if (!a.turnId && !a.startingTurn) this.finish(a, 'interrupted', { reason: 'parent_interrupt' });
-    return { agent_id: a.id, status: 'interrupting' };
+    return this.stopTree(a);
   }
 
-  async requestInterrupt(a) {
-    if (!a.turnId || a.interruptSentTurn === a.turnId) return;
-    const turnId = a.turnId;
-    a.interruptSentTurn = turnId;
-    try { await this.rpc('turn/interrupt', { threadId: a.threadId, turnId }); }
-    catch (error) { if (a.interruptSentTurn === turnId) a.interruptSentTurn = null; throw error; }
+  async uiInterrupt(a) {
+    const changed = !a.userPaused;
+    a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
+    if (a.threadId) this.pausedThreads.add(a.threadId);
+    for (const [threadId, root] of this.descendants) if (root === a) this.pausedThreads.add(threadId);
+    a.pauseDurable = this.persist();
+    if (!a.stopPromise) a.interruptSent = new Map();
+    if (changed) {
+      a.userControlStatus = 'stopping';
+      this.action('interrupt', a, undefined, 'user');
+      this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'requested', message: 'The user requested that this agent and its descendants stop.' });
+    }
+    // The pause barrier must be durable before any native operation is awaited.
+    await a.pauseDurable;
+    const result = await this.stopTree(a);
+    return { ...result, user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
+  }
+
+  async uiSend(a, message) {
+    if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (a.userResumeToken) throw new Error('A direct user message is already being delivered.');
+    if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; answer the pending request first.');
+    if (a.userPaused && (this.treeBusy(a) || a.stopPromise)) throw new Error('Interruption is not yet confirmed; retry after all agent work stops.');
+    if (!ACTIVE.has(a.status) && [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id))) throw new Error('Agent has an active descendant; wait for it to finish before resuming.');
+    const wasPaused = !!a.userPaused;
+    const resumeToken = Symbol('user resume');
+    a.userResumeToken = resumeToken;
+    try {
+      a.userPaused = false; a.userControlStatus = null;
+      if (wasPaused) await this.persist();
+      const result = await this.send(a, message, true, undefined, 'user', resumeToken);
+      if (wasPaused && !a.userPaused && a.threadId) this.pausedThreads.delete(a.threadId);
+      this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'delivered', message, delivery_status: result.status === 'steered' ? 'steered' : 'started' });
+      await this.persist();
+      return { ...result, delivery: result.status === 'steered' ? 'steered' : 'started', user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
+    } catch (error) {
+      if (wasPaused && !a.userPaused) {
+        a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
+        if (a.threadId) this.pausedThreads.add(a.threadId);
+        a.userControlStatus = this.treeBusy(a) ? 'unconfirmed' : 'stopped';
+      }
+      this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'failed', message, delivery_status: 'unconfirmed', error: error.message });
+      a.pauseDurable = this.persist();
+      await a.pauseDurable;
+      if (a.userPaused && this.treeBusy(a)) await this.stopTree(a);
+      throw error;
+    } finally { if (a.userResumeToken === resumeToken) a.userResumeToken = null; }
+  }
+
+  treeBusy(a) {
+    return a.status === 'unknown' || ACTIVE.has(a.status) || !!a.turnId || !!a.startingTurn || !!a.spawning || !!a.resuming || !!a.sending || !!a.recovery || [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id));
+  }
+
+  async reconcileDescendants(a) {
+    for (const [threadId, root] of this.descendants) {
+      if (root !== a || !this.descendantTurns.has(threadId)) continue;
+      try {
+        let status = (await this.rpc('thread/read', { threadId, includeTurns: false }))?.thread?.status?.type;
+        if (status === 'active') {
+          status = (await this.rpc('thread/resume', { threadId, excludeTurns: true, ...permissionParams(this.settings) }))?.thread?.status?.type;
+          if (status === 'active') {
+            const page = await this.rpc('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+            const turn = page?.data?.[0];
+            if (turn?.status === 'inProgress' && nonempty(turn.id)) this.descendantTurns.set(threadId, turn.id);
+          }
+        }
+        if (['idle', 'notLoaded'].includes(status)) this.descendantTurns.delete(threadId);
+      } catch { /* Preserve the last known turn until native state can be confirmed. */ }
+    }
+  }
+
+  updateStopStatus(a) {
+    if (!a.userPaused) return;
+    const status = this.treeBusy(a) ? (a.stopError ? 'unconfirmed' : 'stopping') : 'stopped';
+    if (status === a.userControlStatus) return;
+    const previous = a.userControlStatus;
+    a.userControlStatus = status;
+    if (status === 'stopped') this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'confirmed', message: 'The agent and its known descendants have stopped.' });
+    else if (status === 'unconfirmed') this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'unconfirmed', message: 'The interruption could not be confirmed; work may still be running.' });
+    else if (previous === 'stopped') this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'stopping', message: 'New agent work was observed after the stop; interruption has been requested again.' });
+    this.persist().catch(() => {});
+  }
+
+  async stopTree(a) {
+    if (a.stopPromise) return a.stopPromise;
+    a.stopError = null;
+    const stop = async () => {
+      await this.reconcileUnknown(a);
+      if (a.status === 'unknown') a.stopError = this.unknownError(a).message;
+      if (a.status !== 'unknown' && !a.turnId && !a.startingTurn && !a.spawning && !a.resuming && ACTIVE.has(a.status)) this.finish(a, 'interrupted', { reason: 'interrupt' });
+      const turns = [];
+      if (a.turnId) turns.push([a.threadId, a.turnId]);
+      for (const [id, root] of this.descendants) if (root === a && this.descendantTurns.has(id)) turns.push([id, this.descendantTurns.get(id)]);
+      const results = await Promise.allSettled(turns.map(([id, turn]) => this.requestTreeInterrupt(a, id, turn)));
+      const failure = results.find((r) => r.status === 'rejected');
+      if (failure) a.stopError = failure.reason.message;
+      this.updateStopStatus(a);
+      await this.persist();
+      return { agent_id: a.id, status: a.userPaused ? a.userControlStatus : (this.treeBusy(a) ? 'interrupting' : 'not_running'), ...(a.stopError ? { error: a.stopError } : {}) };
+    };
+    a.stopPromise = stop();
+    try { return await a.stopPromise; } finally { a.stopPromise = null; this.updateStopStatus(a); }
+  }
+
+  async requestTreeInterrupt(a, threadId, turnId) {
+    if (a.userPaused && a.pauseDurable) await a.pauseDurable;
+    if (!a.interrupted) return;
+    a.interruptSent ??= new Map();
+    if (a.interruptSent.get(threadId) === turnId) return;
+    a.interruptSent.set(threadId, turnId);
+    try { await this.rpc('turn/interrupt', { threadId, turnId }); }
+    catch (error) { if (a.interruptSent.get(threadId) === turnId) a.interruptSent.delete(threadId); throw error; }
   }
 
   interruptUnconfirmed(a, error) {
     if (this.closed || this.closing || !a.turnId) return;
     if (a.status === 'interrupted') a.status = 'unknown';
     a.activity = 'interrupt not confirmed';
+    a.stopError = error.message;
+    this.updateStopStatus(a);
     a.error = { code: 'interrupt_unconfirmed', message: error.message, turn_id: a.turnId };
     this.publish(a, 'message', { code: 'interrupt_unconfirmed', message: 'Interruption was not confirmed. This agent may still be running; retry interrupt_agent for this agent.' });
   }
 
   threadId(params = {}) { return params.threadId ?? params.thread?.id; }
   linkDescendants() {
-    let changed;
+    let changed, linked = false;
     do {
       changed = false;
       for (const [id, parentId] of this.unlinkedThreads) {
         const root = this.threads.get(parentId) ?? this.descendants.get(parentId);
         if (!root || id === root.threadId) continue;
-        this.descendants.set(id, root); this.unlinkedThreads.delete(id); changed = true;
+        this.descendants.set(id, root); this.unlinkedThreads.delete(id); changed = true; linked = true;
+        if (root.userPaused) { this.pausedThreads.add(id); root.pauseDurable = this.persist(); root.pauseDurable.catch(() => {}); }
+        const turnId = this.unlinkedTurns.get(id);
+        if (turnId) { this.unlinkedTurns.delete(id); this.observeDescendant(root, { method: 'turn/started' }, { threadId: id, turn: { id: turnId } }); }
       }
     } while (changed);
+    if (linked) this.persist().catch(() => {});
   }
 
   observeDescendant(a, message, p) {
@@ -566,6 +707,10 @@ export class AgentController extends EventEmitter {
       a.activity = ACTIVE.has(a.status) ? 'working' : a.status;
     }
     this.pruneRequestEvents(a);
+    if (message.method === 'turn/started' && a.interrupted) {
+      this.requestTreeInterrupt(a, sourceId, p.turn.id).catch((error) => { a.stopError = error.message; this.updateStopStatus(a); });
+    }
+    this.updateStopStatus(a);
     this.persist().catch(() => {});
   }
 
@@ -583,6 +728,13 @@ export class AgentController extends EventEmitter {
     if (!a) {
       const root = this.descendants.get(sourceId);
       if (root) { this.observeDescendant(root, message, p); return; }
+      if (sourceId && message.method === 'turn/started' && p.turn?.id) {
+        this.unlinkedTurns.set(sourceId, p.turn.id);
+        if (this.unlinkedTurns.size > 1000) this.unlinkedTurns.delete(this.unlinkedTurns.keys().next().value);
+        this.persist().catch(() => {});
+      } else if (sourceId && message.method === 'turn/completed' && this.unlinkedTurns.get(sourceId) === p.turn?.id) {
+        this.unlinkedTurns.delete(sourceId); this.persist().catch(() => {});
+      }
       if (this.starting && this.important(message)) this.early.push({ message: copy(message) });
       return;
     }
@@ -600,7 +752,8 @@ export class AgentController extends EventEmitter {
         if (a.terminalEmitted && a.status !== 'unknown') {
           if (a.interrupted) {
             a.turnId = p.turn.id;
-            this.requestInterrupt(a).catch((error) => this.interruptUnconfirmed(a, error));
+            this.requestTreeInterrupt(a, a.threadId, a.turnId).catch((error) => this.interruptUnconfirmed(a, error));
+            this.updateStopStatus(a); this.persist().catch(() => {});
           }
           return;
         }
@@ -608,7 +761,7 @@ export class AgentController extends EventEmitter {
         a.lastTurnId = p.turn.id;
         if (a.status === 'unknown') { a.terminalEmitted = false; a.error = null; a.status = 'running'; }
         if (!a.recovery && !a.terminalEmitted) { a.status = a.pending.length ? 'waiting' : 'running'; a.activity = a.pending.length ? 'waiting for parent' : 'working'; }
-        if (a.interrupted) this.requestInterrupt(a).catch((error) => this.interruptUnconfirmed(a, error));
+        if (a.interrupted) this.requestTreeInterrupt(a, a.threadId, a.turnId).catch((error) => this.interruptUnconfirmed(a, error));
         break;
       case 'thread/tokenUsage/updated': a.tokenUsage = copy(p.tokenUsage); break;
       case 'error':
@@ -656,7 +809,7 @@ export class AgentController extends EventEmitter {
   turnCompleted(a, turn) {
     if (!turn?.id || a.completedTurns.has(turn.id)) return;
     if (a.terminalEmitted) {
-      if (a.turnId === turn.id) { a.turnId = null; a.lastTurnId = turn.id; }
+      if (a.turnId === turn.id) { a.completedTurns.add(turn.id); a.turnId = null; a.lastTurnId = turn.id; this.updateStopStatus(a); this.persist().catch(() => {}); }
       return;
     }
     if (a.turnId && a.turnId !== turn.id) return;
@@ -698,6 +851,7 @@ export class AgentController extends EventEmitter {
     this.pruneRequestEvents(a);
     if (kind === 'failed' || kind === 'unknown') a.error = details;
     this.publish(a, kind, details);
+    this.updateStopStatus(a);
   }
 
   pruneRequestEvents(a) {
@@ -754,6 +908,7 @@ export class AgentController extends EventEmitter {
   }
 
   async answer(a, id, answer) {
+    if (a.userPaused || a.userResumeToken) throw new Error('Agent is paused by the user; pending requests cannot be answered until the user resumes it.');
     const pending = a.pending.find((r) => r.id === String(id));
     if (!pending || pending.responding) throw new Error('No matching pending request.');
     let result;
@@ -809,10 +964,10 @@ export class AgentController extends EventEmitter {
     // await the batch containing their mutation; failed writes still reject them.
     const write = this.persistTail.then(() => {
       this.persistScheduled = null;
-      const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
+      const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
       id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
       activity: a.activity, turnId: a.turnId, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
-      snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools,
+      snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus,
     })) };
       return (async () => {
       await mkdir(path.dirname(this.statePath), { recursive: true });
@@ -838,7 +993,11 @@ export class AgentController extends EventEmitter {
     for (const a of this.agents.values()) {
       a.pending = [];
       this.pruneRequestEvents(a);
-      if (ACTIVE.has(a.status)) this.finish(a, 'failed', { message: 'App-server connection closed.' });
+      if (a.userPaused && this.treeBusy(a)) {
+        if (ACTIVE.has(a.status)) { a.status = 'unknown'; a.activity = 'connection closed; interruption unconfirmed'; }
+        a.stopError = 'App-server connection closed before interruption was confirmed.';
+        this.updateStopStatus(a);
+      } else if (ACTIVE.has(a.status)) this.finish(a, 'failed', { message: 'App-server connection closed.' });
     }
   }
 
