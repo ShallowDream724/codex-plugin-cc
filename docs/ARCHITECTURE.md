@@ -38,7 +38,7 @@
 
 直接代理以 thread ID 索引。合法后代由 `parentThreadId` / `source.subAgent.thread_spawn.parent_thread_id` 关联。后代工具、推理、usage 和最终结果不传播；问题和审批保留源线程 ID，通过原始 JSON-RPC ID 回答。外部请求 ID 统一为字符串，内部仍保留原类型，避免数字 0 的丢失。
 
-原生 `request_user_input` 在默认工作模式启用；另提供一个简短 `notify_parent` 动态工具，仅用于真正需要协调的阻塞。Codex 自己的多代理能力保留。
+原生 `request_user_input` 在默认工作模式启用，用于必须得到回答才能继续的事项；简短 `notify_parent` 动态工具用于重要协调，不播报常规进度。重要设计问题、实质分歧或更优方案应在大量实施前沟通，不强制每项任务先讨论一轮。工程、验证和交付规范由适用的 AGENTS.md 等原生指引提供，协作提示不重复注入。Codex 自己的多代理能力保留。
 
 `role: default` 使用配置的 Luna medium，hook 与 broker 在读取快照前将上下文模式归为 none，显式冲突则拒绝。该角色关闭原生子代理、生图和主动提问工具，角色职责要求只读、单轮、一次最终交付；其他角色不受这些开关影响。
 

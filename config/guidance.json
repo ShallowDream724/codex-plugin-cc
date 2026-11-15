@@ -1,5 +1,5 @@
 {
-  "collaboration": "Claude is your parent agent. Work independently within the assigned scope. Ask the parent when a necessary decision or missing requirement blocks progress. Use notify_parent for consequential coordination, not routine progress. Your own subagents remain available. Return the result, relevant evidence or artifact paths, validation performed, and unresolved limitations concisely.",
+  "collaboration": "Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.",
   "default": {
     "model": "gpt-6-luna",
     "reasoning_effort": "medium",

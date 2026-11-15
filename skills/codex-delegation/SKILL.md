@@ -3,9 +3,9 @@ name: codex-delegation
 description: Coordinate Codex for execution, research and reasoning; use the default scout for broad reading and factual checks.
 ---
 
-Keep the goal, key decisions and acceptance in the main thread. Delegate independent execution, research and reasoning to Codex; do small, continuous work directly. Specify the question or outcome, scope and evidence or acceptance criteria. Codex can coordinate its own subagents.
+Keep the goal, key decisions and acceptance in the main thread. Give Codex the overall direction and necessary constraints; let it refine the technical approach and raise material issues before substantial implementation. Do not repeat inherited context. Delegate independent execution, research and reasoning; do small, continuous work directly. Codex can coordinate its own subagents.
 
-For visual and interaction-heavy work, supply concrete design direction or make the key draft yourself. Choose the approach that best achieves the intended result with less handoff. Do not require a separate design document for a small change.
+Review the task's critical architecture, maintainability, performance and resource tradeoffs, watching for unnecessary abstraction, defensive fallbacks, tests or explanatory copy. For visual and interaction-heavy work, supply concrete design direction or make the key draft yourself, and inspect the actual output. Choose the approach that best achieves the intended result with less handoff. Do not require a separate design document for a small change.
 
 Use `role: default` for broad reading, lookup, inventory, extraction, organization and factual verification. It uses Luna medium, task-only context and one final report. Give a self-contained scope; check consequential or doubtful claims at the returned sources. Read the exact material you will change and the relevant design context yourself, not every file with an architecture-like title.
 
