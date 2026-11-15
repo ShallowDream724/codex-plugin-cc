@@ -4,7 +4,7 @@
 
 `hooks/register.js` 是 Claude mod：注册九个按需工具，读取宿主公开接口提供的当前快照，等待重要事件并确认最终保留消息。`hooks/bridge.js` 仅提供静态导入的本机通信；UI 使用它不会进入模型交付确认流程。
 
-`hooks/rows.js` 只改写工具调用和本插件通知的显示：不同代理图标与可点击名称组成简短生命周期记录，展开宿主完整记录时保留原始输出。`hooks/ui.js` 使用宿主公开的 Pane、文本、输入与展开组件呈现代理对话，提供 `/codex-agents` 键盘入口。`runtime/activity.mjs` 是独立只读投影，使用原生线程历史分页与有界实时缓存，不读写模型 pendingEvents。`shared/tool-output.mjs` 统一提取结果文本与有效结构化内容，跳过空协议占位；共享运行代码也纳入 helper 构建指纹。
+`hooks/rows.js` 只改写工具调用和本插件通知的显示：不同代理图标与可点击名称组成简短生命周期记录，展开宿主完整记录时保留原始输出。`hooks/ui.js` 使用宿主公开的 Pane、文本、输入与展开组件呈现代理对话，提供 `/codex-agents` 键盘入口。`hooks/action-control.js` 仅绘制圆形发送／停止控件，经 `ui.message` 通知 hooks，hooks 再按当前选中代理、草稿和动作状态执行；没有模型工具或独立文本编辑器。`runtime/activity.mjs` 是独立只读投影，使用原生线程历史分页与有界实时缓存，不读写模型 pendingEvents。`shared/tool-output.mjs` 统一提取结果文本与有效结构化内容，跳过空协议占位；共享运行代码也纳入 helper 构建指纹。
 
 `runtime/settings.mjs` 验证用户权限与活动名额，未知设置键拒绝。`runtime/roles.mjs` 读取唯一的经验指引源、保守判断原生 default fallback，并只读检查外部线程的首条 session_meta 动态工具元数据。角色 TOML 与完整审阅稿由 `scripts/guidance.mjs` 生成，检查脚本验证一致性。
 

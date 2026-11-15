@@ -380,6 +380,11 @@ export function registerUI(on) {
     if (e.origin.kind === 'plugin' && state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(state.selected) || 0 }); }
     return next(e);
   });
+  on('ui.message', { requestId: PANE }, async ($, e, next) => {
+    if (!state.opened || !state.selected || e.element !== `codex_action_${state.selected}` || e.data?.action !== 'activate') return next(e);
+    await controlFor(state.selected).actions?.activate();
+    return {};
+  });
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     if (e.requestId !== PANE) return next(e);
     await $.state.get(PANE_REVISION);
@@ -388,7 +393,7 @@ export function registerUI(on) {
 }
 function renderPane($, e, next) {
     if (e.requestId !== PANE) return next(e);
-    const { Box, Text, Button, Input, Markdown, Image, Code, Svg } = $.ui.resolve(e), id = state.selected;
+    const { Box, Text, Button, Input, Markdown, Image, Code, Svg, Client } = $.ui.resolve(e), id = state.selected;
     const selected = state.agents.find((agent) => idOf(agent) === id);
     if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
     const page = pageFor(id), control = controlFor(id);
@@ -400,6 +405,7 @@ function renderPane($, e, next) {
     const entries = all.filter((entry) => !String(entry.id).startsWith('action:') || !['parentMessage', 'directUserMessage'].includes(entry.type) || !(entry.type === 'parentMessage' ? nativeParent : nativeUser).some((text) => entry.data?.text && text.includes(entry.data.text)));
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
+    const hint = (key, child, label, width = 18, left = 0) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
     const iconFor = (key, icon) => e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key, source: icon.source, alt: icon.alt, width: 14, height: 14 }) : caption(key, icon.glyph);
     const disclosure = (key, label, onPress, entry, integration = false) => {
       const button = Button({ key, plain: true, dimColor: true, label, onPress });
@@ -414,8 +420,12 @@ function renderPane($, e, next) {
       input: (value) => { const wasEmpty = !control.draft.trim(); control.draft = value; if (wasEmpty !== !value.trim()) return invalidate($); },
       submit: (value) => {
         control.draft = value;
+        return sendAgent($, id);
+      },
+      activate: () => {
         const agent = state.agents.find((item) => idOf(item) === id);
-        if (!value.trim() && !control.attachments.length && interruptible(agent)) return stopAgent($, id);
+        if (control.stopping || agent?.user_control_status === 'stopping') return;
+        if (!control.draft.trim() && !control.attachments.length && interruptible(agent)) return stopAgent($, id);
         return sendAgent($, id);
       },
     };
@@ -498,7 +508,8 @@ function renderPane($, e, next) {
           if (!contents.length) contents.push(sections.length || loaded ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
           if (raw.length) {
             const rawKey = `${key}:raw`;
-            contents.push(disclosure(`tool_raw_${key}`, `‹/› 原始调用 ${state.folds.has(rawKey) ? '▾' : '▸'}`, () => { toggle(rawKey); return invalidate($); }));
+            const rawToggle = Box({ key: `tool_raw_row_${key}`, flexDirection: 'row', children: [hint(`tool_raw_hover_${key}`, disclosure(`tool_raw_${key}`, '‹/›', () => { toggle(rawKey); return invalidate($); }), state.folds.has(rawKey) ? '收起原始调用' : '显示原始调用', 16)] });
+            contents.splice(0, contents.length, Box({ key: `tool_output_${key}`, flexDirection: 'column', gap: 0, children: [...contents, rawToggle] }));
             if (state.folds.has(rawKey)) raw.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
           }
           itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: contents }));
@@ -520,14 +531,18 @@ function renderPane($, e, next) {
     if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => Box({ key: `attachment_hover_${id}_${index}`, position: 'relative', children: [disclosure(`attachment_${id}_${index}`, `${safe(attachmentName(path, index))} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); }), Box({ position: 'absolute', top: -2, left: 0, width: 40, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [safe(path.split(/[\\/]/).at(-1) || path)] })] })] })) }));
     if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; return invalidate($); } }));
     if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
-    composer.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '…' : control.stopping || stopStatus === 'stopping' ? '…' : canStop && !control.draft.trim() && !control.attachments.length ? '■' : '↑', onInput: control.actions.input, onSubmit: control.actions.submit }));
+    composer.push(Box({ key: `codex_input_${id}`, flexDirection: 'column', width: '100%', alignItems: 'stretch', children: [Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, ...(e.surface === 'desktop' ? {} : { submitLabel: '发送' }), onInput: control.actions.input, onSubmit: control.actions.submit })] }));
     const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
     const used = selected?.context_used_tokens, limit = selected?.context_limit_tokens;
     const context = contextIndicator(used, limit);
-    const paste = Box({ key: `codex_paste_hover_${id}`, position: 'relative', children: [Button({ key: `codex_paste_${id}`, plain: true, dimColor: true, label: '📎︎', onPress: control.actions.paste }), Box({ position: 'absolute', top: -2, left: 0, width: 20, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: ['粘贴图片或文件'] })] })] });
-    const left = [Button({ key: `codex_attach_${id}`, plain: true, dimColor: true, label: control.picking ? '…' : '+', onPress: control.actions.attach }), paste, ...(permission ? [caption(`codex_permissions_${id}`, permission)] : [])];
-    const right = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? Box({ key: `codex_context_hover_${id}`, position: 'relative', children: [Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16 }), Box({ position: 'absolute', top: -2, right: 0, width: 44, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [context.alt] })] })] }) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
-    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: right })] }));
+    const paste = hint(`codex_paste_hover_${id}`, Button({ key: `codex_paste_${id}`, plain: true, dimColor: true, label: '📎︎', onPress: control.actions.paste }), '粘贴图片或文件');
+    const attach = hint(`codex_attach_hover_${id}`, Button({ key: `codex_attach_${id}`, plain: true, dimColor: true, label: control.picking ? '…' : '+', onPress: control.actions.attach }), '添加文件', 12);
+    const left = [Box({ key: `codex_attachment_actions_${id}`, flexDirection: 'row', alignItems: 'center', gap: 0, children: [attach, paste] }), ...(permission ? [caption(`codex_permissions_${id}`, permission)] : [])];
+    const stopping = canStop && !control.draft.trim() && !control.attachments.length;
+    const disabled = control.stopping || stopStatus === 'stopping' || (!stopping && (control.sending || (!control.draft.trim() && !control.attachments.length)));
+    const action = e.surface === 'desktop' && typeof Client === 'function' ? Client({ key: `codex_action_${id}`, module: './action-control.js', width: 3, height: 2, props: { mode: stopping ? 'stop' : 'send', disabled, label: stopStatus === 'stopping' ? '正在停止' : stopping ? '停止' : '发送' } }) : Button({ key: `codex_action_${id}`, plain: true, label: control.sending || control.stopping || stopStatus === 'stopping' ? '…' : stopping ? '■' : '↑', onPress: control.actions.activate });
+    const right = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? hint(`codex_context_hover_${id}`, Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16 }), context.alt, 24, -11) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : []), action];
+    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', ...(e.surface === 'desktop' ? { marginTop: 'xs' } : {}), justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: right })] }));
     if (control.stopping || stopStatus === 'stopping' || stopStatus === 'stopped') composer.push(caption(`codex_stop_status_${id}`, control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'));
     if (stopStatus === 'unconfirmed') composer.push(caption(`codex_stop_notice_${id}`, '停止状态未确认，工作可能仍在进行。'));
     if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));

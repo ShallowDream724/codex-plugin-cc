@@ -13,6 +13,32 @@ function connect($, handler) {
   } };
 }
 
+test('desktop Enter submits without a native button and the footer control routes only the selected agent', async () => {
+  const hooks = [], calls = [];
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [] };
+    if (op === 'ui_history') return { entries: [], next_cursor: null };
+    calls.push({ op, args });
+    return op === 'ui_interrupt' ? { agent_id: 'a', user_control_status: 'stopped', user_paused: true } : { agent_id: 'a', status: 'steered' };
+  });
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
+  const input = async () => nodes(await draw()).find(node => node.type === 'Input');
+  assert.equal(Object.hasOwn((await input()).props, 'submitLabel'), false);
+  await (await input()).props.onSubmit(''); assert.equal(calls.length, 0);
+  await (await input()).props.onSubmit('继续检查'); assert.equal(calls[0].op, 'ui_send');
+  const message = hooks.find(h => h.event === 'ui.message').fn;
+  let ignored = false;
+  await message($, { element: 'codex_action_old', data: { action: 'activate' } }, () => { ignored = true; return {}; });
+  assert.equal(ignored, true); assert.equal(calls.length, 1);
+  await message($, { element: 'codex_action_a', data: { action: 'activate' } }, () => { throw new Error('matched action'); });
+  assert.equal(calls[1].op, 'ui_interrupt'); assert.equal(calls[1].args.target, 'a');
+  closeUI();
+});
+
 test('keyboard command opens an agent without submitting a prompt or mutating work', async () => {
   const hooks = [], calls = [], notices = []; let agents = [];
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
@@ -54,16 +80,17 @@ test('direct controls preserve per-agent drafts and scope late results', async (
   let tree = await draw(); (await item(tree, 'codex_message_')).props.onInput('first draft');
   const send = (await item(tree, 'codex_message_')).props.onSubmit('first draft');
   (await item(await draw(), 'codex_message_')).props.onInput('edited while sending');
-  const stop = (await item(await draw(), 'codex_message_')).props.onSubmit('');
+  (await item(await draw(), 'codex_message_')).props.onInput('');
+  const stop = (await item(await draw(), 'codex_action_a')).props.onPress();
   (await item(await draw(), 'codex_message_')).props.onInput('edited while sending');
-  assert.equal((await item(await draw(), 'codex_message_')).props.submitLabel, '…');
+  assert.equal((await item(await draw(), 'codex_action_a')).props.label, '…');
   assert.equal((await item(await draw(), 'codex_stop_a')), undefined);
   await new Promise((resolve) => setImmediate(resolve));
   assert.notEqual(requests[0].requestId, requests[1].requestId);
   assert.deepEqual(requests.map((r) => r.args.target), ['a', 'a']);
   await openAgent($, 'b');
   tree = await draw(); assert.equal((await item(tree, 'codex_message_')).props.value, '');
-  assert.equal((await item(tree, 'codex_message_')).props.submitLabel, '↑');
+  assert.equal((await item(tree, 'codex_action_b')).props.label, '↑');
   (await item(tree, 'codex_message_')).props.onInput('other draft');
   pending.ui_interrupt({ agent_id: 'a', status: 'stopped' }); await stop;
   pending.ui_send({ agent_id: 'a', status: 'steered', user_paused: false, user_control_status: null }); await send;
@@ -72,7 +99,7 @@ test('direct controls preserve per-agent drafts and scope late results', async (
   await openAgent($, 'a');
   tree = await draw(); assert.equal((await item(tree, 'codex_message_')).props.value, 'edited while sending');
   assert.ok(JSON.stringify(tree).includes('已停止'));
-  assert.equal((await item(tree, 'codex_message_')).props.submitLabel, '↑');
+  assert.equal((await item(tree, 'codex_action_a')).props.label, '↑');
   closeUI();
 });
 
@@ -94,9 +121,10 @@ test('uncertain send retains draft and stop distinguishes unconfirmed from stopp
   await (await item('codex_message_')).props.onSubmit('retain this');
   assert.equal((await item('codex_message_')).props.value, 'retain this');
   assert.match(JSON.stringify(await draw()), /发送状态未知/);
-  await (await item('codex_message_')).props.onSubmit('');
+  (await item('codex_message_')).props.onInput('');
+  await (await item('codex_action_a')).props.onPress();
   assert.match(JSON.stringify(await draw()), /停止状态未确认/);
-  assert.equal((await item('codex_message_')).props.submitLabel, '■');
+  assert.equal((await item('codex_action_a')).props.label, '■');
   assert.equal(calls.filter((op) => op === 'ui_send').length, 1);
   closeUI();
 });
@@ -151,8 +179,9 @@ test('unchanged revision does not redraw and stopping blocks submit while allowi
   const before = invalidations; timers[0](); await new Promise((r) => setImmediate(r));
   assert.equal(invalidations, before);
   assert.equal((await item('codex_message_')).props.value, 'draft');
-  await (await item('codex_message_')).props.onSubmit('');
-  assert.equal((await item('codex_message_')).props.submitLabel, '…');
+  (await item('codex_message_')).props.onInput('');
+  await (await item('codex_action_a')).props.onPress();
+  assert.equal((await item('codex_action_a')).props.label, '…');
   await (await item('codex_message_')).props.onSubmit('draft');
   assert.equal(sends, 0);
   assert.equal((await item('codex_message_')).props.value, 'draft');
@@ -506,17 +535,18 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:reply').type, 'Markdown');
   assert.equal(nodes(tree).filter((node) => node.props.key?.startsWith('author_')).length, 1);
   assert.equal(nodes(tree).find((node) => node.props.key === 'codex_back'), undefined);
-  assert.equal((await input()).props.submitLabel, '■');
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_action_a').props.label, '■');
   writes.length = 0;
   (await input()).props.onInput('a'); assert.equal(writes.length, 1);
   (await input()).props.onInput('ab'); assert.equal(writes.length, 1);
-  assert.equal((await input()).props.submitLabel, '↑');
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_action_a').props.label, '↑');
   await (await input()).props.onSubmit('ab');
   assert.equal(requests[0].op, 'ui_send'); assert.equal(requests[0].args.message, 'ab');
   writes.length = 0;
   (await input()).props.onInput('x'); (await input()).props.onInput('');
   assert.equal(writes.length, 2);
-  await (await input()).props.onSubmit(''); assert.equal(requests[1].op, 'ui_interrupt');
+  await (await input()).props.onSubmit(''); assert.equal(requests.length, 1, 'empty Enter never stops the agent');
+  await nodes(await draw()).find((node) => node.props.key === 'codex_action_a').props.onPress(); assert.equal(requests[1].op, 'ui_interrupt');
   assert.equal(nodes(await draw()).some((node) => node.props.key?.startsWith('codex_stop_') && node.type === 'Button'), false);
   nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
   nodes(await draw()).find((node) => node.props.key === 'item_a:t:tool').props.onPress();
