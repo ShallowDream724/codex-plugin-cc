@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { WAIT_TOOL, EVENT_PREFIX, scanRetainedDeliveries } from '../hooks/delivery.js';
+import { WAIT_TOOL, EVENT_PREFIX, messageDeliveries, scanRetainedDeliveries, filterClosed } from '../hooks/delivery.js';
+import { formatDeliveryEvent } from '../runtime/delivery.mjs';
 
 const event = (seq = 11, agent_id = 'agent') => ({ seq, agent_id, kind: 'completed' });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -193,6 +194,50 @@ test('queued prompt owns delivery until final append, renews lease, and lets too
   await h.observe(); assert.deepEqual(h.calls.at(-1).args, { deliver: false, lease_id: 'p1' });
   queued.resolve({}); await tick(); assert.equal(h.calls.some(x => x.operation === 'confirm'), false);
   await h.append({ role: 'user', content: h.prompts[0].text }, { door: 'prompt' }); assert.equal(h.calls.at(-1).operation, 'confirm');
+});
+
+test('direct user receipt prompts retain quoted action semantics and confirm exact events on append and recovery', async () => {
+  const receipt = formatDeliveryEvent({ seq: 3, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', message: 'OFFLINE_QUOTED_ACTION' });
+  const h = await setup(body => body.operation === 'observe' ? { events: [receipt], delivery_id: 'receipt' } : {});
+  await h.start(); await h.observe();
+  const content = h.prompts[0].text, value = JSON.parse(content.slice(EVENT_PREFIX.length));
+  assert.deepEqual(value.events, [receipt]); assert.equal(value.events[0].message, undefined);
+  assert.equal(value.events[0].quoted_user_message, 'OFFLINE_QUOTED_ACTION');
+  await h.append({ role: 'user', content }, { door: 'prompt' });
+  assert.deepEqual(h.calls.at(-1).args.observations, [{ delivery_id: 'receipt', sequences: [3], events: [receipt] }]);
+  assert.deepEqual(scanRetainedDeliveries([{ role: 'user', content }]).observations, [{ delivery_id: 'receipt', sequences: [3], events: [receipt] }]);
+});
+
+test('exact native plugin prompt frames acknowledge final retained events and recover on reopen', async () => {
+  for (const [head, tail] of [
+    ['The codex-subagents plugin sent a message:\n', "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."],
+    ['The codex-subagents plugin sent a message while you were working:\n', '\n\nThis is how Claude Code surfaces prompts a plugin submits mid-turn — within the running turn, often alongside the next tool result. Address the message above as you continue this turn.'],
+  ]) {
+    const h = await setup(body => body.operation === 'observe' ? { events: [event()], delivery_id: 'framed' } : {});
+    await h.start(); await h.observe();
+    const message = { role: 'user', content: [{ type: 'text', text: head + h.prompts[0].text + tail }] };
+    await h.append(message, { door: 'prompt' });
+    const observation = { delivery_id: 'framed', sequences: [11], events: [event()] };
+    assert.deepEqual(h.calls.at(-1).args.observations, [observation]);
+    assert.deepEqual(scanRetainedDeliveries([message]).observations, [observation]);
+    for (const content of [head.replace('codex-subagents', 'other-plugin') + h.prompts[0].text + tail, 'Quoted notification: ' + head + h.prompts[0].text + tail, head + h.prompts[0].text + tail + ' extra']) {
+      assert.deepEqual(messageDeliveries({ content }, { prompt: true }), []);
+    }
+    const filtered = filterClosed(message, { prompt: true }, new Set(['agent']));
+    const encoded = filtered.content[0].text;
+    assert.ok(encoded.startsWith(head + EVENT_PREFIX)); assert.ok(encoded.endsWith(tail));
+    assert.deepEqual(messageDeliveries(filtered, { prompt: true })[0].events, []);
+  }
+});
+
+test('a rewritten event inside the exact host frame is released without confirmation', async () => {
+  const head = 'The codex-subagents plugin sent a message:\n';
+  const tail = "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+  const h = await setup(body => body.operation === 'observe' ? { events: [event()], delivery_id: 'framed' } : {});
+  await h.start(); await h.observe();
+  const message = { role: 'user', content: head + h.prompts[0].text + tail };
+  await h.append(message, { door: 'prompt', finish: () => ({ message: { ...message, content: head + EVENT_PREFIX + JSON.stringify({ delivery_id: 'framed', events: [{ ...event(), kind: 'changed' }] }) + tail } }) });
+  assert.equal(h.calls.at(-1).operation, 'release'); assert.equal(h.calls.some(call => call.operation === 'confirm'), false);
 });
 
 test('prompt drop and rejection release reservations', async () => {

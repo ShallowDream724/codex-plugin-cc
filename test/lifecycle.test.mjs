@@ -1,22 +1,36 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import { createServer } from 'node:http';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { acquireOwnedLock, readJson, writeJson } from '../runtime/storage.mjs';
+import { acquireOwnedLock, ownerDirectory, readJson, writeJson } from '../runtime/storage.mjs';
 import { call, createIdleLease, ensureBroker, runtimeSignature, serve } from '../runtime/bridge.mjs';
 import { createBroker } from '../runtime/broker.mjs';
 
 const helperPath = fileURLToPath(new URL('./fixtures/lifecycle-helper.mjs', import.meta.url));
+const bridgePath = fileURLToPath(new URL('../runtime/bridge.mjs', import.meta.url));
 async function temporary(t) {
   const directory = await mkdtemp(join(tmpdir(), 'codex-lifecycle-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   return directory;
 }
+
+test('offline stop all does not start a helper and treats existing ownership as unconfirmed', async t => {
+  const directory = await temporary(t), owner = 'offline-test';
+  const invoke = () => {
+    const child = spawnSync(process.execPath, [bridgePath], { input: JSON.stringify({ owner, operation: 'ui_interrupt_all', requestId: 'stop' }), encoding: 'utf8', env: { ...process.env, CODEX_SUBAGENTS_STATE_DIR: directory }, windowsHide: true });
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout);
+  };
+  assert.deepEqual(invoke(), { offline: true, results: [] });
+  assert.deepEqual(await readdir(directory), []);
+  await mkdir(join(ownerDirectory(owner, directory), 'service'), { recursive: true });
+  assert.equal(invoke().error.code, 'action_status_unknown');
+});
 
 test('owner locks preserve live owners and late release cannot delete a replacement', async t => {
   const directory = await temporary(t), path = join(directory, 'service');

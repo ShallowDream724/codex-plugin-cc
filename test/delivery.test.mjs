@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { DeliveryStore } from '../runtime/delivery.mjs';
+import { DeliveryStore, formatDeliveryEvent } from '../runtime/delivery.mjs';
 import { DiskReceipts } from '../runtime/receipts.mjs';
 import { writeJson } from '../runtime/storage.mjs';
 
@@ -13,6 +13,49 @@ function controller(count = 3) {
     async ackSequences(sequences) { this.events = this.events.filter(event => !sequences.includes(event.seq)); } };
 }
 async function temp(t) { const dir = await mkdtemp(join(tmpdir(), 'codex-delivery-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
+
+test('direct user sends are quoted Codex action receipts and ordinary agent messages stay unchanged', () => {
+  const original = { seq: 3, agent_id: 'a', name: 'terra-nested-test', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', delivery_status: 'started', message: 'Add another line; do not delegate.' };
+  const receipt = formatDeliveryEvent(original);
+  assert.equal(receipt.kind, 'user_action_receipt');
+  assert.equal(receipt.summary, '用户已向 Codex 子代理 terra-nested-test 发送消息，由该代理处理。');
+  assert.equal(receipt.quoted_user_message, original.message);
+  assert.equal(receipt.message, undefined);
+  assert.equal(original.kind, 'message'); assert.equal(original.message, receipt.quoted_user_message);
+  for (const event of [{ ...original, origin: 'codex' }, { seq: 4, agent_id: 'a', kind: 'message', message: 'Agent update' }, { ...original, action: 'answer' }]) {
+    assert.equal(formatDeliveryEvent(event), event);
+  }
+  const failed = formatDeliveryEvent({ ...original, phase: 'failed', delivery_status: 'unconfirmed' });
+  assert.match(failed.summary, /投递未确认/); assert.doesNotMatch(failed.summary, /已向/);
+});
+
+test('stop receipts distinguish requested, stopped, and unconfirmed without a new task message', () => {
+  const base = { seq: 1, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'interrupt', message: 'Stop status detail' };
+  for (const [phase, expected] of [['requested', '用户已请求停止 Codex 子代理 worker 及其子代理。'], ['stopping', 'Codex 子代理 worker 及其子代理 正在按用户要求停止。'], ['confirmed', 'Codex 子代理 worker 及其子代理 已按用户要求停止。'], ['unconfirmed', '用户请求停止 Codex 子代理 worker 及其子代理，停止状态未确认。']]) {
+    const receipt = formatDeliveryEvent({ ...base, phase });
+    assert.equal(receipt.summary, expected); assert.equal(receipt.kind, 'user_action_receipt');
+    assert.equal(receipt.message, undefined); assert.equal(receipt.status_detail, undefined);
+    assert.equal(receipt.quoted_user_message, undefined);
+    assert.doesNotMatch(receipt.summary, /followup|resume|重启|恢复/);
+  }
+});
+
+test('formatted user receipts confirm only exact retained wire events and replay unconfirmed events', async () => {
+  const c = controller(0);
+  const raw = { seq: 3, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', message: 'Add another line.' };
+  c.events = [raw]; let now = 0;
+  const store = new DeliveryStore({ controller: c, leaseMs: 10, now: () => now });
+  const first = await store.claim({ channel: 'prompt' });
+  assert.equal(first.events[0].kind, 'user_action_receipt'); assert.deepEqual(c.events, [raw]);
+  now = 11;
+  const replay = await store.claim({ channel: 'prompt' });
+  assert.notEqual(replay.delivery_id, first.delivery_id); assert.deepEqual(replay.events, first.events);
+  const rejected = await store.confirm({ observations: [{ delivery_id: first.delivery_id, sequences: [3], events: [raw] }] });
+  assert.deepEqual(rejected.rejected, [{ delivery_id: first.delivery_id, sequences: [3] }]);
+  assert.equal(c.events.length, 1);
+  await store.confirm({ observations: [{ delivery_id: replay.delivery_id, sequences: [3], events: replay.events }] });
+  assert.deepEqual(c.events, []);
+});
 
 test('delivery survives restart, confirms exact retained results and never trusts another owner', async t => {
   const dir = await temp(t), c = controller();

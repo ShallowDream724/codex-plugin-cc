@@ -6,9 +6,9 @@ import { activityIcon, contextIndicator } from './tool-icons.js';
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
 let paneRevision = 0;
-const MAX_PAGES = 50;
-const MAX_LIVE_ENTRIES = 200;
 const MAX_DETAILS = 16;
+const VISIBLE_ENTRIES = 500;
+const WINDOW_STEP = 250;
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
 const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
@@ -153,14 +153,57 @@ const state = { agents: [], selected: null, requested: null, error: '', opened: 
 const mergeSummaries = (agents) => summaries(agents).map((agent) => ({ ...state.agents.find((previous) => idOf(previous) === idOf(agent)), ...agent }));
 const failureText = (error) => safe(error?.message || error?.error?.message || error?.error || (typeof error === 'string' ? error : JSON.stringify(error)) || '连接未返回有效响应').slice(0, 400);
 function mergeLive(page, entries, prepend = false) {
-  const values = new Map((prepend ? [...entries, ...page.live] : [...page.live, ...entries]).map((entry) => [entryKey(entry), entry]));
-  const merged = [...values.values()];
-  if (merged.length > MAX_LIVE_ENTRIES) page.liveOverflow = true;
-  const next = merged.slice(-MAX_LIVE_ENTRIES), changed = JSON.stringify(next) !== JSON.stringify(page.live);
-  if (changed) page.live = next;
+  const positions = new Map(page.live.map((entry, index) => [entryKey(entry), index]));
+  if (prepend) {
+    // Loaded history extends the same transcript. It cannot replace newer live
+    // versions or evict messages the person already has on screen.
+    const older = [];
+    for (const entry of entries) if (!positions.has(entryKey(entry))) {
+      positions.set(entryKey(entry), -1); older.push(entry);
+    }
+    if (older.length) page.live = [...older, ...page.live];
+    return older.length > 0;
+  }
+  let changed = false;
+  for (const entry of entries) {
+    const index = positions.get(entryKey(entry));
+    if (index === undefined) { positions.set(entryKey(entry), page.live.length); page.live.push(entry); changed = true; }
+    else if (JSON.stringify(page.live[index]) !== JSON.stringify(entry)) { page.live[index] = entry; changed = true; }
+  }
   return changed;
 }
+function conversationEntries(all) {
+  const messageKey = (entry) => {
+    if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) return null;
+    const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
+    return JSON.stringify([entry.turn_id, entry.type === 'directUserMessage' ? 'user' : 'parent', body(entry), attachments.map(part => part.path)]);
+  };
+  const nativeCopies = new Map();
+  for (const entry of all) {
+    const key = messageKey(entry);
+    if (key && !String(entry.id).startsWith('action:')) nativeCopies.set(key, (nativeCopies.get(key) ?? 0) + 1);
+  }
+  return all.filter((entry) => {
+    if (!String(entry.id).startsWith('action:')) return true;
+    const key = messageKey(entry), count = nativeCopies.get(key) ?? 0;
+    if (!count) return true;
+    nativeCopies.set(key, count - 1); return false;
+  });
+}
+function timelineWindow(page) {
+  const all = conversationEntries(page.live), lastStart = Math.max(0, all.length - VISIBLE_ENTRIES);
+  const start = page.followTail ? lastStart : Math.min(page.windowStart, lastStart);
+  return { entries: all.slice(start, start + VISIBLE_ENTRIES), start, total: all.length };
+}
+function holdWindow(page) { page.windowStart = timelineWindow(page).start; page.followTail = false; }
+function anchorAfterRender($, id, page, gen, scrollGen, entry, block) {
+  if (!entry) return;
+  $.clock.after(0, async () => {
+    if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen) await $.ui.scroll({ in: PANE, to: { key: `activity_group_${id}:${entryKey(entry)}` }, block }).catch(() => {});
+  });
+}
 let actionSequence = 0;
+let stoppingAll;
 const actionId = () => `ui-${Date.now().toString(36)}-${++actionSequence}-${Math.random().toString(36).slice(2)}`;
 const controlFor = (id) => {
   if (!state.controls.has(id)) state.controls.set(id, { draft: '', attachments: [], attachmentVersion: 0, picking: false, pathEntry: false, attachmentNotice: '', inputVersion: 0, sending: false, stopping: false, stopEpoch: 0, mutationEpoch: 0, sendResult: '' });
@@ -189,6 +232,24 @@ async function stopAgent($, id) {
   } catch { if (state.controls.get(id) === control) updateAgent(id, { user_control_status: 'unconfirmed' }); }
   finally { control.stopping = false; if (state.opened && state.selected === id) await invalidate($); }
 }
+async function stopAllAgents($) {
+  if (stoppingAll) return stoppingAll;
+  stoppingAll = (async () => {
+    try {
+      const result = await bridge($, 'ui_interrupt_all', {}, { requestId: actionId() });
+      if (result.offline) return { text: '当前会话的 Codex 助手未运行，已有记录保留。' };
+      if (result.error || !Array.isArray(result.results)) return { text: `停止结果未确认：${failureText(result)}` };
+      const listed = await bridge($, 'ui_list', {}).catch(() => null);
+      if (Array.isArray(listed?.agents)) await observeUI($, listed);
+      if (!result.results.length) return { text: '当前会话没有 Codex 代理。' };
+      const stopped = result.results.filter(item => (item.user_control_status ?? item.status) === 'stopped').length;
+      const stopping = result.results.filter(item => (item.user_control_status ?? item.status) === 'stopping').length;
+      const unconfirmed = result.results.length - stopped - stopping;
+      return { text: [stopped && `已停止 ${stopped} 个`, stopping && `正在停止 ${stopping} 个`, unconfirmed && `停止未确认 ${unconfirmed} 个`].filter(Boolean).join('；') + ' Codex 代理（含所属子代理）。' };
+    } catch (error) { return { text: `停止结果未确认：${failureText(error)}` }; }
+  })();
+  try { return await stoppingAll; } finally { stoppingAll = null; }
+}
 async function sendAgent($, id) {
   const control = controlFor(id), message = control.draft, attachments = [...control.attachments], attachmentVersion = control.attachmentVersion, stopEpoch = control.stopEpoch;
   let accepted = false;
@@ -204,10 +265,6 @@ async function sendAgent($, id) {
       if (control.draft === message) { control.draft = ''; control.inputVersion++; }
       if (control.attachmentVersion === attachmentVersion) { control.attachments = []; control.attachmentVersion++; }
       if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
-      if (state.controls.get(id) === control) {
-        const page = pageFor(id);
-        page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.cursorStack = []; page.historyError = '';
-      }
     } else control.sendResult = '发送状态未知，请查看活动后再试。';
   } catch (error) { control.sendResult = `发送状态未知：${safe(error?.message || error).slice(0, 600)}。请查看活动后再试，草稿已保留。`; }
   finally {
@@ -243,7 +300,7 @@ async function chooseAttachments($, id, source = 'file') {
   finally { control.picking = false; if (state.opened && state.selected === id) await invalidate($); }
 }
   const pageFor = (id) => {
-    if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, historyChecked: false, liveOverflow: false, latestCursor: null, liveError: '', historyError: '', busy: false, historyLoading: false, historyGeneration: 0, detailSequence: 0, details: new Map(), detailRequests: new Map() });
+    if (!state.pages.has(id)) state.pages.set(id, { live: [], windowStart: 0, followTail: true, revision: undefined, historyChecked: false, cursor: null, liveError: '', historyError: '', busy: false, historyLoading: false, historyGeneration: 0, scrollGeneration: 0, detailSequence: 0, details: new Map(), detailRequests: new Map() });
     const page = state.pages.get(id); state.pages.delete(id); state.pages.set(id, page);
     while (state.pages.size > 16) {
       const old = state.pages.keys().next().value; state.pages.delete(old); state.scroll.delete(old);
@@ -265,9 +322,9 @@ async function chooseAttachments($, id, source = 'file') {
       const result = await bridge($, 'ui_history', { target: id });
       if (!state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen) return;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
-      const changed = mergeLive(page, result.entries, true), cursorChanged = JSON.stringify(page.latestCursor) !== JSON.stringify(result.next_cursor ?? null);
+      const changed = mergeLive(page, result.entries, true), cursorChanged = JSON.stringify(page.cursor) !== JSON.stringify(result.next_cursor ?? null);
       const hadError = page.historyError;
-      page.latestCursor = result.next_cursor ?? null; page.historyError = '';
+      page.cursor = result.next_cursor ?? null; page.historyError = '';
       if (changed || cursorChanged || hadError) await invalidate($);
     } catch (error) {
       if (state.opened && state.selected === id && state.generation === gen) {
@@ -279,7 +336,7 @@ async function chooseAttachments($, id, source = 'file') {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
     const page = pageFor(id), control = controlFor(id), mutationEpoch = control.mutationEpoch;
-    if (afterSend) page.afterSendGeneration = gen;
+    if (afterSend) { page.afterSendGeneration = gen; page.followTail = true; page.scrollGeneration++; }
     if (page.busy) { if (afterSend) page.refreshAfterPoll = true; return; }
     page.busy = true;
     try {
@@ -291,7 +348,6 @@ async function chooseAttachments($, id, source = 'file') {
       page.liveError = '';
       if (result.entries && result.revision !== page.revision) {
         const entriesChanged = mergeLive(page, result.entries);
-        if (page.mode !== 'live' && entriesChanged) page.hasNew = true;
         page.revision = result.revision;
         dirty ||= entriesChanged;
       }
@@ -312,35 +368,37 @@ async function chooseAttachments($, id, source = 'file') {
       } else if (page.afterSendGeneration !== undefined) {
         const sentGeneration = page.afterSendGeneration;
         delete page.afterSendGeneration;
-        if (sentGeneration === gen && state.opened && state.selected === id && state.generation === gen && page.mode === 'live') await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
+        if (sentGeneration === gen && state.opened && state.selected === id && state.generation === gen) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
       }
     }
   }
-  async function history($, id, direction = 'latest') {
-    const page = pageFor(id), gen = state.generation, request = ++page.historyGeneration;
-    page.detailRequests.clear();
-    const fromLive = page.mode === 'live', olderCursor = fromLive ? page.latestCursor : page.cursor;
-    if (direction === 'older' && !olderCursor) return;
-    let stack = direction === 'older' ? [...(fromLive ? [] : page.cursorStack), olderCursor] : direction === 'newer' ? page.cursorStack.slice(0, -1) : [];
-    let truncated = direction === 'latest' ? false : page.stackTruncated;
-    if (stack.length > MAX_PAGES) { stack = stack.slice(-MAX_PAGES); truncated = true; }
-    const cursor = stack.at(-1);
-    page.historyLoading = true; await invalidate($);
+  async function history($, id) {
+    const page = pageFor(id), gen = state.generation, cursor = page.cursor;
+    if (!cursor || page.historyLoading) return;
+    const scrollGen = page.scrollGeneration, anchor = timelineWindow(page).entries[0];
+    page.historyLoading = true;
     try {
-      const result = await bridge($, 'ui_history', { target: id, ...(cursor ? { cursor } : {}) });
-      if (!state.opened || state.selected !== id || state.generation !== gen || request !== page.historyGeneration) return;
+      const result = await bridge($, 'ui_history', { target: id, cursor });
+      if (!state.opened || state.selected !== id || state.generation !== gen) return;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
-      page.mode = 'history'; page.entries = result.entries || []; page.cursorStack = stack; page.stackTruncated = truncated; page.details.clear();
-      page.cursor = result.next_cursor; page.loaded = true; page.historyError = '';
-    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) page.historyError = `无法读取更早消息：${failureText(error)}。请重试。`; }
-    finally { page.historyLoading = false; if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) await invalidate($); }
+      if (result.next_cursor && JSON.stringify(result.next_cursor) === JSON.stringify(cursor)) throw new Error('历史读取位置未推进');
+      const previous = timelineWindow(page), oldLength = page.live.length;
+      const changed = mergeLive(page, result.entries, true);
+      if (!page.followTail) page.windowStart = page.scrollGeneration === scrollGen ? 0 : previous.start + page.live.length - oldLength;
+      page.cursor = result.next_cursor ?? null; page.historyError = '';
+      await invalidate($);
+      // Run after this wheel dispatch returns. Revealing the previous first row
+      // preserves its position without recursively dispatching a scroll hook.
+      if (changed) anchorAfterRender($, id, page, gen, scrollGen, anchor, 'start');
+    } catch (error) { if (state.opened && state.selected === id && state.generation === gen) { page.historyError = `无法读取对话记录：${failureText(error)}。请重试。`; await invalidate($); } }
+    finally { page.historyLoading = false; }
   }
   async function select($, id) {
-    state.selected = id; state.generation++; state.restore = true;
+    state.selected = id; state.generation++;
     const page = pageFor(id);
+    state.restore = state.scroll.has(id) && !page.followTail;
     page.detailRequests.clear();
-    if (page.mode === 'live') await poll($);
-    else if (!page.loaded) await history($, id);
+    await poll($);
     await invalidate($);
   }
   export async function openAgent($, id) {
@@ -359,7 +417,7 @@ async function chooseAttachments($, id, source = 'file') {
     const result = await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
-    if (state.restore) await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
+    await $.ui.scroll({ in: PANE, to: state.restore ? 'start' : 'end' }).catch(() => {});
     if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath) {
@@ -376,6 +434,7 @@ async function chooseAttachments($, id, source = 'file') {
     await invalidate($);
   }
 export function registerUI(on) {
+  on('command.run', { command: 'codex-stop' }, async ($) => stopAllAgents($));
   on('command.run', { command: 'codex-agents' }, async ($) => {
     try {
       const result = await bridge($, 'ui_list', {});
@@ -394,11 +453,37 @@ export function registerUI(on) {
     if (e.id === PANE) { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; }
     return next(e);
   });
-  on('ui.scroll', { requestId: PANE }, ($, e, next) => {
-    if (e.origin.kind === 'person' && state.selected) state.scroll.set(state.selected, e.offset);
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    const id = state.selected;
+    const page = id && pageFor(id), view = page && timelineWindow(page), gen = state.generation;
+    const atBottom = Number.isFinite(e.contentRows) && Number.isFinite(e.bodyRows) && e.offset >= e.contentRows - e.bodyRows - 1;
+    if (e.origin.kind === 'person' && id) {
+      state.scroll.set(id, e.offset); page.scrollGeneration++;
+      holdWindow(page);
+      page.followTail = atBottom && view.start + view.entries.length >= view.total;
+    }
     if (e.origin.kind === 'plugin' && state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(state.selected) || 0 }); }
     if (e.origin.kind === 'plugin' && state.selected) state.scroll.set(state.selected, e.offset);
-    return next(e);
+    const result = await next(e);
+    if (e.origin.kind === 'person' && id && state.opened && state.selected === id && state.generation === gen) {
+      if (e.by < 0 && e.offset <= 1) {
+        if (view.start > 0) {
+          page.windowStart = Math.max(0, view.start - WINDOW_STEP); page.followTail = false;
+          await invalidate($);
+          anchorAfterRender($, id, page, gen, page.scrollGeneration, view.entries[0], 'start');
+        } else await history($, id);
+      } else if (e.by > 0 && atBottom && view.start + view.entries.length < view.total) {
+        page.windowStart = Math.min(view.start + WINDOW_STEP, Math.max(0, view.total - VISIBLE_ENTRIES));
+        await invalidate($);
+        anchorAfterRender($, id, page, gen, page.scrollGeneration, view.entries.at(-1), 'end');
+      } else if (e.by > 0 && atBottom && page.followTail) {
+        const scrollGen = page.scrollGeneration;
+        $.clock.after(0, async () => {
+          if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
+        });
+      }
+    }
+    return result;
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     if (!state.opened || !state.selected || e.element !== `codex_action_${state.selected}` || e.data?.action !== 'activate') return next(e);
@@ -417,31 +502,19 @@ function renderPane($, e, next) {
     const selected = state.agents.find((agent) => idOf(agent) === id);
     if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
     const page = pageFor(id), control = controlFor(id);
-    const all = page.mode === 'history' ? page.entries : page.live;
-    // The action gives immediate feedback while native history catches up. Once
-    // the same message is persisted, retain the native copy for pagination.
-    const messageKey = (entry) => {
-      if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) return null;
-      const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
-      return JSON.stringify([entry.turn_id, entry.type === 'directUserMessage' ? 'user' : 'parent', body(entry), attachments.map(part => part.path)]);
-    };
-    const nativeCopies = new Map();
-    for (const entry of all) {
-      const key = messageKey(entry);
-      if (key && !String(entry.id).startsWith('action:')) nativeCopies.set(key, (nativeCopies.get(key) ?? 0) + 1);
-    }
-    const entries = all.filter((entry) => {
-      if (!String(entry.id).startsWith('action:')) return true;
-      const key = messageKey(entry), count = nativeCopies.get(key) ?? 0;
-      if (!count) return true;
-      nativeCopies.set(key, count - 1); return false;
-    });
+    const entries = timelineWindow(page).entries;
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
     const hint = (key, child, label, width = 18, left = 0) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
     const iconFor = (key, icon) => e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key, source: icon.source, alt: icon.alt, width: 14, height: 14 }) : caption(key, icon.glyph);
     const disclosure = (key, label, onPress, entry, integration = false) => {
-      const button = Button({ key, plain: true, dimColor: true, label, onPress });
+      const button = Button({ key, plain: true, dimColor: true, label, onPress: entry ? async (...args) => {
+        const gen = state.generation;
+        page.scrollGeneration++; holdWindow(page);
+        // Selecting a tool ends tail following before its height changes.
+        await $.ui.scroll({ in: PANE, to: { key: `row_${key}` }, block: 'nearest' }).catch(() => {});
+        if (state.opened && state.selected === id && state.generation === gen) return onPress(...args);
+      } : onPress });
       return entry ? Box({ key: `row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${key}`, activityIcon(entry, integration)), button] }) : button;
     };
     const sourceCode = (key, source) => typeof Code === 'function' ? Code({ key, source: safe(source), format: 'source', wrap: 'wrap' }) : Text({ key, mono: true, size: 'caption', children: [safe(source)] });
@@ -467,19 +540,20 @@ function renderPane($, e, next) {
     const effort = selected?.reasoning_effort ? selected.reasoning_effort[0].toUpperCase() + selected.reasoning_effort.slice(1) : '';
     const model = [friendlyModel, effort].filter(Boolean).join(' · ');
     navigation.push(Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [`${agentIcon(id)} ${safe(selected.name || 'Codex')}`] }));
-    if ((page.mode === 'live' && (page.liveOverflow || page.latestCursor)) || (page.mode !== 'live' && page.cursor)) navigation.push(disclosure('codex_older', page.historyLoading ? '正在读取…' : '更早消息', () => history($, id, page.mode === 'live' && (page.liveOverflow || !page.latestCursor) ? 'latest' : 'older')));
     if (state.error) navigation.push(caption('codex_open_error', state.error));
     if (state.error || page.liveError || page.historyError) {
       if (page.liveError) navigation.push(caption('codex_update_error', page.liveError));
       if (page.historyError) navigation.push(caption('codex_history_error', page.historyError));
-      navigation.push(disclosure('codex_retry_conversation', '重新读取', async () => { if (state.error) return openAgent($, id); page.historyChecked = false; await poll($); }));
+      navigation.push(disclosure('codex_retry_conversation', '重新读取', async () => { if (state.error) return openAgent($, id); if (page.cursor && page.historyError) return history($, id); page.historyChecked = false; await poll($); }));
     }
     for (const group of groupEntries(entries)) {
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
+      const groupRows = [], rowGap = e.surface === 'desktop' ? 0.7 : 'sm';
+      const groupBox = (children) => Box({ key: `activity_group_${id}:${entryKey(first)}`, flexDirection: 'column', rowGap, minWidth: 0, children });
       if (group.items.length > 1 || group.integration) {
         const groupLabel = group.integration ? `已使用 ${safe(group.integration)} 集成` : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
-        rows.push(disclosure(`group_${groupKey}`, `${groupLabel}${!group.integration ? ` (${group.items.length})` : ''} ${folded ? '▸' : '▾'}`, () => { toggle(groupKey); return invalidate($); }, first, Boolean(group.integration)));
-        if (folded) continue;
+        groupRows.push(disclosure(`group_${groupKey}`, `${groupLabel}${!group.integration ? ` (${group.items.length})` : ''} ${folded ? '›' : '⌄'}`, () => { toggle(groupKey); return invalidate($); }, first, Boolean(group.integration)));
+        if (folded) { rows.push(groupBox(groupRows)); continue; }
       }
       const itemRows = [];
       for (const entry of group.items) {
@@ -501,7 +575,7 @@ function renderPane($, e, next) {
           if (attachments.length) message.push(caption(`attachments_${key}`, attachments.map((part) => `附件：${part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件'}`).join('  ')));
           if (loaded?.offset > 0) message.push(disclosure(`message_prev_${key}`, '上一页正文', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
           if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) message.push(disclosure(`item_${key}`, loaded ? '下一页正文' : '展开全文', () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); }));
-          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { width: '85%', borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: 1 }), children: message });
+          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { width: '85%', borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: e.surface === 'desktop' ? 0.8 : 1 }), children: message });
           itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', justifyContent: incoming ? 'flex-end' : 'flex-start', children: [content] }));
           continue;
         }
@@ -527,7 +601,8 @@ function renderPane($, e, next) {
           });
           continue;
         }
-        itemRows.push(disclosure(`item_${key}`, `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, async () => {
+        const toolStart = itemRows.length;
+        itemRows.push(disclosure(`item_${key}`, safe(description(entry)).slice(0, 120), async () => {
           toggle(key); if (expanded) page.detailRequests.delete(detailKey(entry));
           await invalidate($);
           if (!expanded && entry.deferred && outputTypes.has(entry.type) && !detailFor(page, entry)) await detail($, id, entry);
@@ -556,11 +631,14 @@ function renderPane($, e, next) {
           const truncated = entry.deferred || (entry.preview?.length ?? 0) >= 4096 || entry.preview?.includes('[truncated]') || JSON.stringify(entry.data || {}).includes('[truncated]');
           if (!String(entry.id).startsWith('action:') && !loading && ((!loaded && truncated) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`detail_${key}`, loaded?.error ? '重试' : loaded ? '更多输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0)));
         }
+        itemRows.push(Box({ key: `tool_entry_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.5 : 'sm', children: itemRows.splice(toolStart) }));
       }
-      if (group.integration) rows.push(Box({ key: `integration_${groupKey}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: itemRows }));
-      else rows.push(...itemRows);
+      if (group.integration) {
+        const line = e.surface === 'desktop' ? Box({ key: `integration_line_${groupKey}`, position: 'absolute', top: 0, bottom: 0, left: 0, width: '1px', backgroundColor: 'rgba(128,128,128,0.18)', children: [] }) : null;
+        groupRows.push(Box({ key: `integration_${groupKey}`, position: 'relative', flexDirection: 'column', rowGap, paddingLeft: 1, children: [...(line ? [line] : []), ...itemRows] }));
+      } else groupRows.push(...itemRows);
+      rows.push(groupBox(groupRows));
     }
-    if (page.mode !== 'live' && (page.hasNew || page.cursorStack.length)) rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: async () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.details.clear(); page.detailRequests.clear(); await poll($).catch(() => {}); await invalidate($); await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
     if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => Box({ key: `attachment_hover_${id}_${index}`, position: 'relative', children: [disclosure(`attachment_${id}_${index}`, `${safe(attachmentName(path, index))} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); }), Box({ position: 'absolute', top: -2, left: 0, width: 40, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [safe(path.split(/[\\/]/).at(-1) || path)] })] })] })) }));
     if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; return invalidate($); } }));
     if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
@@ -575,17 +653,14 @@ function renderPane($, e, next) {
     const disabled = control.stopping || stopStatus === 'stopping' || (!stopping && (control.sending || (!control.draft.trim() && !control.attachments.length)));
     const action = e.surface === 'desktop' && typeof Client === 'function' ? Client({ key: `codex_action_${id}`, module: './action-control.js', width: 3, height: 2, props: { mode: stopping ? 'stop' : 'send', disabled, label: stopStatus === 'stopping' ? '正在停止' : stopping ? '停止' : '发送' } }) : Button({ key: `codex_action_${id}`, plain: true, label: control.sending || control.stopping || stopStatus === 'stopping' ? '…' : stopping ? '■' : '↑', onPress: control.actions.activate });
     const metadata = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? hint(`codex_context_hover_${id}`, Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16 }), context.alt, 24, -11) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
-    // Caption glyphs sit below the Client's title-sized circle's optical center.
-    // Move only these groups; keep the action's geometry and hit area unchanged.
-    const opticalOffset = e.surface === 'desktop' ? { marginBottom: 0.5 } : {};
-    const right = [Box({ key: `codex_composer_metadata_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', ...opticalOffset, children: metadata }), action];
-    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', ...(e.surface === 'desktop' ? { marginTop: 'xs' } : {}), justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', ...opticalOffset, children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: right })] }));
+    const right = [Box({ key: `codex_composer_metadata_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: metadata }), action];
+    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', ...(e.surface === 'desktop' ? { marginTop: 'xs' } : {}), justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: right })] }));
     if (control.stopping || stopStatus === 'stopping' || stopStatus === 'stopped') composer.push(caption(`codex_stop_status_${id}`, control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'));
     if (stopStatus === 'unconfirmed') composer.push(caption(`codex_stop_notice_${id}`, '停止状态未确认，工作可能仍在进行。'));
     if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));
     const bodyRows = e.surface === 'desktop' ? e.props?.scroll?.bodyRows : undefined;
     const fillPane = Number.isFinite(bodyRows) && bodyRows > 0;
-    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
+    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 1 : 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
 }
 export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
 export async function observeUI($, result) {

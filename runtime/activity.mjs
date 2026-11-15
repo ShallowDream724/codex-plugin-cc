@@ -209,19 +209,46 @@ export class ActivityStore {
     const agent = this.find(target);
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new TypeError('limit must be between 1 and 50.');
     if (cursor != null && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor))) throw new TypeError('Invalid history cursor.');
-    let { turn_id: turnId, turns_cursor: turnsCursor, items_cursor: itemsCursor } = cursor ?? {};
-    if (![turnId, turnsCursor, itemsCursor].every((v) => v == null || typeof v === 'string')) throw new TypeError('Invalid history cursor.');
-    if (!turnId) {
-      const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded', ...(turnsCursor ? { cursor: turnsCursor } : {}) });
-      turnId = page.data?.[0]?.id;
-      if (turnId) this.remember(this.turnStates, `${agent.threadId}:${turnId}`, page.data[0].status);
-      turnsCursor = page.nextCursor ?? null;
-      if (!turnId) return { agent: this.summary(agent), entries: [], next_cursor: null };
+    let { turn_id: turnId, turns_cursor: turnsCursor, items_cursor: itemsCursor, seen_turn_cursors: seenTurns = [], seen_item_cursors: seenItems = [] } = cursor ?? {};
+    const validToken = (v) => v == null || (typeof v === 'string' && v.length > 0);
+    const validSeen = (v) => Array.isArray(v) && v.length <= 64 && v.every((s) => typeof s === 'string' && s.length > 0) && new Set(v).size === v.length;
+    if (![turnId, turnsCursor, itemsCursor].every(validToken) || !validSeen(seenTurns) || !validSeen(seenItems) || (!turnId && (itemsCursor || seenItems.length))) throw new TypeError('Invalid history cursor.');
+    seenTurns = new Set(seenTurns); seenItems = new Set(seenItems);
+    const entries = [];
+    // Bound work even when native pages contain only hidden or empty items.
+    let requests = 0, done = false;
+    const advance = (current, next, seen) => {
+      if (!validToken(next)) throw new Error('Invalid native history cursor.');
+      if (current) {
+        if (seen.has(current)) throw new Error('Repeated native history cursor.');
+        seen.add(current);
+      }
+      if (next && seen.has(next)) throw new Error('Repeated native history cursor.');
+      return next ?? null;
+    };
+    while (entries.length < limit && requests < 80 && !done) {
+      if (!turnId) {
+        const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded', ...(turnsCursor ? { cursor: turnsCursor } : {}) });
+        requests++;
+        turnsCursor = advance(turnsCursor, page.nextCursor, seenTurns);
+        turnId = page.data?.[0]?.id;
+        if (turnId && !validToken(turnId)) throw new Error('Invalid native turn ID.');
+        if (turnId) this.remember(this.turnStates, `${agent.threadId}:${turnId}`, page.data[0].status);
+        else if (!turnsCursor) done = true;
+        continue;
+      }
+      const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit: limit - entries.length, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
+      requests++;
+      if ((page.data?.length ?? 0) > limit - entries.length) throw new Error('Native history page exceeded its requested limit.');
+      itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
+      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry))));
+      if (!itemsCursor) {
+        turnId = null; seenItems = new Set();
+        if (!turnsCursor) done = true;
+      }
     }
-    const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
-    const entries = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry))).reverse();
-    const next_cursor = page.nextCursor ? { turn_id: turnId, items_cursor: page.nextCursor, turns_cursor: turnsCursor } : turnsCursor ? { turns_cursor: turnsCursor } : null;
-    return { agent: this.summary(agent), entries, next_cursor };
+    const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
+    return { agent: this.summary(agent), entries: entries.reverse(), next_cursor };
   }
   async detail({ target, turn_id, item_id, offset = 0, file_path, view } = {}) {
     const agent = this.find(target);

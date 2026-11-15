@@ -38,6 +38,9 @@ export class AgentController extends EventEmitter {
     this.descendantTurns = new Map();
     this.retiredThreads = new Set();
     this.pausedThreads = new Set();
+    this.stopAllPromise = null;
+    this.stopAllInProgress = false;
+    this.stopAllEpoch = 0;
     this.pendingEvents = [];
     this.nextSeq = 1;
     this.starting = 0;
@@ -146,6 +149,7 @@ export class AgentController extends EventEmitter {
       case 'followup_task': return this.followup(args.target, args.message);
       case 'interrupt_agent': return this.interrupt(this.find(args.target));
       case 'ui_interrupt': return this.uiInterrupt(this.find(args.target));
+      case 'ui_interrupt_all': return this.uiInterruptAll();
       case 'ui_send': return this.uiSend(this.find(args.target), args.message, args.attachments);
       case 'close_agent': return this.closeSelected(args);
       case 'answer_agent': return this.answer(this.find(args.target), args.request_id, args.answer);
@@ -189,6 +193,7 @@ export class AgentController extends EventEmitter {
   }
 
   async spawn({ message, cwd, model, reasoning_effort, name, context_mode, snapshot, role }) {
+    if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
     let roleInstructions = '';
     if (role !== undefined) {
       if (role !== 'default') throw new TypeError('Unknown role.');
@@ -382,8 +387,10 @@ export class AgentController extends EventEmitter {
     const existing = matches[0];
     if (this.adoptions.has(existing?.threadId ?? id)) throw new Error(`Thread ${existing?.threadId ?? id} is already being adopted; retry using the registered agent after it completes.`);
     if (existing) return this.send(existing, message, true);
+    if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
     if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Unknown agent target; native thread IDs must be UUIDs.');
     const reservation = Symbol('adopt'); this.reserve(reservation);
+    const stopAllEpoch = this.stopAllEpoch;
     this.adoptions.set(id, true);
     try {
       const response = await this.rpc('thread/read', { threadId: id, includeTurns: false });
@@ -391,6 +398,7 @@ export class AgentController extends EventEmitter {
       if (thread?.id !== id || !nonempty(thread.cwd) || !path.posix.isAbsolute(thread.cwd) && !path.win32.isAbsolute(thread.cwd)) throw new Error('Native thread metadata has no matching ID and absolute cwd.');
       if (!['idle', 'notLoaded'].includes(thread.status?.type)) throw new Error(`Native thread status is ${thread.status?.type ?? 'unknown'}; active or unconfirmed external threads cannot be adopted.`);
       const clientTools = await externalClientTools(thread);
+      if (this.stopAllInProgress || this.stopAllEpoch !== stopAllEpoch) throw new Error('A user stop-all action interrupted adoption; retry afterward.');
       const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, status: 'interrupted', activity: 'adopted',
         pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: false, recoveryUsed: false, interrupted: false, terminalEmitted: true, adopting: true, externalAdopted: true, externalThread: true };
       if (this.pausedThreads.has(id)) { a.userPaused = true; a.userControlStatus = 'stopped'; a.interrupted = true; }
@@ -555,25 +563,62 @@ export class AgentController extends EventEmitter {
     return this.stopTree(a);
   }
 
-  async uiInterrupt(a) {
+  prepareUserInterrupt(a) {
     const changed = !a.userPaused;
     a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
     if (a.threadId) this.pausedThreads.add(a.threadId);
     for (const [threadId, root] of this.descendants) if (root === a) this.pausedThreads.add(threadId);
-    a.pauseDurable = this.persist();
     if (!a.stopPromise) a.interruptSent = new Map();
     if (changed) {
       a.userControlStatus = 'stopping';
       this.action('interrupt', a, undefined, 'user');
       this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'requested', message: 'The user requested that this agent and its descendants stop.' });
     }
+  }
+
+  async uiInterrupt(a) {
+    this.prepareUserInterrupt(a);
+    a.pauseDurable = this.persist();
     // The pause barrier must be durable before any native operation is awaited.
     await a.pauseDurable;
     const result = await this.stopTree(a);
     return { ...result, user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
   }
 
+  async uiInterruptAll() {
+    if (this.stopAllPromise) return this.stopAllPromise;
+    if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
+    this.stopAllInProgress = true;
+    this.stopAllEpoch++;
+    const agents = [...this.agents.values()];
+    // Install every in-memory barrier before yielding to persistence or RPCs.
+    for (const a of agents) this.prepareUserInterrupt(a);
+    const durable = this.persist();
+    for (const a of agents) a.pauseDurable = durable;
+    const run = async () => {
+      try {
+        await durable;
+        const settled = await Promise.allSettled(agents.map(a => this.stopTree(a)));
+        return { results: settled.map((result, i) => {
+          const a = agents[i];
+          if (result.status === 'fulfilled') return { ...result.value, user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
+          a.stopError = result.reason?.message ?? String(result.reason);
+          a.userControlStatus = 'unconfirmed';
+          return { agent_id: a.id, status: 'unconfirmed', user_paused: true, user_control_status: 'unconfirmed', error: a.stopError };
+        }) };
+      } catch (error) {
+        return { results: agents.map(a => {
+          a.stopError = error.message; a.userControlStatus = 'unconfirmed';
+          return { agent_id: a.id, status: 'unconfirmed', user_paused: true, user_control_status: 'unconfirmed', error: error.message };
+        }) };
+      }
+    };
+    this.stopAllPromise = run();
+    try { return await this.stopAllPromise; } finally { this.stopAllPromise = null; this.stopAllInProgress = false; }
+  }
+
   async uiSend(a, message, attachments) {
+    if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
     if (message !== undefined && typeof message !== 'string') throw new TypeError('message must be a string.');
     if (a.userResumeToken) throw new Error('A direct user message is already being delivered.');
     const resumeToken = Symbol('user resume');

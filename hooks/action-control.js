@@ -31,7 +31,7 @@ export default function ActionControl(props, surface) {
 
   const pressed = !disabled && surface.state?.pressed && surface.state.mode === mode;
   return Box({
-    key: 'action-control', position: 'relative', width: '100%', height: '100%',
+    key: 'action-control', position: 'relative', width: '100%', height: 2,
     alignItems: 'center', justifyContent: 'center',
     children: [
       Text({ size: 'title', color: '#171717', dimColor: disabled || Boolean(pressed), children: '⬤' }),

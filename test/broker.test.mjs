@@ -53,6 +53,10 @@ test('direct user controls use durable receipts without acknowledging Claude eve
   const conflict = await post({ ...request, args: { ...request.args, message: 'Changed text' } });
   assert.equal(conflict.body.error.code, 'request_id_conflict');
   assert.equal((await post({ operation: 'ui_interrupt', requestId: 'human-stop', args: { target: 'a' }, restore: request.restore })).status, 200);
+  const stopAll = { operation: 'ui_interrupt_all', requestId: 'human-stop-all', args: {}, restore: request.restore };
+  assert.equal((await post(stopAll)).status, 200);
+  assert.equal((await post(stopAll)).status, 200);
+  assert.equal(controller.calls.filter(call => call.op === 'ui_interrupt_all').length, 1);
   assert.deepEqual(controller.acks, []);
   const delivery = await post({ operation: 'wait', args: { timeout_ms: 0 } });
   assert.equal(delivery.body.events[0].seq, 1);

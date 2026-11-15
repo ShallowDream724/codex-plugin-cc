@@ -51,6 +51,17 @@ test('wrapped MCP results decode; oversized or invalid results preserve native f
   assert.equal(describeCall(full('wait_agent'), {}, 'x'.repeat(524289)), null);
 });
 
+test('native framed plugin prompts retain compact rows and expanded or unrelated messages stay native', () => {
+  const h = setup(), origin = { kind: 'plugin', name: 'codex-subagents' };
+  const text = 'The codex-subagents plugin sent a message:\n' + EVENT_PREFIX + JSON.stringify({ events: [{ agent_id: 'a', name: 'worker', kind: 'user_action_receipt', origin: 'user', action: 'send', phase: 'delivered', quoted_user_message: 'OFFLINE_QUOTED_ACTION' }] }) + "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+  const tree = h.render('UserMessage', { origin, text });
+  assert.equal(nodes(tree).filter(node => node.type === 'Button').length, 1);
+  assert.ok(nodes(tree).some(node => node.type === 'Text' && node.props.children[0] === '已收到你的消息'));
+  assert.equal(h.render('UserMessage', { origin, text, isExpanded: true }), 'native');
+  assert.equal(h.render('UserMessage', { origin: { kind: 'plugin', name: 'other' }, text }), 'native');
+  assert.equal(h.render('UserMessage', { origin, text: 'Quoted: ' + text }), 'native');
+});
+
 test('compact error rows retain the cause without repeating the plugin name', () => {
   assert.match(describeCall(full('followup_task'), {}, { error: { code: 'helper_restart_required' } })[0].text, /重启 Claude/);
   const h = setup();

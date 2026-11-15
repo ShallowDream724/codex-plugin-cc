@@ -1,5 +1,19 @@
 export const WAIT_TOOL = 'mcp__codex-subagents__wait_agent';
 export const EVENT_PREFIX = '[codex-subagents:events:v1]\n';
+const PROMPT_FRAMES = [
+  ['The codex-subagents plugin sent a message:\n', "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."],
+  ['The codex-subagents plugin sent a message while you were working:\n', '\n\nThis is how Claude Code surfaces prompts a plugin submits mid-turn — within the running turn, often alongside the next tool result. Address the message above as you continue this turn.'],
+];
+
+function promptEnvelope(value) {
+  if (value.startsWith(EVENT_PREFIX)) return { prefix: EVENT_PREFIX, json: value.slice(EVENT_PREFIX.length), suffix: '' };
+  // Claude's prompt pipeline frames plugin submissions before retaining the
+  // row. Accept only this plugin's exact host frame, never arbitrary inner JSON.
+  for (const [head, suffix] of PROMPT_FRAMES) {
+    const prefix = head + EVENT_PREFIX;
+    if (value.startsWith(prefix) && value.endsWith(suffix)) return { prefix, json: value.slice(prefix.length, -suffix.length), suffix };
+  }
+}
 
 function text(content) {
   if (typeof content === 'string') return content;
@@ -9,9 +23,11 @@ function text(content) {
 
 function payload(content, prompt = false) {
   const value = text(content);
-  if (value === undefined || (prompt && !value.startsWith(EVENT_PREFIX))) return undefined;
+  if (value === undefined) return undefined;
+  const framed = prompt ? promptEnvelope(value) : undefined;
+  if (prompt && !framed) return undefined;
   try {
-    const parsed = JSON.parse(prompt ? value.slice(EVENT_PREFIX.length) : value);
+    const parsed = JSON.parse(prompt ? framed.json : value);
     if (!parsed || !Array.isArray(parsed.events)) return undefined;
     return parsed;
   } catch { return undefined; }
@@ -72,7 +88,8 @@ export function filterClosed(message, options, closed) {
     if (!value) return content;
     const events = value.events.filter(event => !closed.has(event.agent_id));
     if (events.length === value.events.length) return content;
-    const encoded = (prompt ? EVENT_PREFIX : '') + JSON.stringify({ ...value, events });
+    const frame = prompt ? promptEnvelope(text(content)) : undefined;
+    const encoded = (frame?.prefix || '') + JSON.stringify({ ...value, events }) + (frame?.suffix || '');
     return typeof content === 'string' ? encoded : [{ type: 'text', text: encoded }];
   };
   if (options.tool && Array.isArray(message?.content)) return { ...message, content: message.content.map(block => block?.type === 'tool_result' ? { ...block, content: rewrite(block.content, false) } : block) };

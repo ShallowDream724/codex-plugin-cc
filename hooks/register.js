@@ -208,6 +208,8 @@ export function register(on, options = {}) {
     $.clock.every(10000, () => observe($).catch(() => {}));
     try { await $.command.register({ name: 'codex-agents', description: 'Browse Codex agents', immediate: true }); }
     catch { /* A conflicting command does not prevent tool and clickable-row use. */ }
+    try { await $.command.register({ name: 'codex-stop', description: 'Stop all Codex agents in this conversation', immediate: true }); }
+    catch { /* Keep an existing command with the same name intact. */ }
     return next(e);
   });
   on('session.append', { door: 'tool-result', origin: { kind: 'tool', tool: WAIT_TOOL } }, handleAppend);

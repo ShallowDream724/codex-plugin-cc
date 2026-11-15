@@ -13,7 +13,7 @@ function fixture() {
   client.request = async (method, args) => {
     requests.push({ method, args });
     if (method === 'thread/turns/list') return { data: [{ id: 'turn' }], nextCursor: 'older-turn' };
-    if (method === 'thread/items/list') return { data: [{ turnId: 'turn', outputDeferred: true, item: { id: 'cmd', type: 'commandExecution', command: 'test' } }, { turnId: 'turn', item: { id: 'secret', type: 'reasoning', content: ['hidden'] } }], nextCursor: 'older-item' };
+    if (method === 'thread/items/list') return { data: [{ turnId: 'turn', outputDeferred: true, item: { id: 'cmd', type: 'commandExecution', command: 'test' } }], nextCursor: 'older-item' };
     if (method === 'thread/items/read') return { data: [{ item: { id: 'cmd', type: 'commandExecution', aggregatedOutput: 'x'.repeat(20000) } }] };
   };
   return { client, controller, requests, store: ActivityStore.attach(client, controller) };
@@ -23,7 +23,7 @@ test('history uses owned native thread and bounded deferred pages', async () => 
   const { store, requests } = fixture();
   await assert.rejects(() => store.history({ target: 'foreign' }), /Unknown/);
   assert.equal(requests.length, 0);
-  const result = await store.history({ target: 'a' });
+  const result = await store.history({ target: 'a', limit: 1 });
   assert.deepEqual(result.entries.map((e) => e.id), ['cmd']);
   assert.equal(result.entries[0].deferred, true);
   assert.deepEqual(result.next_cursor, { turn_id: 'turn', items_cursor: 'older-item', turns_cursor: 'older-turn' });
@@ -33,6 +33,77 @@ test('history uses owned native thread and bounded deferred pages', async () => 
   assert.equal(first.text.length, 16000); assert.equal(first.next_offset, 16000);
   const second = await store.detail({ target: 'a', turn_id: 'turn', item_id: 'cmd', offset: first.next_offset });
   assert.equal(second.next_offset, null);
+});
+
+test('history combines turns in chronological order and resumes inside a turn', async () => {
+  const { client, store } = fixture();
+  const turns = ['new', 'middle', 'old'];
+  const items = { new: ['n2', 'n1'], middle: ['m'], old: ['o'] };
+  client.request = async (method, args) => {
+    if (method === 'thread/turns/list') {
+      const index = Number(args.cursor ?? 0);
+      return { data: [{ id: turns[index] }], nextCursor: index + 1 < turns.length ? String(index + 1) : null };
+    }
+    const index = Number(args.cursor ?? 0), ids = items[args.turnId];
+    return { data: ids.slice(index, index + args.limit).map(id => ({ item: { id, type: 'agentMessage', text: id } })), nextCursor: index + args.limit < ids.length ? String(index + args.limit) : null };
+  };
+  assert.deepEqual((await store.history({ target: 'a' })).entries.map(e => e.id), ['o', 'm', 'n1', 'n2']);
+  const first = await store.history({ target: 'a', limit: 1 });
+  const second = await store.history({ target: 'a', limit: 2, cursor: first.next_cursor });
+  const third = await store.history({ target: 'a', limit: 2, cursor: second.next_cursor });
+  assert.deepEqual(first.entries.map(e => e.id), ['n2']);
+  assert.deepEqual(second.entries.map(e => e.id), ['m', 'n1']);
+  assert.deepEqual(third.entries.map(e => e.id), ['o']);
+  assert.equal(third.next_cursor, null);
+});
+
+test('history advances through filtered pages with a bounded continuation', async () => {
+  const { client, store } = fixture();
+  let calls = 0;
+  client.request = async (method, args) => {
+    calls++;
+    if (method === 'thread/turns/list') return { data: [{ id: 'turn' }], nextCursor: null };
+    const index = Number(args.cursor ?? 0);
+    return { data: [{ item: index < 82 ? { id: `hidden${index}`, type: 'reasoning' } : { id: 'visible', type: 'agentMessage', text: 'hello' } }], nextCursor: index < 82 ? String(index + 1) : null };
+  };
+  const first = await store.history({ target: 'a' });
+  assert.equal(calls, 80);
+  assert.deepEqual(first.entries, []);
+  assert.ok(first.next_cursor);
+  const second = await store.history({ target: 'a', cursor: first.next_cursor });
+  assert.deepEqual(second.entries.map(e => e.id), ['visible']);
+  assert.equal(second.next_cursor, null);
+});
+
+test('history rejects repeated and malformed cursors across pages', async () => {
+  const { client, store } = fixture();
+  client.request = async (method, args) => method === 'thread/turns/list'
+    ? { data: [{ id: 'turn' }], nextCursor: null }
+    : { data: [{ item: { id: args.cursor ?? 'first', type: 'agentMessage', text: 'x' } }], nextCursor: args.cursor === 'a' ? 'b' : 'a' };
+  const first = await store.history({ target: 'a', limit: 1 });
+  const second = await store.history({ target: 'a', limit: 1, cursor: first.next_cursor });
+  await assert.rejects(() => store.history({ target: 'a', limit: 1, cursor: second.next_cursor }), /Repeated native history cursor/);
+  await assert.rejects(() => store.history({ target: 'a', cursor: { items_cursor: 'x' } }), /Invalid history cursor/);
+  await assert.rejects(() => store.history({ target: 'a', cursor: { seen_turn_cursors: Array.from({ length: 65 }, (_, i) => String(i)) } }), /Invalid history cursor/);
+});
+
+test('history keeps a bounded cursor trail while paging through long histories', async () => {
+  const { client, store } = fixture();
+  client.request = async (method, args) => {
+    if (method === 'thread/turns/list') {
+      const index = Number(args.cursor ?? 0);
+      return { data: [{ id: `turn${index}` }], nextCursor: index < 149 ? String(index + 1) : null };
+    }
+    return { data: [{ item: { id: args.turnId, type: 'agentMessage', text: 'x' } }], nextCursor: null };
+  };
+  let cursor, count = 0;
+  do {
+    const page = await store.history({ target: 'a', limit: 1, cursor });
+    assert.equal(page.entries[0].id, `turn${count++}`);
+    cursor = page.next_cursor;
+    assert.ok((cursor?.seen_turn_cursors?.length ?? 0) <= 64);
+  } while (cursor);
+  assert.equal(count, 150);
 });
 
 test('live cache excludes descendant and reasoning events and never touches pending events', () => {
@@ -93,7 +164,7 @@ test('cold live caches are evicted without invalidating native history', async (
   const { store, controller } = fixture();
   for (let i = 0; i < 40; i++) store.bucket(`cold-${i}`);
   assert.equal(store.live.size, 32);
-  assert.equal((await store.history({ target: 'a' })).entries[0].id, 'cmd');
+  assert.equal((await store.history({ target: 'a', limit: 1 })).entries[0].id, 'cmd');
   assert.equal(controller.pendingEvents, undefined);
 });
 

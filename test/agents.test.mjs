@@ -138,6 +138,68 @@ test('user stop isolates the tree, waits for descendants, and resumes with user 
   assert.ok(controller.eventsAfter().some(e => e.origin === 'user' && e.action === 'send' && e.message === 'resume' && e.phase === 'delivered'));
 });
 
+test('stop all pauses every root before interrupting either tree and isolates failures', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const first = await spawn(), second = await spawn();
+  for (const [root, child] of [[first, 'child-a'], [second, 'child-b']]) {
+    client.note('thread/started', { thread: { id: child, parentThreadId: root.thread_id } });
+    client.note('turn/started', { threadId: child, turn: { id: child + '-turn' } });
+  }
+  client.note('turn/started', { threadId: 'external', turn: { id: 'external-turn' } });
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const persist = controller.persist.bind(controller); controller.persist = () => gate;
+  const stopping = controller.dispatch('ui_interrupt_all');
+  assert.ok([first, second].every(a => controller.find(a.id).userPaused));
+  assert.equal(client.calls.filter(c => c.method === 'turn/interrupt').length, 0);
+  await assert.rejects(spawn(), /stop-all action is in progress/);
+  await assert.rejects(controller.dispatch('ui_send', { target: first.id, message: 'resume' }), /stop-all action is in progress/);
+  controller.persist = persist;
+  client.handler = (method, params) => { if (method === 'turn/interrupt' && params.threadId === first.thread_id) throw new Error('offline'); };
+  release();
+  const result = await stopping;
+  assert.deepEqual(result.results.map(a => a.status), ['unconfirmed', 'stopping']);
+  assert.deepEqual(client.calls.filter(c => c.method === 'turn/interrupt').map(c => c.params.threadId).sort(), [first.thread_id, second.thread_id, 'child-a', 'child-b'].sort());
+  for (const a of [first, second]) await assert.rejects(controller.dispatch('send_message', { target: a.id, message: 'continue' }), /paused by the user/);
+  for (const [thread, turn] of [[first.thread_id, first.turn_id], [second.thread_id, second.turn_id], ['child-a', 'child-a-turn'], ['child-b', 'child-b-turn']]) client.complete(thread, turn, 'interrupted');
+  assert.ok(result.results.every(a => a.user_paused));
+  assert.equal((await spawn()).status, 'running');
+});
+
+test('stop all persists registrations and pause across controller restart', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-stop-all-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath });
+  const first = await spawn(), second = await spawn();
+  await controller.dispatch('ui_interrupt_all');
+  for (const a of [first, second]) client.complete(a.thread_id, a.turn_id, 'interrupted');
+  await controller.persist(); await controller.close();
+  const restartedClient = new MockClient();
+  const restarted = new AgentController({ client: restartedClient, statePath, nativeRoleResolver: async () => undefined });
+  await restarted.init(); t.after(() => restarted.close());
+  assert.equal(restarted.agents.size, 2);
+  for (const a of [first, second]) {
+    assert.equal(restarted.find(a.id).userPaused, true);
+    await assert.rejects(restarted.dispatch('followup_task', { target: a.id, message: 'continue' }), /paused by the user/);
+  }
+  assert.equal(restartedClient.calls.filter(c => c.method === 'turn/start').length, 0);
+  await restarted.dispatch('ui_send', { target: first.id, message: 'resume' });
+  assert.equal(restarted.find(first.id).userPaused, false);
+  assert.equal(restarted.find(second.id).userPaused, true);
+});
+
+test('stop all prevents an in-flight external adoption from starting work', async t => {
+  const { client, controller } = await setup(t);
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  client.handler = method => { if (method === 'thread/read') return gate; };
+  const nativeId = '12345678-1234-4234-8234-123456789abc';
+  const adopting = controller.dispatch('followup_task', { target: nativeId, message: 'continue' });
+  await tick(); await controller.dispatch('ui_interrupt_all');
+  release({ thread: { id: nativeId, cwd: '/workspace', status: { type: 'idle' } } });
+  await assert.rejects(adopting, /stop-all action interrupted adoption/);
+  assert.equal(controller.agents.size, 0);
+  assert.equal(client.calls.filter(c => c.method === 'turn/start').length, 0);
+});
+
 test('failed user stop remains unconfirmed, retries, and catches late descendants', async t => {
   const { client, controller, spawn } = await setup(t);
   const agent = await spawn(); let fail = true;

@@ -4,6 +4,22 @@ import { join } from 'node:path';
 import { DiskReceipts, MemoryReceipts, requestFingerprint } from './receipts.mjs';
 import { readJson, writeJson } from './storage.mjs';
 
+// A direct sidebar action is a receipt for Codex, not a new task for Claude.
+// Format before hashing so transcript confirmation still verifies the exact
+// delivered event, while the controller's original journal stays unchanged.
+export function formatDeliveryEvent(event) {
+  if (event?.kind !== 'message' || event.origin !== 'user' || !['send', 'interrupt'].includes(event.action)) return event;
+  const { message, ...receipt } = event;
+  const target = `Codex 子代理 ${event.name || event.agent_id}`;
+  const tree = `${target} 及其子代理`;
+  const summary = event.action === 'send'
+    ? event.phase === 'delivered' ? `用户已向 ${target} 发送消息，由该代理处理。` : `用户向 ${target} 发送消息，投递未确认。`
+    : ({ requested: `用户已请求停止 ${tree}。`, stopping: `${tree} 正在按用户要求停止。`,
+      confirmed: `${tree} 已按用户要求停止。`, unconfirmed: `用户请求停止 ${tree}，停止状态未确认。` })[event.phase] || `${tree} 的用户停止请求状态已更新。`;
+  return { ...receipt, kind: 'user_action_receipt', summary,
+    ...(message !== undefined && event.action === 'send' ? { quoted_user_message: message } : {}) };
+}
+
 export class DeliveryStore extends EventEmitter {
   constructor({ controller, records = new MemoryReceipts(), statePath, leaseMs = 60000, now = Date.now } = {}) {
     super();
@@ -39,7 +55,7 @@ export class DeliveryStore extends EventEmitter {
       }
       if (!events.length) { this.lease = null; await this.saveLease(); return { events: [] }; }
       // Page whole events, never truncate their content or drop an unconfirmed result.
-      const selected = events.slice(0, 32), id = randomUUID();
+      const selected = events.slice(0, 32).map(formatDeliveryEvent), id = randomUUID();
       await this.records.put(id, { status: 'issued', channel, toolUseId, sequences: selected.map(event => event.seq),
         hashes: Object.fromEntries(selected.map(event => [event.seq, requestFingerprint('event', event)])), acknowledged: [] });
       this.lease = { id, expiresAt: this.now() + this.leaseMs };

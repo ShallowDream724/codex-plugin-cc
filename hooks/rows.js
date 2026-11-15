@@ -1,4 +1,4 @@
-import { EVENT_PREFIX } from './delivery.js';
+import { messageDeliveries } from './delivery.js';
 import { openAgent } from './ui.js';
 import { agentIcon } from './presentation.js';
 
@@ -102,8 +102,8 @@ export function registerRows(on) {
     return entries.length ? draw($, e, entries) : next(e);
   });
   on('ui.render', { component: 'UserMessage' }, ($, e, next) => {
-    if (e.props.isExpanded || e.props.origin?.kind !== 'plugin' || e.props.origin?.name !== 'codex-subagents' || !e.props.text?.startsWith(EVENT_PREFIX)) return next(e);
-    const value = parseDisplayResult(e.props.text.slice(EVENT_PREFIX.length));
+    if (e.props.isExpanded || e.props.origin?.kind !== 'plugin' || e.props.origin?.name !== 'codex-subagents') return next(e);
+    const [value] = messageDeliveries({ content: e.props.text }, { prompt: true });
     if (!Array.isArray(value?.events)) return next(e);
     return draw($, e, value.events.map(event => ({ id: event.agent_id, name: event.name, kind: event.kind, text: eventText(event) })));
   });

@@ -4,7 +4,7 @@ import { prepareContextSnapshot } from './context.mjs';
 import { DeliveryStore } from './delivery.mjs';
 import { MemoryReceipts, requestFingerprint } from './receipts.mjs';
 
-const UI_MUTATIONS = new Set(['ui_interrupt', 'ui_send']);
+const UI_MUTATIONS = new Set(['ui_interrupt', 'ui_interrupt_all', 'ui_send']);
 const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', ...UI_MUTATIONS]);
 const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;

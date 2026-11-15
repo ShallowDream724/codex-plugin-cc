@@ -4,6 +4,7 @@ import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hook
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
 function connect($, handler) {
+  $.clock.after ??= () => ({ cancel() {} });
   $.state ??= { get: async () => ({ value: undefined, version: 0 }), set: async () => { $.ui.invalidate(); return { isSet: true }; } };
   $.session = { id: async () => 'session', cwd: async () => 'C:/work' };
   $.env = { get: async () => undefined }; $.plugin = { root: 'C:/plugin' };
@@ -230,7 +231,7 @@ test('conversation shows prose and expandable file changes with authoritative co
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = await draw(); assert.ok(nodes(tree).some(node => node.type === 'Markdown' && node.props.text === '正文直接显示'));
   const file = nodes(tree).find(node => node.props.key?.startsWith('file_'));
-  assert.match(file.props.label, /test\.js \+5 -1/); file.props.onPress();
+  assert.match(file.props.label, /test\.js \+5 -1/); await file.props.onPress();
   tree = await draw(); const code = nodes(tree).find(node => node.type === 'Code');
   assert.deepEqual(code.props, { key: 'file_code_a:t:f:file:0', source: diff, path: 'test.js', format: 'diff', wrap: 'wrap' });
   await nodes(tree).find((node) => node.props.key?.startsWith('file_detail_')).props.onPress();
@@ -257,7 +258,7 @@ test('long messages and file output support next and previous pages', async () =
   assert.ok(JSON.stringify(await draw()).includes('m page 16000'));
   await (await item('message_prev_a:t:m')).props.onPress();
   assert.ok(JSON.stringify(await draw()).includes('m page 0'));
-  (await item('file_a:t:f:file:0')).props.onPress();
+  await (await item('file_a:t:f:file:0')).props.onPress();
   await (await item('file_detail_a:t:f:file:0')).props.onPress();
   await (await item('file_detail_a:t:f:file:0')).props.onPress();
   assert.ok(JSON.stringify(await draw()).includes('f page 16000'));
@@ -278,13 +279,13 @@ test('open file retains its detail while new live entries continue to appear', a
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   const item = async (prefix) => nodes(await draw()).find((node) => node.props.key?.startsWith(prefix));
-  (await item('file_a:t:f:file:0')).props.onPress();
+  await (await item('file_a:t:f:file:0')).props.onPress();
   await (await item('file_detail_a:t:f:file:0')).props.onPress();
   revision = 2; timers[0](); await new Promise((r) => setImmediate(r));
   assert.match(JSON.stringify(await draw()), /old\.js/);
   assert.match(JSON.stringify(await draw()), /完整输出/);
   assert.match(JSON.stringify(await draw()), /新活动/);
-  (await item('file_a:t:f:file:0')).props.onPress();
+  await (await item('file_a:t:f:file:0')).props.onPress();
   timers[0](); await new Promise((r) => setImmediate(r));
   assert.ok(JSON.stringify(await draw()).includes('新活动'));
   closeUI();
@@ -303,11 +304,11 @@ test('native activity types render readable tool, search, plan and lifecycle det
   assert.ok(JSON.stringify(tree).includes('研究已完成'));
   assert.ok(JSON.stringify(tree).includes('撰写开始工作'));
   assert.ok(nodes(tree).some((node) => node.type === 'Markdown' && node.props.text.includes('检查结果')));
-  nodes(tree).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  await nodes(tree).find((node) => node.props.key?.startsWith('group_')).props.onPress();
   tree = await draw(); assert.ok(JSON.stringify(tree).includes('读取本地文件')); assert.ok(JSON.stringify(tree).includes('搜索文件内容'));
-  nodes(tree).find((node) => node.props.key?.startsWith('item_a:t:search')).props.onPress();
+  await nodes(tree).find((node) => node.props.key?.startsWith('item_a:t:search')).props.onPress();
   tree = await draw(); assert.ok(JSON.stringify(tree).includes('中文查询')); assert.ok(JSON.stringify(tree).includes('https://example.com/'));
-  nodes(tree).find((node) => node.props.key?.startsWith('item_a:t:future')).props.onPress();
+  await nodes(tree).find((node) => node.props.key?.startsWith('item_a:t:future')).props.onPress();
   assert.ok(JSON.stringify(await draw()).includes('opaque'));
   closeUI();
 });
@@ -320,7 +321,7 @@ test('expanded local PNG uses native image; other paths never load as files', as
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   assert.equal(nodes(await draw()).filter((node) => node.type === 'Image').length, 0);
-  for (const id of ['png', 'web', 'unc', 'jpg']) nodes(await draw()).find((node) => node.props.key?.startsWith(`item_a:t:${id}`)).props.onPress();
+  for (const id of ['png', 'web', 'unc', 'jpg']) await nodes(await draw()).find((node) => node.props.key?.startsWith(`item_a:t:${id}`)).props.onPress();
   const images = nodes(await draw()).filter((node) => node.type === 'Image');
   assert.equal(images.length, 1); assert.deepEqual(images[0].props.source, { file: 'C:\\images\\plot.png', format: 'png' });
   assert.ok(nodes(await draw()).some((node) => node.props.key?.startsWith('copy_a:t:jpg')));
@@ -338,7 +339,7 @@ test('only adjacent same-type calls within a turn group and retain items', () =>
   assert.deepEqual(groupEntries(calls).map((g) => g.items.length), [3]);
 });
 
-test('history stays reachable after live rollover and past fifty pages; closed observation never redraws', async () => {
+test('history remains reachable across many pages alongside live updates; closed observation never redraws', async () => {
   const hooks = [], timers = []; let invalidations = 0, live = 'live-100';
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { invalidations++; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(ms, fn) { const t = { fn, cancel() {} }; timers.push(t); return t; } } };
@@ -356,17 +357,16 @@ test('history stays reachable after live rollover and past fifty pages; closed o
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   live = 'live-200'; timers[0].fn(); await new Promise((r) => setImmediate(r));
   let tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200')); assert.ok(JSON.stringify(tree).includes('live-100'));
-  await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
-  for (let i = 0; i < 56; i++) { tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress(); }
-  tree = await draw(); assert.ok(JSON.stringify(tree).includes('history-57')); assert.ok(nodes(tree).some((x) => x.props.key === 'codex_older'));
-  assert.ok(nodes(tree).some((x) => x.props.key === 'codex_latest'));
-  await nodes(tree).find((x) => x.props.key === 'codex_latest').props.onPress();
-  tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200'));
+  const scroll = hooks.find((h) => h.event === 'ui.scroll').fn;
+  for (let i = 0; i < 57; i++) await scroll($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
+  tree = await draw();
+  for (const text of ['history-0', 'history-57', 'live-100', 'live-200']) assert.ok(JSON.stringify(tree).includes(text));
+  assert.equal(nodes(tree).find((x) => ['codex_older', 'codex_latest'].includes(x.props.key)), undefined);
   await hooks.find((h) => h.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e);
   const count = invalidations; observeUI($, { agents: [{ ...agents[0], status: 'completed', name: 'Changed' }] }); assert.equal(invalidations, count);
 });
 
-test('older pages stay visible during live updates and newer returns to latest', async () => {
+test('older history is prepended while live updates continue to append', async () => {
   const hooks = [], timers = [];
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(ms, fn) { const t = { fn, cancel() {} }; timers.push(t); return t; } } };
@@ -381,12 +381,11 @@ test('older pages stay visible during live updates and newer returns to latest',
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = await draw();
   assert.ok(JSON.stringify(tree).includes('The full agent name'));
-  await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
+  await hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
   tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old')));
   timers[0].fn(); await new Promise((r) => setImmediate(r));
-  tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old'))); assert.ok(!nodes(tree).some((x) => x.props.key?.includes('t:live')));
-  await nodes(tree).find((x) => x.props.key === 'codex_latest').props.onPress();
-  tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:live')));
+  tree = await draw();
+  assert.deepEqual(nodes(tree).filter((x) => x.type === 'Markdown').map((x) => x.props.text), ['old', 'new', 'live']);
 });
 
 test('late details from a previous selection are discarded', async () => {
@@ -462,13 +461,13 @@ test('tool details separate protocol commands and output into wrapped source pan
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_detail' ? { text: 'full raw page\nnext line', next_offset: null } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
-  nodes(await draw()).find((node) => node.props.key === 'item_a:t:run').props.onPress();
+  await nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  await nodes(await draw()).find((node) => node.props.key === 'item_a:t:run').props.onPress();
   let panels = nodes(await draw()).filter((node) => node.type === 'Code');
   assert.equal(panels.length, 1);
   assert.match(panels[0].props.source, /one\ntwo\n<html>literal<\/html>/);
   assert.match(panels[0].props.source, /"exit_code": 0/);
-  nodes(await draw()).find((node) => node.props.key === 'tool_raw_a:t:run').props.onPress();
+  await nodes(await draw()).find((node) => node.props.key === 'tool_raw_a:t:run').props.onPress();
   panels = nodes(await draw()).filter((node) => node.type === 'Code');
   assert.deepEqual(panels.slice(1).map((node) => node.props.source), ['printf "one\\ntwo"', 'C:/work', '{\n  "timeout_ms": 1000\n}']);
   assert.ok(panels.every((node) => node.props.format === 'source' && node.props.wrap === 'wrap'));
@@ -568,8 +567,8 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   await (await input()).props.onSubmit(''); assert.equal(requests.length, 1, 'empty Enter never stops the agent');
   await nodes(await draw()).find((node) => node.props.key === 'codex_action_a').props.onPress(); assert.equal(requests[1].op, 'ui_interrupt');
   assert.equal(nodes(await draw()).some((node) => node.props.key?.startsWith('codex_stop_') && node.type === 'Button'), false);
-  nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
-  nodes(await draw()).find((node) => node.props.key === 'item_a:t:tool').props.onPress();
+  await nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  await nodes(await draw()).find((node) => node.props.key === 'item_a:t:tool').props.onPress();
   tree = await draw();
   assert.equal(nodes(tree).find((node) => node.props.key === 'detail_a:t:tool'), undefined);
   assert.deepEqual(nodes(tree).filter((node) => node.type === 'Code').map((node) => node.props.source), ['complete short output']);
@@ -595,26 +594,24 @@ test('an empty live cache restores saved latest history once and skips a newly s
   for (let i = 0; i < 3; i++) { await timers[0](); await observeUI($, { agents }); }
   assert.equal(historyCalls.length, 1); assert.equal(writes.length, 0);
   assert.match(JSON.stringify(await draw()), /recent saved message/);
-  await nodes(await draw()).find((node) => node.props.key === 'codex_older').props.onPress();
+  await hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
   assert.deepEqual(historyCalls[1].cursor, { turns_cursor: 'older' });
   assert.match(JSON.stringify(await draw()), /older saved message/);
-  await nodes(await draw()).find((node) => node.props.key === 'codex_latest').props.onPress();
   assert.match(JSON.stringify(await draw()), /recent saved message/);
   await openAgent($, 'new'); assert.equal(historyCalls.length, 2);
   closeUI();
 });
 
-test('history actions, input boundaries and polling await the asynchronous pane refresh', async () => {
+test('history scrolling, input boundaries and polling await the asynchronous pane refresh', async () => {
   const hooks = [], timers = [], pending = []; let delay = false, revision = 1;
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async () => { if (delay) await new Promise((resolve) => pending.push(resolve)); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
-  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : { revision, entries: [{ id: 'm', turn_id: 't', type: 'agentMessage', data: { text: op === 'ui_history' ? 'saved history' : `live message ${revision}` } }], next_cursor: { turns_cursor: 'older' } });
+  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [{ id: args.cursor ? 'old' : 'saved', turn_id: 't', type: 'agentMessage', data: { text: 'saved history' } }], next_cursor: args.cursor ? null : { turns_cursor: 'older' } } : { revision, entries: [{ id: 'm', turn_id: 't', type: 'agentMessage', data: { text: `live message ${revision}` } }] });
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   delay = true; let completed = false;
-  const action = nodes(await draw()).find((node) => node.props.key === 'codex_older').props.onPress().then(() => { completed = true; });
+  const action = hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e).then(() => { completed = true; });
   await new Promise((r) => setImmediate(r)); assert.equal(completed, false); assert.equal(pending.length, 1);
-  pending.shift()(); await new Promise((r) => setImmediate(r)); assert.equal(completed, false); assert.equal(pending.length, 1);
   pending.shift()(); await action; assert.equal(completed, true); assert.match(JSON.stringify(await draw()), /saved history/);
   completed = false;
   const input = nodes(await draw()).find((node) => node.type === 'Input').props.onInput('x').then(() => { completed = true; });
@@ -625,7 +622,7 @@ test('history actions, input boundaries and polling await the asynchronous pane 
   closeUI();
 });
 
-test('cold history merges with live deltas, updates duplicates and keeps a bounded conversation', async () => {
+test('cold history merges with live deltas, updates duplicates and retains more than 200 messages', async () => {
   const hooks = [], timers = []; let revision = 1, recent = [];
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
@@ -642,8 +639,8 @@ test('cold history merges with live deltas, updates duplicates and keeps a bound
   assert.deepEqual(messages, ['cold-one', 'cold-two', 'new-one updated']);
   recent = Array.from({ length: 260 }, (_, i) => entry(`new-${i + 2}`)); revision++; await timers[0]();
   messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
-  assert.equal(messages.length, 200); assert.equal(messages.at(-1), 'new-261');
-  assert.ok(nodes(await draw()).find((node) => node.props.key === 'codex_older'));
+  assert.equal(messages.length, 263); assert.equal(messages[0], 'cold-one'); assert.equal(messages.at(-1), 'new-261');
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_older'), undefined);
   closeUI();
 });
 
@@ -668,9 +665,8 @@ test('failed discovery has a recovery action without an untargeted composer and 
   assert.equal(composer.props.borderStyle, undefined); assert.equal(composer.props.gap, 0);
   historyFails = false; await nodes(tree).find((node) => node.props.key === 'codex_retry_conversation').props.onPress();
   tree = await draw(); assert.match(JSON.stringify(tree), /saved reply/); assert.match(JSON.stringify(tree), /live reply/);
-  assert.ok(nodes(tree).find((node) => node.props.key === 'codex_older'));
-  historyFails = true; await nodes(tree).find((node) => node.props.key === 'codex_older').props.onPress();
-  tree = await draw(); assert.match(JSON.stringify(tree), /无法读取更早消息/); assert.match(JSON.stringify(tree), /saved reply/);
+  historyFails = true; await hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
+  tree = await draw(); assert.match(JSON.stringify(tree), /saved history unavailable/); assert.match(JSON.stringify(tree), /saved reply/);
   pollFails = true; await timers[0](); tree = await draw(); assert.match(JSON.stringify(tree), /broker offline/); assert.match(JSON.stringify(tree), /live reply/);
   closeUI();
 });

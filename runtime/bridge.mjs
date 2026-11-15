@@ -244,13 +244,20 @@ export async function main(argv = process.argv.slice(2)) {
   for await (const chunk of process.stdin) input += chunk;
   const body = JSON.parse(input);
   const dir = ownerDirectory(body.owner);
-  const existing = await probe(join(dir, 'endpoint.json'));
+  const endpointPath = join(dir, 'endpoint.json');
+  const existing = await probe(endpointPath);
+  if (body.operation === 'ui_interrupt_all' && !existing) {
+    const lockExists = async name => { try { await readdir(join(dir, name)); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } };
+    if (await readJson(endpointPath, null) || await lockExists('service') || await lockExists('starting')) return { error: { code: 'action_status_unknown', message: 'The session helper cannot be reached; agent status is unconfirmed.' } };
+    return { offline: true, results: [] };
+  }
   let endpoint = body.operation === 'shutdown' ? existing?.endpoint : compatible(existing, await runtimeSignature());
+  if (body.operation === 'ui_interrupt_all' && !endpoint) return { error: { code: 'helper_restart_required', message: 'The running session helper is incompatible; agent status is unconfirmed.' } };
   if (!existing && ['observe', 'ack', 'confirm', 'release', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
   endpoint ||= await ensureBroker(body.owner, body.cwd || process.cwd());
   try { return await call(endpoint, body, body.operation === 'wait' ? 35000 : 150000); }
   catch (error) {
-    if (['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', 'ui_interrupt', 'ui_send'].includes(body.operation)) {
+    if (['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', 'ui_interrupt', 'ui_interrupt_all', 'ui_send'].includes(body.operation)) {
       return { error: { code: 'action_status_unknown', message: 'The local connection ended before confirmation. The action may already have been submitted. Use list_agents before issuing another action.' } };
     }
     throw error;
