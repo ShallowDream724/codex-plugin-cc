@@ -175,6 +175,7 @@ test('user pause persists across restart and prevents Claude from resuming', asy
 test('user stop cancels an in-flight followup before it can start', async t => {
   const { client, controller, spawn } = await setup(t);
   const agent = await spawn(); client.complete(agent.thread_id, agent.turn_id); await tick();
+  controller.find(agent.id).loaded = false;
   let release; const gate = new Promise(resolve => { release = resolve; });
   client.handler = method => { if (method === 'thread/resume') return gate; };
   const send = controller.dispatch('followup_task', { target: agent.id, message: 'continue' });
@@ -420,8 +421,40 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   await controller.dispatch('followup_task', { target: agent.id, message: 'second task' });
   assert.equal(client.calls.filter((c) => c.method === 'thread/start').length, 1);
   assert.equal(client.calls.filter((c) => c.method === 'thread/inject_items').length, 2);
-  assert.deepEqual(client.calls.find((c) => c.method === 'thread/resume').params, { threadId: 'thread-1', excludeTurns: true, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+  assert.equal(client.calls.filter((c) => c.method === 'thread/resume').length, 0);
   assert.equal(client.calls.at(-1).params.input[0].text, 'second task');
+});
+
+test('a restored old agent resumes once and runs repeated tasks on its existing native thread', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-reuse-old-'));
+  let restored;
+  t.after(async () => { await restored?.close(); await rm(dir, { recursive: true, force: true }); });
+  const statePath = path.join(dir, 'state.json');
+  const { client, controller, spawn } = await setup(t, { statePath });
+  const original = await spawn(); client.complete(original.thread_id, original.turn_id);
+  await controller.persist(); await controller.close();
+  const restoredClient = new MockClient();
+  restoredClient.handler = (method, params) => {
+    if (method === 'thread/resume') return { thread: { id: params.threadId, status: { type: 'idle' } } };
+  };
+  restored = new AgentController({ client: restoredClient, statePath });
+  await restored.init();
+  const resume = restoredClient.handler;
+  restoredClient.handler = method => {
+    if (method === 'thread/resume') throw Object.assign(new Error('This thread already has an active native writer.'), { code: -32600, reason: 'thread_writer_conflict' });
+  };
+  await assert.rejects(restored.dispatch('followup_task', { target: original.id, message: 'blocked task' }), { reason: 'thread_writer_conflict' });
+  assert.equal(restored.find(original.id).loaded, false);
+  assert.equal(restored.find(original.id).status, 'completed');
+  assert.deepEqual(restoredClient.calls.map(call => call.method), ['thread/resume']);
+  restoredClient.handler = resume;
+  for (const operation of ['followup_task', 'ui_send', 'followup_task']) {
+    const current = await restored.dispatch(operation, { target: original.id, message: 'next task' });
+    assert.equal(current.thread_id, original.thread_id);
+    restoredClient.complete(current.thread_id, current.turn_id);
+  }
+  assert.deepEqual(restoredClient.calls.map(call => call.method), ['thread/resume', 'thread/resume', 'turn/start', 'turn/start', 'turn/start']);
+  assert.deepEqual(restoredClient.calls[0].params, { threadId: original.thread_id, excludeTurns: true, approvalPolicy: 'never', sandbox: 'danger-full-access' });
 });
 
 test('completed final messages and requests before RPC replies are not lost', async (t) => {

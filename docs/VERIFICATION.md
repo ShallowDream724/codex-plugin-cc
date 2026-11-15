@@ -1,10 +1,10 @@
 # 验证记录
 
-2026-11-15，插件 **0.2.0-rc.6**，Windows / Node.js 24.22.2。新增接口与权限字段按 Codex CLI 0.169.0 的生成 schema 核对。真实宿主离线测试使用本机原有 `@cometix/claude-code 2.1.303`；没有修改宿主安装。
+2026-11-15，插件 **0.2.0-rc.7**，Windows / Node.js 24.22.2。新增接口与权限字段按 Codex CLI 0.169.0 的生成 schema 核对。真实宿主离线测试使用本机原有 `@cometix/claude-code 2.1.303`；没有修改宿主安装。
 
 ## 自动检查
 
-- `npm test`：249 项通过，2 项跳过：需显式指定宿主的集成测试，以及 Linux 专用 FIFO 测试（当前为 Windows）。
+- `npm test`：254 项通过，2 项跳过：需显式指定宿主的集成测试，以及 Linux 专用 FIFO 测试（当前为 Windows）。
 - `npm run check`：元数据、JavaScript 语法、指引源与生成文件一致性检查通过。
 - `claude plugin validate .`：通过，无警告。
 - 显式运行 `test/host-integration.test.mjs`：三个场景及父测试全部通过。
@@ -49,6 +49,10 @@ rc.4 实机已看到右侧灰色任务消息、集成 Svg 图标、上下文用�
 rc.5 新增同协议 helper 的原子空闲升级，覆盖活动任务、并发动作、未收完请求体、多个升级调用以及旧 helper 未提供能力的拒绝路径。UI 回归使用真实形态的稀疏 controller summary，断言观察与查询交替时不丢失用量、不触发无意义刷新；最近历史与新条目合并有界。延迟工具自动读取纯结果，空协议字段不作为输出，输入另行折叠；详情按工具和文件独立缓存，不因打开另一个工具丢失已读内容。中文输入法由宿主原生 Input 保留，Desktop 不叠第二层边框。最终视觉及持续刷新仍以实际 Desktop 检查为准。
 
 rc.6 只读核对本机 Claude Desktop 5.11492.5.0 的 `ion-dist.asar/assets/v1/c2719cf1b-B0-HB2oF.js`：`gf` 仅在 `submitLabel !== undefined` 时创建提交按钮；省略标签时，多行输入的 Enter 仍走原生 submit，保留 composition 处理。这纠正了此前仅依据类型说明作出的“无法隐藏按钮”结论。全宽纵向 Box 拉伸 Input；独立 Client 控件只处理点击、Enter/Space，不接管文字输入。新增六项控件行为测试及 UI 路由回归，检查越界释放、右键、禁用、模式改变、空 Enter 不停止和过期代理点击被忽略。原生宿主离线交付/上下文检查最近一次为 rc.5 的四项通过；本轮 UI 使用原生 validator 和本地交互测试。
+
+rc.7 修正原先“展开项阻止全部实时合并”的错误策略。回归覆盖工具组和详情保持展开时的新用户消息、进度与最终答复，详情缓存不丢失、后台不强制滚动；从历史页发送回到最新视图，发送撞上在途轮询时随后再次取增量。重复消息的去重按来源、轮次、完整正文和附件一一匹配，旧消息或正文子串不能吞掉新的发送。短对话布局使用公开 `e.props.scroll.bodyRows`，已从同一 Desktop 实际源码确认测量与 `minHeight` 都用 `1lh`；默认主题下工具 `rowGap:0.7` 比原 `sm` 约小 17%，缩小内部箭头且保留圆钮尺寸。尺寸变化与未知高度 fallback 进入组件测试；新布局的实际绘制仍由用户验收。
+
+rc.7 对用户旧线程的独立本机协议探针只做 initialize、thread/read 和一次 thread/resume，没有任何 turn/start/steer 或模型请求。原始 RPC -32600 是 `already has an active writer`。Windows Restart Manager 只读查询目标 writer 锁，唯一持有者为 Codex App 的 app-server；没有删除锁或停止用户进程。测试覆盖旧登记状态恢复、writer 拒绝不启动新轮/不创建替身、拥有者释放后同 ID 重试，以及已加载线程连续三轮不重复 resume。RPC 方法和已识别的安全原因保留，任意远端错误正文与 data 不透传。
 
 0.1.1 增加首尾预览与 Unicode 边界、已关闭代理持久化及迟到事件、关闭与发送的竞态、限时等待不终止任务、无效回答的重试格式等测试。预览不改变完整历史或 digest；新版本检查仍未发起真实模型请求。
 

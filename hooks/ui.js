@@ -191,6 +191,7 @@ async function stopAgent($, id) {
 }
 async function sendAgent($, id) {
   const control = controlFor(id), message = control.draft, attachments = [...control.attachments], attachmentVersion = control.attachmentVersion, stopEpoch = control.stopEpoch;
+  let accepted = false;
   const selected = state.agents.find((agent) => idOf(agent) === id);
   if (!selected || control.sending || control.stopping || selected.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
   control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; await invalidate($);
@@ -199,13 +200,23 @@ async function sendAgent($, id) {
     if (result.error || result.offline) {
       control.sendResult = result.offline || result.error?.code === 'action_status_unknown' ? '发送状态未知，请查看活动后再试。' : `发送失败：${safe(result.error?.message || result.error).slice(0, 600)}。草稿已保留。`;
     } else if (result.agent_id === id && typeof result.status === 'string') {
-      control.sendResult = result.status === 'steered' || result.user_paused || control.stopEpoch !== stopEpoch ? '消息已发送。' : '消息已发送，代理继续工作。';
+      accepted = true; control.sendResult = '';
       if (control.draft === message) { control.draft = ''; control.inputVersion++; }
       if (control.attachmentVersion === attachmentVersion) { control.attachments = []; control.attachmentVersion++; }
       if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
+      if (state.controls.get(id) === control) {
+        const page = pageFor(id);
+        page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.cursorStack = []; page.historyError = '';
+      }
     } else control.sendResult = '发送状态未知，请查看活动后再试。';
   } catch (error) { control.sendResult = `发送状态未知：${safe(error?.message || error).slice(0, 600)}。请查看活动后再试，草稿已保留。`; }
-  finally { control.sending = false; if (state.opened && state.selected === id) await invalidate($); }
+  finally {
+    control.sending = false;
+    if (state.opened && state.selected === id && state.controls.get(id) === control) {
+      if (accepted) await poll($, true);
+      if (state.opened && state.selected === id && state.controls.get(id) === control) await invalidate($);
+    }
+  }
 }
 function addAttachments(control, paths) {
   const additions = paths.filter((path) => typeof path === 'string' && path.trim());
@@ -241,10 +252,6 @@ async function chooseAttachments($, id, source = 'file') {
     return page;
   };
   const toggle = (key) => { if (!state.folds.delete(key)) { state.folds.add(key); if (state.folds.size > 512) state.folds.delete(state.folds.values().next().value); } };
-  const reading = (id, page) => page.live.some((entry) => {
-    const key = `${id}:${entryKey(entry)}`;
-    return state.folds.has(key) || state.folds.has(`${key}:group`) || [...state.folds].some((fold) => fold.startsWith(`${key}:file:`));
-  });
   function invalidate($) {
     // Reading this key in the pane renderer subscribes only that render site.
     // Event-wide invalidation also rebuilds the host conversation's tool rows.
@@ -268,11 +275,12 @@ async function chooseAttachments($, id, source = 'file') {
       }
     }
   }
-  async function poll($) {
+  async function poll($, afterSend = false) {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
     const page = pageFor(id), control = controlFor(id), mutationEpoch = control.mutationEpoch;
-    if (page.busy) return;
+    if (afterSend) page.afterSendGeneration = gen;
+    if (page.busy) { if (afterSend) page.refreshAfterPoll = true; return; }
     page.busy = true;
     try {
       const result = await bridge($, 'ui_revision', { target: id, revision: page.revision });
@@ -281,7 +289,7 @@ async function chooseAttachments($, id, source = 'file') {
       const changed = result.agent && control.mutationEpoch === mutationEpoch && !control.stopping && !control.sending && updateAgent(id, result.agent);
       let dirty = changed || Boolean(page.liveError);
       page.liveError = '';
-      if (result.entries && result.revision !== page.revision && (page.mode !== 'live' || !reading(id, page))) {
+      if (result.entries && result.revision !== page.revision) {
         const entriesChanged = mergeLive(page, result.entries);
         if (page.mode !== 'live' && entriesChanged) page.hasNew = true;
         page.revision = result.revision;
@@ -295,7 +303,18 @@ async function chooseAttachments($, id, source = 'file') {
         const message = `无法更新对话：${failureText(error)}。请重试。`;
         if (page.liveError !== message) { page.liveError = message; await invalidate($); }
       }
-    } finally { page.busy = false; }
+    } finally {
+      page.busy = false;
+      if (page.refreshAfterPoll) {
+        page.refreshAfterPoll = false;
+        if (state.opened && state.selected === id && state.generation === gen) await poll($);
+        else delete page.afterSendGeneration;
+      } else if (page.afterSendGeneration !== undefined) {
+        const sentGeneration = page.afterSendGeneration;
+        delete page.afterSendGeneration;
+        if (sentGeneration === gen && state.opened && state.selected === id && state.generation === gen && page.mode === 'live') await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
+      }
+    }
   }
   async function history($, id, direction = 'latest') {
     const page = pageFor(id), gen = state.generation, request = ++page.historyGeneration;
@@ -378,6 +397,7 @@ export function registerUI(on) {
   on('ui.scroll', { requestId: PANE }, ($, e, next) => {
     if (e.origin.kind === 'person' && state.selected) state.scroll.set(state.selected, e.offset);
     if (e.origin.kind === 'plugin' && state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(state.selected) || 0 }); }
+    if (e.origin.kind === 'plugin' && state.selected) state.scroll.set(state.selected, e.offset);
     return next(e);
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
@@ -400,9 +420,22 @@ function renderPane($, e, next) {
     const all = page.mode === 'history' ? page.entries : page.live;
     // The action gives immediate feedback while native history catches up. Once
     // the same message is persisted, retain the native copy for pagination.
-    const nativeMessages = (type) => all.filter((entry) => entry.type === type && !String(entry.id).startsWith('action:')).map(body);
-    const nativeParent = nativeMessages('userMessage'), nativeUser = nativeMessages('directUserMessage');
-    const entries = all.filter((entry) => !String(entry.id).startsWith('action:') || !['parentMessage', 'directUserMessage'].includes(entry.type) || !(entry.type === 'parentMessage' ? nativeParent : nativeUser).some((text) => entry.data?.text && text.includes(entry.data.text)));
+    const messageKey = (entry) => {
+      if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) return null;
+      const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
+      return JSON.stringify([entry.turn_id, entry.type === 'directUserMessage' ? 'user' : 'parent', body(entry), attachments.map(part => part.path)]);
+    };
+    const nativeCopies = new Map();
+    for (const entry of all) {
+      const key = messageKey(entry);
+      if (key && !String(entry.id).startsWith('action:')) nativeCopies.set(key, (nativeCopies.get(key) ?? 0) + 1);
+    }
+    const entries = all.filter((entry) => {
+      if (!String(entry.id).startsWith('action:')) return true;
+      const key = messageKey(entry), count = nativeCopies.get(key) ?? 0;
+      if (!count) return true;
+      nativeCopies.set(key, count - 1); return false;
+    });
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
     const hint = (key, child, label, width = 18, left = 0) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
@@ -512,7 +545,7 @@ function renderPane($, e, next) {
             contents.splice(0, contents.length, Box({ key: `tool_output_${key}`, flexDirection: 'column', gap: 0, children: [...contents, rawToggle] }));
             if (state.folds.has(rawKey)) raw.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
           }
-          itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: contents }));
+          itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: contents }));
           const imagePath = entry.data?.path || entry.data?.savedPath || entry.data?.saved_path;
           const localImage = typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(imagePath);
           if (['imageView', 'imageGeneration'].includes(entry.type) && localImage) {
@@ -524,7 +557,7 @@ function renderPane($, e, next) {
           if (!String(entry.id).startsWith('action:') && !loading && ((!loaded && truncated) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`detail_${key}`, loaded?.error ? '重试' : loaded ? '更多输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0)));
         }
       }
-      if (group.integration) rows.push(Box({ key: `integration_${groupKey}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: itemRows }));
+      if (group.integration) rows.push(Box({ key: `integration_${groupKey}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: itemRows }));
       else rows.push(...itemRows);
     }
     if (page.mode !== 'live' && (page.hasNew || page.cursorStack.length)) rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: async () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.details.clear(); page.detailRequests.clear(); await poll($).catch(() => {}); await invalidate($); await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
@@ -541,12 +574,18 @@ function renderPane($, e, next) {
     const stopping = canStop && !control.draft.trim() && !control.attachments.length;
     const disabled = control.stopping || stopStatus === 'stopping' || (!stopping && (control.sending || (!control.draft.trim() && !control.attachments.length)));
     const action = e.surface === 'desktop' && typeof Client === 'function' ? Client({ key: `codex_action_${id}`, module: './action-control.js', width: 3, height: 2, props: { mode: stopping ? 'stop' : 'send', disabled, label: stopStatus === 'stopping' ? '正在停止' : stopping ? '停止' : '发送' } }) : Button({ key: `codex_action_${id}`, plain: true, label: control.sending || control.stopping || stopStatus === 'stopping' ? '…' : stopping ? '■' : '↑', onPress: control.actions.activate });
-    const right = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? hint(`codex_context_hover_${id}`, Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16 }), context.alt, 24, -11) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : []), action];
-    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', ...(e.surface === 'desktop' ? { marginTop: 'xs' } : {}), justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: right })] }));
+    const metadata = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? hint(`codex_context_hover_${id}`, Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16 }), context.alt, 24, -11) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
+    // Caption glyphs sit below the Client's title-sized circle's optical center.
+    // Move only these groups; keep the action's geometry and hit area unchanged.
+    const opticalOffset = e.surface === 'desktop' ? { marginBottom: 0.5 } : {};
+    const right = [Box({ key: `codex_composer_metadata_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', ...opticalOffset, children: metadata }), action];
+    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', ...(e.surface === 'desktop' ? { marginTop: 'xs' } : {}), justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', ...opticalOffset, children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'xs', children: right })] }));
     if (control.stopping || stopStatus === 'stopping' || stopStatus === 'stopped') composer.push(caption(`codex_stop_status_${id}`, control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'));
     if (stopStatus === 'unconfirmed') composer.push(caption(`codex_stop_notice_${id}`, '停止状态未确认，工作可能仍在进行。'));
     if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));
-    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
+    const bodyRows = e.surface === 'desktop' ? e.props?.scroll?.bodyRows : undefined;
+    const fillPane = Number.isFinite(bodyRows) && bodyRows > 0;
+    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
 }
 export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
 export async function observeUI($, result) {

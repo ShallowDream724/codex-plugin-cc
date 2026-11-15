@@ -138,7 +138,8 @@ test('start and resume expose valid native model metadata', async t => {
     if (method === 'thread/resume') return { thread: { status: { type: 'idle' } }, model: 'resumed-model', reasoningEffort: null };
   };
   const a = await spawn(); assert.equal(a.model, 'resolved-model'); assert.equal(a.reasoning_effort, 'high');
-  client.finish(a); const resumed = await c.dispatch('followup_task', { target: a.id, message: 'continue' });
+  client.finish(a); c.find(a.id).loaded = false;
+  const resumed = await c.dispatch('followup_task', { target: a.id, message: 'continue' });
   assert.equal(resumed.model, 'resumed-model'); assert.equal(resumed.reasoning_effort, 'high');
 });
 
@@ -151,7 +152,8 @@ test('permission modes and default role use explicit protocol settings', async t
     assert.equal(start.model, 'gpt-6-luna'); assert.equal(client.calls.find(x => x.method === 'turn/start').params.effort, 'medium');
     assert.deepEqual(start.dynamicTools, []); assert.equal(start.config['features.multi_agent_v2'], false); assert.equal(start.config['features.image_generation'], false);
     await assert.rejects(spawn({ role: 'default', model: 'other' }), /role default/);
-    client.finish(a); await c.dispatch('followup_task', { target: a.id, message: 'continue' });
+    client.finish(a); c.find(a.id).loaded = false;
+    await c.dispatch('followup_task', { target: a.id, message: 'continue' });
     assert.equal(client.calls.find(x => x.method === 'thread/resume').params.approvalsReviewer, reviewer);
   }
 });

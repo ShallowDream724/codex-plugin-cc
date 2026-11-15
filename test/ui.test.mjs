@@ -25,7 +25,13 @@ test('desktop Enter submits without a native button and the footer control route
     return op === 'ui_interrupt' ? { agent_id: 'a', user_control_status: 'stopped', user_paused: true } : { agent_id: 'a', status: 'steered' };
   });
   closeUI(); registerUI(on); await openAgent($, 'a');
-  const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
+  const draw = (bodyRows) => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows } } }, () => null);
+  for (const rows of [24, 40]) {
+    const tree = await draw(rows);
+    assert.equal(tree.props.minHeight, rows);
+    assert.equal(nodes(tree).find(node => node.props.key === 'codex_timeline_a').props.flexGrow, 1);
+  }
+  assert.equal((await draw()).props.minHeight, undefined);
   const input = async () => nodes(await draw()).find(node => node.type === 'Input');
   assert.equal(Object.hasOwn((await input()).props, 'submitLabel'), false);
   await (await input()).props.onSubmit(''); assert.equal(calls.length, 0);
@@ -188,16 +194,28 @@ test('unchanged revision does not redraw and stopping blocks submit while allowi
   closeUI();
 });
 
-test('activity deduplication respects message origin', async () => {
+test('activity deduplication matches origin, turn and exact content one-to-one', async () => {
   const hooks = [];
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entry = (id, type, data) => ({ id, type, data, turn_id: 't' });
-  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries: [entry('native', 'userMessage', { content: [{ text: 'same' }] }), entry('action:send:1', 'directUserMessage', { text: 'same' }), entry('action:send:2', 'parentMessage', { text: 'same' })] });
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries: [
+    entry('native', 'userMessage', { content: [{ text: 'same' }] }),
+    entry('action:send:1', 'directUserMessage', { text: 'same' }),
+    entry('action:send:2', 'parentMessage', { text: 'same' }),
+    entry('action:send:repeat', 'parentMessage', { text: 'same' }),
+    { ...entry('action:send:next-turn', 'parentMessage', { text: 'same' }), turn_id: 'next' },
+    entry('action:send:substring', 'parentMessage', { text: 'sam' }),
+    entry('native-image', 'directUserMessage', { text: '', attachments: [{ path: 'C:/a.png' }] }),
+    entry('action:send:image-a', 'directUserMessage', { text: '', attachments: [{ path: 'C:/a.png' }] }),
+    entry('action:send:image-b', 'directUserMessage', { text: '', attachments: [{ path: 'C:/b.png' }] }),
+  ] });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const tree = await hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   assert.ok(nodes(tree).some((node) => node.props.key?.includes('action:send:1')));
   assert.ok(!nodes(tree).some((node) => node.props.key?.includes('action:send:2')));
+  for (const key of ['repeat', 'next-turn', 'substring', 'image-b']) assert.ok(nodes(tree).some(node => node.props.key?.includes(`action:send:${key}`)));
+  assert.ok(!nodes(tree).some(node => node.props.key?.includes('action:send:image-a')));
   closeUI();
 });
 
@@ -248,7 +266,7 @@ test('long messages and file output support next and previous pages', async () =
   closeUI();
 });
 
-test('open file holds live entries through refresh and collapsing releases them', async () => {
+test('open file retains its detail while new live entries continue to appear', async () => {
   const hooks = [], timers = []; let revision = 1;
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
@@ -263,7 +281,9 @@ test('open file holds live entries through refresh and collapsing releases them'
   (await item('file_a:t:f:file:0')).props.onPress();
   await (await item('file_detail_a:t:f:file:0')).props.onPress();
   revision = 2; timers[0](); await new Promise((r) => setImmediate(r));
-  assert.match(JSON.stringify(await draw()), /old\.js/); assert.ok(!JSON.stringify(await draw()).includes('新活动'));
+  assert.match(JSON.stringify(await draw()), /old\.js/);
+  assert.match(JSON.stringify(await draw()), /完整输出/);
+  assert.match(JSON.stringify(await draw()), /新活动/);
   (await item('file_a:t:f:file:0')).props.onPress();
   timers[0](); await new Promise((r) => setImmediate(r));
   assert.ok(JSON.stringify(await draw()).includes('新活动'));

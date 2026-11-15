@@ -38,7 +38,7 @@ export default function ActionControl(props, surface) {
       Box({
         position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
         alignItems: 'center', justifyContent: 'center',
-        children: Text({ size: 'body', weight: 'bold', color: '#ffffff', children: mode === 'stop' ? '■' : '↑' }),
+        children: Text({ size: 'caption', weight: 'semibold', color: '#ffffff', children: mode === 'stop' ? '■' : '↑' }),
       }),
       ...(label ? [Box({
         position: 'absolute', top: -1, right: 0, paddingX: 1,

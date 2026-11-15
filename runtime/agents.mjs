@@ -418,7 +418,7 @@ export class AgentController extends EventEmitter {
     const wireInput = origin === 'user' ? directUserInput(message, attachments) : input(message);
     if (a.adopting && !existingReservation) throw new Error(`Thread ${a.threadId} is being adopted.`);
     if (a.externalConflict) throw new Error(`Thread ${a.threadId} became active in another client. Close this agent and retry adoption once the native thread is idle.`);
-    const reconciliation = await this.reconcileUnknown(a);
+    await this.reconcileUnknown(a);
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
     if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
     if (a.status === 'unknown') throw this.unknownError(a);
@@ -440,7 +440,9 @@ export class AgentController extends EventEmitter {
     a.resuming = true;
     this.reservations.delete(reservation);
     try {
-      if ((followup && !reconciliation?.resumed) || !a.loaded) {
+      // A completed turn keeps this connection's native thread loaded. Resume
+      // only after a restart/unload; repeated followups use the same writer.
+      if (!a.loaded) {
         const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
         this.updateResolved(a, response);
         if (a.externalAdopted && !a.loaded && !['idle', 'notLoaded'].includes(response?.thread?.status?.type)) {

@@ -9,6 +9,25 @@ const STDERR_TAIL_BYTES = 4096;
 const MAX_TIMER_MS = 2_147_483_647;
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const validId = (id) => typeof id === 'string' || (typeof id === 'number' && Number.isSafeInteger(id));
+const threadIdPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+
+// Only preserve recognized protocol diagnostics. Arbitrary remote message/data
+// may contain tool input, prompts, paths, or credentials and must stay private.
+function rpcDiagnostic(message) {
+  if (new RegExp(`^thread ${threadIdPattern} already has an active writer$`, 'i').test(message)) {
+    return { reason: 'thread_writer_conflict', message: 'This thread already has an active native writer. Continue through its owning Codex connection, or release the thread there before retrying.' };
+  }
+  if (new RegExp(`^no rollout found for thread id ${threadIdPattern}$`, 'i').test(message)) {
+    return { reason: 'thread_not_found', message: 'No persisted rollout was found for this thread.' };
+  }
+  if (new RegExp(`^session ${threadIdPattern} is archived\\. Run .+ to unarchive it first\\.$`, 'i').test(message)) {
+    return { reason: 'thread_archived', message: 'This thread is archived. Unarchive it in Codex before resuming.' };
+  }
+  if (message === 'cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it') {
+    return { reason: 'parent_resume_required', message: 'This native sub-agent must be resumed through its parent. Resume the parent first, or inspect the child with thread/read.' };
+  }
+  return null;
+}
 
 // npm's Windows .cmd shim cannot be spawned without a shell. Invoke its known
 // JavaScript entry point instead, keeping every argument separate from shell code.
@@ -144,7 +163,7 @@ export class AppServerClient extends EventEmitter {
         error.code = 'ETIMEDOUT';
         reject(error);
       }, timeoutMs);
-      this.#pending.set(id, { resolve, reject, timer });
+      this.#pending.set(id, { resolve, reject, timer, method });
       this.#send({ id, method, params }, () => this.#pending.has(id)).catch((error) => {
         const pending = this.#pending.get(id);
         if (!pending) return;
@@ -248,10 +267,12 @@ export class AppServerClient extends EventEmitter {
     clearTimeout(pending.timer);
     if (hasOwn(message, 'error')) {
       const rpc = message.error;
-      // Do not echo remote error text/data: either can contain prompt or secrets.
-      const error = new Error(`App-server request failed (RPC ${Number.isInteger(rpc?.code) ? rpc.code : 'error'}).`);
+      const diagnostic = rpcDiagnostic(rpc.message);
+      const error = new Error(`App-server ${pending.method} failed (RPC ${rpc.code}).${diagnostic ? ` ${diagnostic.message}` : ''}`);
       error.code = rpc?.code;
       error.rpcCode = rpc?.code;
+      error.rpcMethod = pending.method;
+      if (diagnostic) error.reason = diagnostic.reason;
       pending.reject(error);
     } else pending.resolve(message.result);
   }

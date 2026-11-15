@@ -96,6 +96,7 @@ test('returns results, RPC error codes and handles server requests including id 
     await assert.rejects(client.request('bad'), (error) => {
       assert.equal(error.rpcCode, -32001);
       assert.equal(error.code, -32001);
+      assert.equal(error.rpcMethod, 'bad');
       assert.doesNotMatch(error.message, /SECRET/);
       assert.equal(error.data, undefined);
       return true;
@@ -109,6 +110,26 @@ test('returns results, RPC error codes and handles server requests including id 
       { id: 0, result: { decision: 'decline' } },
       { id: 'server-id', error: { code: -32601, message: 'Unsupported request' } },
     ]);
+  } finally { await client.close(); }
+});
+
+test('writer conflicts identify the rejected RPC and actionable reason without exposing remote payloads', async () => {
+  const threadId = '01a1de5d-17da-7630-928e-dc05db8288a1';
+  const { client } = fixture({ handle(frame, child) {
+    if (frame.method === 'thread/resume') child.stdout.write(`${JSON.stringify({ id: frame.id,
+      error: { code: -32600, message: `thread ${threadId} already has an active writer`, data: { token: 'SECRET KEY', input: 'SECRET PROMPT' } } })}\n`);
+  } });
+  await client.start();
+  try {
+    await assert.rejects(client.request('thread/resume', { threadId }), error => {
+      assert.equal(error.code, -32600); assert.equal(error.rpcMethod, 'thread/resume');
+      assert.equal(error.reason, 'thread_writer_conflict');
+      assert.match(error.message, /thread\/resume.*RPC -32600/);
+      assert.match(error.message, /active native writer.*owning Codex connection/);
+      assert.doesNotMatch(JSON.stringify(error) + error.message, /SECRET|token|input/);
+      assert.equal(error.data, undefined);
+      return true;
+    });
   } finally { await client.close(); }
 });
 
