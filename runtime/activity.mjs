@@ -165,9 +165,9 @@ export class ActivityStore {
     return item;
   }
   remember(map, key, value) { map.delete(key); map.set(key, value); if (map.size > 256) map.delete(map.keys().next().value); }
-  stage(item, threadId, turnId) {
-    if (item.completedAtMs != null || this.turnStates.get(`${threadId}:${turnId}`) === 'completed') return 'completed';
-    return item.startedAtMs != null ? 'started' : undefined;
+  stage(item, threadId, turnId, entry = item) {
+    if (entry.completedAtMs != null || item.completedAtMs != null || this.turnStates.get(`${threadId}:${turnId}`) === 'completed') return 'completed';
+    return entry.startedAtMs != null || item.startedAtMs != null ? 'started' : undefined;
   }
   observe(message) {
     const p = message?.params ?? {};
@@ -215,7 +215,7 @@ export class ActivityStore {
       if (!turnId) return { agent: this.summary(agent), entries: [], next_cursor: null };
     }
     const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
-    const entries = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId))).reverse();
+    const entries = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry))).reverse();
     const next_cursor = page.nextCursor ? { turn_id: turnId, items_cursor: page.nextCursor, turns_cursor: turnsCursor } : turnsCursor ? { turns_cursor: turnsCursor } : null;
     return { agent: this.summary(agent), entries, next_cursor };
   }

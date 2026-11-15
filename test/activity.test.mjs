@@ -49,6 +49,19 @@ test('live cache excludes descendant and reasoning events and never touches pend
   store.close();
 });
 
+test('saved compaction stages use native entry timing when the live cache is absent', async () => {
+  const { client, store } = fixture();
+  client.request = async method => method === 'thread/turns/list'
+    ? { data: [{ id: 'turn' }], nextCursor: null }
+    : { data: [
+      { turnId: 'turn', startedAtMs: 1000, completedAtMs: 2000, item: { id: 'done', type: 'contextCompaction' } },
+      { turnId: 'turn', startedAtMs: 3000, completedAtMs: null, item: { id: 'active', type: 'contextCompaction' } },
+    ], nextCursor: null };
+  const result = await store.history({ target: 'a' });
+  assert.equal(result.entries.find(entry => entry.id === 'done').data.stage, 'completed');
+  assert.equal(result.entries.find(entry => entry.id === 'active').data.stage, 'started');
+});
+
 test('previews bound deep data and image payloads while details format native items', async () => {
   const { store, client, controller } = fixture();
   const payload = 'A'.repeat(50000);

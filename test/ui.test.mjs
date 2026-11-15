@@ -44,6 +44,7 @@ test('direct controls preserve per-agent drafts and scope late results', async (
   connect($, async (_$, op, args, request) => {
     if (op === 'ui_list') return { agents };
     if (op === 'ui_revision') return { entries: [] };
+    if (op === 'ui_history') return { entries: [], next_cursor: null };
     requests.push(request);
     return new Promise((resolve) => { pending[op] = resolve; });
   });
@@ -115,7 +116,7 @@ test('attachments stay scoped to drafts and uncertain or edited sends preserve t
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   const item = async (key) => nodes(await draw()).find((node) => node.props.key?.startsWith(key));
-  assert.equal(pickerCount, 0); assert.match(JSON.stringify(await draw()), /上下文 50%/);
+  assert.equal(pickerCount, 0); assert.match(JSON.stringify(await draw()), /◔ 50%/);
   await (await item('codex_attach_a')).props.onPress();
   (await item('attachment_path_a')).props.onSubmit('C:/docs/a.png');
   await openAgent($, 'b'); assert.ok(!JSON.stringify(await draw()).includes('a.png'));
@@ -353,8 +354,8 @@ test('late details from a previous selection are discarded', async () => {
   };
   closeUI(); connect($, bridge); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
-  tree = await draw(); nodes(tree).find((x) => x.props.key?.includes('item_a:t:a')).props.onPress();
+  let tree = await draw();
+  tree = await draw(); nodes(tree).find((x) => x.props.key === 'item_a:t:a').props.onPress();
   tree = await draw(); const pending = nodes(tree).find((x) => x.props.label === '获取更多').props.onPress();
   await openAgent($, 'b'); await new Promise((r) => setImmediate(r));
   deferred.resolve({ text: 'old response', next_offset: null }); await pending;
@@ -373,8 +374,8 @@ test('large detail pages can be navigated in both directions', async () => {
   };
   closeUI(); connect($, bridge); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
-  tree = await draw(); nodes(tree).find((x) => x.props.key?.includes('item_a:t:cmd')).props.onPress();
+  let tree = await draw();
+  tree = await draw(); nodes(tree).find((x) => x.props.key === 'item_a:t:cmd').props.onPress();
   tree = await draw(); await nodes(tree).find((x) => x.props.label === '获取更多').props.onPress();
   tree = await draw(); await nodes(tree).find((x) => x.props.label === '下一页输出').props.onPress();
   tree = await draw(); assert.ok(JSON.stringify(tree).includes('Page 16000'));
@@ -520,5 +521,54 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   tree = await draw();
   assert.equal(nodes(tree).find((node) => node.props.key === 'detail_a:t:tool'), undefined);
   assert.deepEqual(nodes(tree).filter((node) => node.type === 'Code').map((node) => node.props.source), ['complete short output']);
+  closeUI();
+});
+
+test('an empty live cache restores saved latest history once and skips a newly starting agent', async () => {
+  const hooks = [], timers = [], historyCalls = [], writes = [];
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async (_ref, value) => { writes.push(value); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
+  const agents = [{ agent_id: 'saved', status: 'completed' }, { agent_id: 'new', status: 'starting' }];
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents };
+    if (op === 'ui_revision') return { revision: 1, entries: [] };
+    if (op === 'ui_history') { historyCalls.push(args); return { entries: [{ id: args.cursor ? 'older' : 'recent', type: 'agentMessage', turn_id: 't', data: { text: args.cursor ? 'older saved message' : 'recent saved message' } }], next_cursor: args.cursor ? null : { turns_cursor: 'older' } }; }
+  });
+  closeUI(); registerUI(on); await openAgent($, 'saved');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  assert.match(JSON.stringify(await draw()), /recent saved message/);
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_attach_saved').props.label, '+');
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_paste_saved').props.label, '📋');
+  writes.length = 0;
+  for (let i = 0; i < 3; i++) { await timers[0](); await observeUI($, { agents }); }
+  assert.equal(historyCalls.length, 1); assert.equal(writes.length, 0);
+  assert.match(JSON.stringify(await draw()), /recent saved message/);
+  await nodes(await draw()).find((node) => node.props.key === 'codex_older').props.onPress();
+  assert.deepEqual(historyCalls[1].cursor, { turns_cursor: 'older' });
+  assert.match(JSON.stringify(await draw()), /older saved message/);
+  await nodes(await draw()).find((node) => node.props.key === 'codex_latest').props.onPress();
+  assert.match(JSON.stringify(await draw()), /recent saved message/);
+  await openAgent($, 'new'); assert.equal(historyCalls.length, 2);
+  closeUI();
+});
+
+test('history actions, input boundaries and polling await the asynchronous pane refresh', async () => {
+  const hooks = [], timers = [], pending = []; let delay = false, revision = 1;
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async () => { if (delay) await new Promise((resolve) => pending.push(resolve)); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : { revision, entries: [{ id: 'm', turn_id: 't', type: 'agentMessage', data: { text: op === 'ui_history' ? 'saved history' : 'live message' } }], next_cursor: null });
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  delay = true; let completed = false;
+  const action = nodes(await draw()).find((node) => node.props.key === 'codex_older').props.onPress().then(() => { completed = true; });
+  await new Promise((r) => setImmediate(r)); assert.equal(completed, false); assert.equal(pending.length, 1);
+  pending.shift()(); await new Promise((r) => setImmediate(r)); assert.equal(completed, false); assert.equal(pending.length, 1);
+  pending.shift()(); await action; assert.equal(completed, true); assert.match(JSON.stringify(await draw()), /saved history/);
+  completed = false;
+  const input = nodes(await draw()).find((node) => node.type === 'Input').props.onInput('x').then(() => { completed = true; });
+  await new Promise((r) => setImmediate(r)); assert.equal(completed, false); pending.shift()(); await input;
+  revision = 2; completed = false;
+  const tick = timers[0]().then(() => { completed = true; });
+  await new Promise((r) => setImmediate(r)); assert.equal(completed, false); pending.shift()(); await tick;
   closeUI();
 });

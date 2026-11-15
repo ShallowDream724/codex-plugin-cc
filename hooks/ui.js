@@ -1,6 +1,7 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
 import { agentIcon, retainIcons, clearIcons } from './presentation.js';
 import { toolSections } from './tool-presentation.js';
+import { activityIcon, contextIndicator } from './tool-icons.js';
 
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
@@ -52,7 +53,7 @@ function changeLabel(change) {
   const added = lines.filter((line) => line.startsWith('+') && !line.startsWith('+++')).length;
   const removed = lines.filter((line) => line.startsWith('-') && !line.startsWith('---')).length;
   const hasCounts = Number.isInteger(change.added) && Number.isInteger(change.removed);
-  return `✎ 已编辑 ${safe(change.path || '文件')}${hasCounts ? ` +${change.added} -${change.removed}` : lines.length ? ` +${added} -${removed}` : ''}`;
+  return `已编辑 ${safe(change.path || '文件')}${hasCounts ? ` +${change.added} -${change.removed}` : lines.length ? ` +${added} -${removed}` : ''}`;
 }
 // Only complete unified hunks are passed as diffs; bounded previews and output
 // pages may end mid-hunk and are still readable as ordinary code.
@@ -151,20 +152,20 @@ function updateAgent(id, fields) {
 async function stopAgent($, id) {
   const control = controlFor(id);
   if (control.stopping) return;
-  control.stopping = true; control.stopEpoch++; control.mutationEpoch++; updateAgent(id, { user_control_status: 'stopping' }); invalidate($);
+  control.stopping = true; control.stopEpoch++; control.mutationEpoch++; updateAgent(id, { user_control_status: 'stopping' }); await invalidate($);
   try {
     const result = await bridge($, 'ui_interrupt', { target: id }, { requestId: actionId() });
     const status = result.user_control_status ?? result.status;
     const known = ['stopping', 'stopped', 'unconfirmed'].includes(status);
     if (state.controls.get(id) === control) updateAgent(id, { ...(typeof result.user_paused === 'boolean' ? { user_paused: result.user_paused } : known ? { user_paused: true } : {}), user_control_status: known ? status : 'unconfirmed' });
   } catch { if (state.controls.get(id) === control) updateAgent(id, { user_control_status: 'unconfirmed' }); }
-  finally { control.stopping = false; if (state.opened && state.selected === id) invalidate($); }
+  finally { control.stopping = false; if (state.opened && state.selected === id) await invalidate($); }
 }
 async function sendAgent($, id) {
   const control = controlFor(id), message = control.draft, attachments = [...control.attachments], attachmentVersion = control.attachmentVersion, stopEpoch = control.stopEpoch;
   const selected = state.agents.find((agent) => idOf(agent) === id);
   if (control.sending || control.stopping || selected?.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
-  control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; invalidate($);
+  control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; await invalidate($);
   try {
     const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
     if (result.error || result.offline) {
@@ -176,7 +177,7 @@ async function sendAgent($, id) {
       if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
     } else control.sendResult = '发送状态未知，请查看活动后再试。';
   } catch (error) { control.sendResult = `发送状态未知：${safe(error?.message || error).slice(0, 600)}。请查看活动后再试，草稿已保留。`; }
-  finally { control.sending = false; if (state.opened && state.selected === id) invalidate($); }
+  finally { control.sending = false; if (state.opened && state.selected === id) await invalidate($); }
 }
 function addAttachments(control, paths) {
   const additions = paths.filter((path) => typeof path === 'string' && path.trim());
@@ -189,7 +190,7 @@ function addAttachments(control, paths) {
 async function chooseAttachments($, id, source = 'file') {
   const control = controlFor(id);
   if (control.picking) return;
-  control.picking = true; control.attachmentNotice = ''; invalidate($);
+  control.picking = true; control.attachmentNotice = ''; await invalidate($);
   try {
     const result = await (source === 'clipboard' ? pasteAttachments($) : pickFiles($));
     if (state.controls.get(id) !== control) return;
@@ -200,10 +201,10 @@ async function chooseAttachments($, id, source = 'file') {
     else if (result.error) control.attachmentNotice = '无法选择文件，请输入文件路径。', control.pathEntry = true;
     else if (Array.isArray(result.paths)) addAttachments(control, result.paths);
   } catch { if (state.controls.get(id) === control) { control.pathEntry = source !== 'clipboard'; control.attachmentNotice = source === 'clipboard' ? '无法读取剪贴板，请添加文件。' : '无法选择文件，请输入文件路径。'; } }
-  finally { control.picking = false; if (state.opened && state.selected === id) invalidate($); }
+  finally { control.picking = false; if (state.opened && state.selected === id) await invalidate($); }
 }
   const pageFor = (id) => {
-    if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, busy: false, historyGeneration: 0, detailGeneration: 0, detail: null });
+    if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, restoreAttempted: false, restoredHistory: false, latestCursor: null, busy: false, historyGeneration: 0, detailGeneration: 0, detail: null });
     const page = state.pages.get(id); state.pages.delete(id); state.pages.set(id, page);
     while (state.pages.size > 16) {
       const old = state.pages.keys().next().value; state.pages.delete(old); state.scroll.delete(old);
@@ -219,7 +220,7 @@ async function chooseAttachments($, id, source = 'file') {
   function invalidate($) {
     // Reading this key in the pane renderer subscribes only that render site.
     // Event-wide invalidation also rebuilds the host conversation's tool rows.
-    void $.state.set(PANE_REVISION, ++paneRevision).catch(() => {});
+    return $.state.set(PANE_REVISION, ++paneRevision).catch(() => {});
   }
   async function poll($) {
     const id = state.selected, gen = state.generation;
@@ -231,16 +232,27 @@ async function chooseAttachments($, id, source = 'file') {
       const result = await bridge($, 'ui_revision', { target: id, revision: page.revision });
       if (!state.opened || state.selected !== id || state.generation !== gen || result.error || result.offline) return;
       const changed = result.agent && control.mutationEpoch === mutationEpoch && !control.stopping && !control.sending && updateAgent(id, result.agent);
+      const selected = state.agents.find((agent) => idOf(agent) === id);
+      if (page.mode === 'live' && Array.isArray(result.entries) && !result.entries.length && !page.restoreAttempted && !page.loaded && selected?.status !== 'starting') {
+        page.restoreAttempted = true;
+        const saved = await bridge($, 'ui_history', { target: id }).catch(() => ({ error: true }));
+        if (!state.opened || state.selected !== id || state.generation !== gen) return;
+        if (!saved.error && !saved.offline && saved.entries?.length) {
+          page.live = saved.entries; page.revision = result.revision; page.latestCursor = saved.next_cursor;
+          page.loaded = true; page.restoredHistory = true; await invalidate($); return;
+        }
+      }
       if (result.entries && result.revision !== page.revision && (page.mode !== 'live' || !reading(id, page))) {
         if (page.mode !== 'live') page.hasNew = true;
-        page.revision = result.revision; page.live = result.entries;
-        invalidate($);
-      } else if (changed) invalidate($);
+        page.revision = result.revision;
+        if (!page.restoredHistory || result.entries.length) { page.live = result.entries; page.restoredHistory = false; }
+        await invalidate($);
+      } else if (changed) await invalidate($);
     } finally { page.busy = false; }
   }
   async function history($, id, direction = 'latest') {
     const page = pageFor(id), gen = state.generation, request = ++page.historyGeneration;
-    if (page.mode === 'live') { page.mode = 'history'; page.entries = []; page.cursor = null; page.cursorStack = []; page.stackTruncated = false; page.loaded = false; invalidate($); }
+    if (page.mode === 'live') { page.mode = 'history'; page.entries = []; page.cursor = direction === 'older' ? page.latestCursor : null; page.cursorStack = []; page.stackTruncated = false; page.loaded = false; await invalidate($); }
     let stack = direction === 'older' ? [...page.cursorStack, page.cursor] : direction === 'newer' ? page.cursorStack.slice(0, -1) : [];
     let truncated = direction === 'latest' ? false : page.stackTruncated;
     if (direction === 'older' && !page.cursor) return;
@@ -251,15 +263,15 @@ async function chooseAttachments($, id, source = 'file') {
       if (!state.opened || state.selected !== id || state.generation !== gen || request !== page.historyGeneration) return;
       if (result.error || result.offline) throw new Error('无法获取历史记录');
       page.mode = 'history'; page.entries = result.entries || []; page.cursorStack = stack; page.stackTruncated = truncated; page.detail = null;
-      page.cursor = result.next_cursor; page.loaded = true; page.error = null; invalidate($);
-    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) { page.error = String(error.message || error); invalidate($); } }
+      page.cursor = result.next_cursor; page.loaded = true; page.error = null; await invalidate($);
+    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) { page.error = String(error.message || error); await invalidate($); } }
   }
   async function select($, id) {
     state.selected = id; state.generation++; state.restore = true;
     const page = pageFor(id);
-    if (page.mode === 'live') void poll($).catch(() => {});
-    else if (!page.loaded) void history($, id);
-    invalidate($);
+    if (page.mode === 'live') await poll($).catch(() => {});
+    else if (!page.loaded) await history($, id);
+    await invalidate($);
   }
   export async function openAgent($, id) {
     state.opened = true; const gen = ++state.generation;
@@ -274,8 +286,8 @@ async function chooseAttachments($, id, source = 'file') {
     const result = await $.ui.open({ id: PANE, title: 'Codex 代理', focus: true, closeOnEscape: true, rows: 24 });
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
-    if (state.restore) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
-    if (!state.timer) state.timer = $.clock.every(1000, () => { void poll($).catch(() => {}); });
+    if (state.restore) await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
+    if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath) {
     const page = pageFor(id), key = entryKey(entry), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailGeneration;
@@ -283,7 +295,7 @@ async function chooseAttachments($, id, source = 'file') {
     if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || request !== page.detailGeneration || !state.folds.has(foldKey)) return;
     if (result.error || result.offline) page.detail = { key, filePath, text: '无法获取完整内容', error: true, next_offset: null, offset };
     else page.detail = { key, filePath, text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line };
-    invalidate($);
+    await invalidate($);
   }
 export function registerUI(on) {
   on('command.run', { command: 'codex-agents' }, async ($) => {
@@ -317,7 +329,7 @@ export function registerUI(on) {
 }
 function renderPane($, e, next) {
     if (e.requestId !== PANE) return next(e);
-    const { Box, Text, Button, Input, Markdown, Image, Code } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
+    const { Box, Text, Button, Input, Markdown, Image, Code, Svg } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
     const all = page.mode === 'history' ? page.entries : page.live;
     // The action gives immediate feedback while native history catches up. Once
     // the same message is persisted, retain the native copy for pagination.
@@ -326,7 +338,11 @@ function renderPane($, e, next) {
     const entries = all.filter((entry) => !String(entry.id).startsWith('action:') || !['parentMessage', 'directUserMessage'].includes(entry.type) || !(entry.type === 'parentMessage' ? nativeParent : nativeUser).some((text) => entry.data?.text && text.includes(entry.data.text)));
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
-    const disclosure = (key, label, onPress) => Button({ key, plain: true, label, children: [caption(`${key}:label`, label)], onPress });
+    const iconFor = (key, icon) => e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key, source: icon.source, alt: icon.alt, width: 14, height: 14 }) : caption(key, icon.glyph);
+    const disclosure = (key, label, onPress, entry, integration = false) => {
+      const button = Button({ key, plain: true, dimColor: true, label, onPress });
+      return entry ? Box({ key: `row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${key}`, activityIcon(entry, integration)), button] }) : button;
+    };
     const sourceCode = (key, source) => typeof Code === 'function' ? Code({ key, source: safe(source), format: 'source', wrap: 'wrap' }) : Text({ key, mono: true, size: 'caption', children: [safe(source)] });
     const selected = state.agents.find((a) => idOf(a) === id);
     const stopStatus = selected?.user_control_status;
@@ -334,7 +350,7 @@ function renderPane($, e, next) {
     // draft without invalidating the pane or the host conversation.
     control.actions ??= {
       stop: () => stopAgent($, id), attach: () => chooseAttachments($, id), paste: () => chooseAttachments($, id, 'clipboard'),
-      input: (value) => { const wasEmpty = !control.draft.trim(); control.draft = value; if (wasEmpty !== !value.trim()) invalidate($); },
+      input: (value) => { const wasEmpty = !control.draft.trim(); control.draft = value; if (wasEmpty !== !value.trim()) return invalidate($); },
       submit: (value) => {
         control.draft = value;
         const agent = state.agents.find((item) => idOf(item) === id);
@@ -343,15 +359,17 @@ function renderPane($, e, next) {
       },
     };
     const canStop = interruptible(selected);
-    const model = [selected?.model, selected?.reasoning_effort].filter(Boolean).join(' · ');
+    const friendlyModel = (selected?.model || '').replace(/^gpt-([\d.]+)-(.+)$/, (_all, version, name) => `GPT-${version} ${name.split('-').map((word) => word[0].toUpperCase() + word.slice(1)).join(' ')}`);
+    const effort = selected?.reasoning_effort ? selected.reasoning_effort[0].toUpperCase() + selected.reasoning_effort.slice(1) : '';
+    const model = [friendlyModel, effort].filter(Boolean).join(' · ');
     navigation.push(Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [`${agentIcon(id)} ${safe(selected?.name || id || 'Codex')}`] }));
-    if (page.mode === 'live' || page.cursor) navigation.push(disclosure('codex_older', '更早消息', () => history($, id, page.mode === 'live' ? 'latest' : 'older')));
+    if ((page.mode === 'live' && (!page.restoredHistory || page.latestCursor)) || (page.mode !== 'live' && page.cursor)) navigation.push(disclosure('codex_older', '更早消息', () => history($, id, page.mode === 'live' && !page.latestCursor ? 'latest' : 'older')));
     if (page.error) navigation.push(caption('codex_history_error', page.error));
     for (const group of groupEntries(entries)) {
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
       if (group.items.length > 1 || group.integration) {
         const groupLabel = group.integration ? `已使用 ${safe(group.integration)} 集成` : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
-        rows.push(disclosure(`group_${groupKey}`, `${groupLabel}${!group.integration ? ` (${group.items.length})` : ''} ${folded ? '▸' : '▾'}`, () => { toggle(groupKey); invalidate($); }));
+        rows.push(disclosure(`group_${groupKey}`, `${groupLabel}${!group.integration ? ` (${group.items.length})` : ''} ${folded ? '▸' : '▾'}`, () => { toggle(groupKey); return invalidate($); }, first, Boolean(group.integration)));
         if (folded) continue;
       }
       const itemRows = [];
@@ -361,7 +379,7 @@ function renderPane($, e, next) {
           itemRows.push(caption(`activity_${id}:${entryKey(entry)}`, `${agentIcon(target)} ${description(entry)}`));
           continue;
         }
-        if (entry.type === 'contextCompaction') { itemRows.push(caption(`activity_${id}:${entryKey(entry)}`, description(entry))); continue; }
+        if (entry.type === 'contextCompaction') { itemRows.push(Box({ key: `activity_${id}:${entryKey(entry)}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${id}:${entryKey(entry)}`, activityIcon(entry)), caption(`activity_label_${id}:${entryKey(entry)}`, description(entry))] })); continue; }
         const key = `${id}:${entryKey(entry)}`, expanded = state.folds.has(key);
         if (['agentMessage', 'userMessage', 'parentMessage', 'directUserMessage', 'plan'].includes(entry.type)) {
           const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
@@ -374,7 +392,7 @@ function renderPane($, e, next) {
           if (attachments.length) message.push(caption(`attachments_${key}`, attachments.map((part) => `附件：${part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件'}`).join('  ')));
           if (loaded?.offset > 0) message.push(disclosure(`message_prev_${key}`, '上一页正文', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
           if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) message.push(disclosure(`item_${key}`, loaded ? '下一页正文' : '展开全文', () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); }));
-          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { width: '85%', borderStyle: 'round', borderDimColor: true, padding: 1 } : { width: '100%', paddingY: 1 }), children: message });
+          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { width: '85%', borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: 1 }), children: message });
           itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', justifyContent: incoming ? 'flex-end' : 'flex-start', children: [content] }));
           continue;
         }
@@ -382,7 +400,7 @@ function renderPane($, e, next) {
         if (entry.type === 'fileChange' && Array.isArray(fileList) && fileList.length) {
           fileList.forEach((change, index) => {
             const fileKey = `${key}:file:${index}`, open = state.folds.has(fileKey);
-            itemRows.push(disclosure(`file_${fileKey}`, `${changeLabel(change)} ${open ? '▾' : '▸'}`, () => { toggle(fileKey); invalidate($); }));
+            itemRows.push(disclosure(`file_${fileKey}`, `${changeLabel(change)} ${open ? '▾' : '▸'}`, () => { toggle(fileKey); return invalidate($); }, entry));
             const diff = entry.data?.changes?.find((item) => item.path === change.path)?.diff ?? change.diff;
             if (open) {
               const filePath = typeof change.path === 'string' ? change.path : '';
@@ -400,7 +418,7 @@ function renderPane($, e, next) {
           });
           continue;
         }
-        itemRows.push(disclosure(`item_${key}`, `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, () => { toggle(key); if (expanded) page.detailGeneration++; invalidate($); }));
+        itemRows.push(disclosure(`item_${key}`, `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, () => { toggle(key); if (expanded) page.detailGeneration++; return invalidate($); }, entry));
         if (expanded) {
           const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
           const sections = loaded ? [{ label: '输出', source: loaded.text }] : toolSections(entry);
@@ -410,7 +428,7 @@ function renderPane($, e, next) {
           if (!contents.length) contents.push(sections.length ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
           if (raw.length) {
             const rawKey = `${key}:raw`;
-            contents.push(disclosure(`tool_raw_${key}`, `‹/› 原始调用 ${state.folds.has(rawKey) ? '▾' : '▸'}`, () => { toggle(rawKey); invalidate($); }));
+            contents.push(disclosure(`tool_raw_${key}`, `‹/› 原始调用 ${state.folds.has(rawKey) ? '▾' : '▸'}`, () => { toggle(rawKey); return invalidate($); }));
             if (state.folds.has(rawKey)) raw.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
           }
           itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: contents }));
@@ -428,24 +446,25 @@ function renderPane($, e, next) {
       if (group.integration) rows.push(Box({ key: `integration_${groupKey}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: itemRows }));
       else rows.push(...itemRows);
     }
-    if (page.mode !== 'live') rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.detail = null; void poll($).catch(() => {}); invalidate($); void $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
-    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => disclosure(`attachment_${id}_${index}`, `${safe(path.split(/[\\/]/).at(-1) || path)} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; invalidate($); })) }));
-    if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; invalidate($); } }));
+    if (page.mode !== 'live' && (page.hasNew || page.cursorStack.length)) rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: async () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.detail = null; await poll($).catch(() => {}); await invalidate($); await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
+    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => disclosure(`attachment_${id}_${index}`, `${safe(path.split(/[\\/]/).at(-1) || path)} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); })) }));
+    if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; return invalidate($); } }));
     if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
     composer.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '…' : control.stopping || stopStatus === 'stopping' ? '…' : canStop && !control.draft.trim() && !control.attachments.length ? '■' : '↑', onInput: control.actions.input, onSubmit: control.actions.submit }));
     const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
     const used = selected?.context_used_tokens, limit = selected?.context_limit_tokens;
-    const context = Number.isFinite(used) && used >= 0 && Number.isFinite(limit) && limit > 0 ? `上下文 ${Math.round(used / limit * 100)}%` : '';
-    const paste = Box({ key: `codex_paste_hover_${id}`, position: 'relative', children: [Button({ key: `codex_paste_${id}`, plain: true, label: '粘贴图片或文件', children: [caption(`codex_paste_icon_${id}`, '📋')], onPress: control.actions.paste }), Box({ position: 'absolute', top: -2, left: 0, width: 20, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: ['粘贴图片或文件'] })] })] });
-    const footer = [Button({ key: `codex_attach_${id}`, plain: true, label: '添加文件', children: [caption(`codex_attach_icon_${id}`, control.picking ? '…' : '+')], onPress: control.actions.attach }), paste, ...(permission ? [caption(`codex_permissions_${id}`, permission)] : []), ...(context ? [caption(`codex_context_${id}`, context)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
-    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', alignItems: 'center', children: footer }));
+    const context = contextIndicator(used, limit);
+    const paste = Box({ key: `codex_paste_hover_${id}`, position: 'relative', children: [Button({ key: `codex_paste_${id}`, plain: true, dimColor: true, label: '📋', onPress: control.actions.paste }), Box({ position: 'absolute', top: -2, left: 0, width: 20, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: ['粘贴图片或文件'] })] })] });
+    const left = [Button({ key: `codex_attach_${id}`, plain: true, dimColor: true, label: control.picking ? '…' : '+', onPress: control.actions.attach }), paste, ...(permission ? [caption(`codex_permissions_${id}`, permission)] : [])];
+    const right = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16, isInteractive: true }) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
+    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: right })] }));
     if (control.stopping || stopStatus === 'stopping' || stopStatus === 'stopped') composer.push(caption(`codex_stop_status_${id}`, control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'));
     if (stopStatus === 'unconfirmed') composer.push(caption(`codex_stop_notice_${id}`, '停止状态未确认，工作可能仍在进行。'));
     if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));
-    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1, children: composer })] });
+    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', gap: 'sm', ...(e.surface === 'desktop' ? { paddingY: 1 } : { borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
 }
 export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; clearIcons(); }
-export function observeUI($, result) {
+export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);
     state.agents = summaries(result.agents);
@@ -456,5 +475,5 @@ export function observeUI($, result) {
       state.pages.delete(id); state.scroll.delete(id);
       for (const key of state.folds) if (key.startsWith(`${id}:`)) state.folds.delete(key);
     }
-    if (state.opened && before !== JSON.stringify(state.agents)) invalidate($);
+    if (state.opened && before !== JSON.stringify(state.agents)) await invalidate($);
 }
