@@ -173,6 +173,25 @@ async function observe($) {
   } finally { observing = false; }
 }
 
+async function handleAppend($, e, next) {
+  const options = { tool: e.door === 'tool-result' && e.origin?.kind === 'tool' && e.origin.tool === WAIT_TOOL, prompt: e.door === 'prompt' };
+  const candidates = messageDeliveries(e.message, options).filter(delivery => deliveries.has(delivery.delivery_id));
+  const message = filterClosed(e.message, options, closedAgents);
+  const result = await next(message === e.message ? e : { ...e, message });
+  if (!candidates.length) return result;
+  const retained = result?.deny ? [] : messageDeliveries(result?.message, options);
+  for (const candidate of candidates) {
+    const expected = deliveries.get(candidate.delivery_id);
+    const sequences = expected?.signal?.aborted ? [] : retained.filter(delivery => delivery.delivery_id === candidate.delivery_id).flatMap(delivery => retainedSequences(delivery, expected));
+    if (sequences.length) {
+      try {
+        await confirm($, candidate.delivery_id, expected.events.filter(event => sequences.includes(event.seq)));
+      } catch { /* The retained transcript recovers this delivery on restart. */ }
+    } else await release($, candidate.delivery_id);
+  }
+  return result;
+}
+
 export function register(on, options = {}) {
   configureBridge(options);
   registerUI(on);
@@ -191,24 +210,8 @@ export function register(on, options = {}) {
     catch { /* A conflicting command does not prevent tool and clickable-row use. */ }
     return next(e);
   });
-  on('session.append', async ($, e, next) => {
-    const options = { tool: e.door === 'tool-result' && e.origin?.kind === 'tool' && e.origin.tool === WAIT_TOOL, prompt: e.door === 'prompt' };
-    const candidates = messageDeliveries(e.message, options).filter(delivery => deliveries.has(delivery.delivery_id));
-    const message = filterClosed(e.message, options, closedAgents);
-    const result = await next(message === e.message ? e : { ...e, message });
-    if (!candidates.length) return result;
-    const retained = result?.deny ? [] : messageDeliveries(result?.message, options);
-    for (const candidate of candidates) {
-      const expected = deliveries.get(candidate.delivery_id);
-      const sequences = expected?.signal?.aborted ? [] : retained.filter(delivery => delivery.delivery_id === candidate.delivery_id).flatMap(delivery => retainedSequences(delivery, expected));
-      if (sequences.length) {
-        try {
-          await confirm($, candidate.delivery_id, expected.events.filter(event => sequences.includes(event.seq)));
-        } catch { /* The retained transcript recovers this delivery on restart. */ }
-      } else await release($, candidate.delivery_id);
-    }
-    return result;
-  });
+  on('session.append', { door: 'tool-result', origin: { kind: 'tool', tool: WAIT_TOOL } }, handleAppend);
+  on('session.append', { door: 'prompt' }, handleAppend);
   on('turn.start', ($, e, next) => {
     if (!e.agentId) busyTurns.add(e.turnId);
     return next(e);

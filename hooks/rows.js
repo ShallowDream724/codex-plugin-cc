@@ -32,7 +32,13 @@ export function describeCall(tool, input = {}, output, isRunning = false) {
   if (!tool?.startsWith(PREFIX)) return null;
   const operation = tool.slice(PREFIX.length), value = parseDisplayResult(output);
   if (output !== undefined && value === null) return null;
-  if (value?.error) return [{ kind: 'error', text: 'Codex 请求失败', id: value.error.agent_id }];
+  if (value?.error) {
+    const error = value.error;
+    const message = ['helper_restart_required', 'bridge_version_mismatch'].includes(error.code)
+      ? '插件已更新，重启 Claude 后继续原对话'
+      : typeof error === 'string' ? error : error.message || error.code;
+    return [{ kind: 'error', text: `Codex 请求失败${message ? `：${message}` : ''}`, id: error.agent_id }];
+  }
   if (operation === 'wait_agent') {
     if (Array.isArray(value?.events) && value.events.length) return value.events.map(event => ({ id: event.agent_id, name: event.name, kind: event.kind, text: eventText(event) }));
     return [{ text: isRunning ? '正在等待 Codex' : value?.idle ? 'Codex 空闲' : value?.timed_out ? '等待结束，代理继续工作' : value?.cancelled ? '已取消等待，代理继续工作' : '等待 Codex 更新' }];
@@ -40,7 +46,7 @@ export function describeCall(tool, input = {}, output, isRunning = false) {
   if (operation === 'spawn_agent' || operation === 'followup_task') return [{ id: value?.agent_id, name: value?.name || input?.name, text: isRunning ? '正在启动' : operation === 'spawn_agent' ? '开始工作' : '已收到任务' }];
   if (operation === 'list_agents' && Array.isArray(value?.agents)) return value.agents.map(agent => ({ id: agent.agent_id || agent.id, name: agent.name, text: ({ running: '工作中', starting: '正在启动', waiting: '等待中', completed: '已完成', interrupted: '本轮已停止', failed: '失败', unknown: '状态未知', compacting: '正在整理上下文' })[agent.status] || '已保存' }));
   if (operation === 'close_agent') return [{ text: isRunning ? '正在关闭代理' : value?.closed_count !== undefined ? `已关闭 ${value.closed_count} 个代理${value.skipped?.length ? `，保留 ${value.skipped.length} 个` : ''}` : '代理已关闭，历史已保留' }];
-  if (operation === 'list_models' && Array.isArray(value?.models)) return value.models.map(model => ({ text: `${model.name || model.id} · ${(model.efforts || []).join(', ')}` }));
+  if (operation === 'list_models' && Array.isArray(value?.models)) return [{ text: `${value.models.length} 个 Codex 模型可用` }];
   const action = { send_message: '已收到消息', answer_agent: '已收到答复', interrupt_agent: '已请求停止' }[operation];
   return action ? [{ id: value?.agent_id, name: null, text: isRunning ? '处理中' : action }] : null;
 }
@@ -53,15 +59,16 @@ function draw($, e, entries) {
     if (prior && prior.text === entry.text && prior.kind === entry.kind && entry.id) prior.entries.push(entry);
     else groups.push({ text: entry.text, kind: entry.kind, entries: [entry] });
   }
-  return Box({ flexDirection: 'column', children: groups.map((group, index) => {
-    const buttons = group.entries.filter(entry => entry.id).flatMap((entry, position) => [...(position ? [Text({ children: ['和'] })] : []), Text({ children: [agentIcon(entry.id)] }), Button({
+  return Box({ key: `codex_rows_${e.requestId || 'events'}`, flexDirection: 'column', gap: 'xs', children: groups.map((group, index) => {
+    const buttons = group.entries.filter(entry => entry.id).flatMap((entry, position) => [...(position ? [Text({ key: `join_${entry.id}`, size: 'footnote', dimColor: true, children: ['和'] })] : []), Text({ key: `icon_${entry.id}`, size: 'footnote', children: [agentIcon(entry.id)] }), Button({
       key: `${e.requestId || 'codex'}:${index}:${position}:${entry.id}`,
       label: safe(entry.name || entry.id || 'Codex'),
       plain: true,
+      children: [Text({ size: 'footnote', weight: 'medium', children: [safe(entry.name || entry.id || 'Codex')] })],
       onPress: () => openAgent($, entry.id),
     })]);
-    if (!buttons.length) return Text({ children: [`${group.kind === 'error' ? 'Codex: ' : ''}${short(group.text, 600)}`] });
-    return Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: [...buttons, Text({ children: [short(group.text, 600)] })] });
+    if (!buttons.length) return Text({ key: `codex_row_${index}`, size: 'footnote', dimColor: group.kind !== 'error', children: [short(group.text, 600)] });
+    return Box({ key: `codex_row_${index}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', columnGap: 'xs', children: [...buttons, Text({ key: `codex_row_status_${index}`, size: 'footnote', dimColor: true, children: [short(group.text, 600)] })] });
   }) });
 }
 

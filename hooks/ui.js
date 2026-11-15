@@ -1,13 +1,21 @@
-import { requestBridge as bridge, pickFiles } from './bridge.js';
+import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
 import { agentIcon, retainIcons, clearIcons } from './presentation.js';
+import { toolSections } from './tool-presentation.js';
 
 const PANE = 'codex_subagent_activity';
+const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
+let paneRevision = 0;
 const MAX_PAGES = 50;
-const safe = (value) => String(value).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
+const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
 const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), name: agent.name, model: agent.model, reasoning_effort: agent.reasoning_effort, permissions_mode: agent.permissions_mode, context_used_tokens: agent.context_used_tokens, context_limit_tokens: agent.context_limit_tokens, status: agent.status, user_paused: agent.user_paused, user_control_status: agent.user_control_status }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
 const groupable = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch']);
+const integrationOf = (entry) => {
+  if (!['mcpToolCall', 'dynamicToolCall'].includes(entry.type)) return '';
+  const d = entry.data || {}, source = d.server || d.namespace || (/^mcp__([^_]+)__/.exec(d.tool || '')?.[1]) || '';
+  return /fastctx/i.test(`${source} ${d.tool || ''}`) ? 'FastCtx' : source;
+};
 const fastctxTitles = { inspect_local_file: '读取本地文件', grep: '搜索文件内容', glob: '匹配文件路径', run: '运行命令', run_background: '启动后台任务', job_output: '读取任务输出', job_list: '查看后台任务', job_kill: '停止后台任务', replace: '替换文件内容' };
 function toolTitle(data) {
   if (typeof data.display_title === 'string' && data.display_title.trim()) return data.display_title;
@@ -102,9 +110,9 @@ const body = (entry) => {
     return [d.query, action.query, ...(Array.isArray(action.queries) ? action.queries : []), action.pattern, d.title, action.title, d.url, action.url, ...results].filter((v) => typeof v === 'string' && v).join('\n') || entry.preview || '';
   }
   if (entry.type === 'plan') return planText(d) || entry.preview || '';
-  if (typeof entry.preview === 'string') return entry.preview;
   if (typeof d.text === 'string') return d.text;
   if (entry.type === 'userMessage' && Array.isArray(d.content)) return d.content.map((part) => part.text || '').filter(Boolean).join('\n\n');
+  if (typeof entry.preview === 'string') return entry.preview;
   return JSON.stringify(d, null, 2);
 };
 
@@ -113,9 +121,9 @@ export function groupEntries(entries) {
   const groups = [];
   for (const entry of entries) {
     const last = groups.at(-1);
-    const sameTool = !['mcpToolCall', 'dynamicToolCall'].includes(entry.type) || (last?.items[0]?.data?.server === entry.data?.server && last?.items[0]?.data?.namespace === entry.data?.namespace && last?.items[0]?.data?.tool === entry.data?.tool);
+    const sameTool = !['mcpToolCall', 'dynamicToolCall'].includes(entry.type) || (integrationOf(entry) ? integrationOf(last?.items[0] || {}) === integrationOf(entry) : last?.items[0]?.data?.tool === entry.data?.tool);
     if (groupable.has(entry.type) && last && last.type === entry.type && last.turn_id === entry.turn_id && sameTool) last.items.push(entry);
-    else groups.push({ type: entry.type, turn_id: entry.turn_id, items: [entry] });
+    else groups.push({ type: entry.type, turn_id: entry.turn_id, integration: integrationOf(entry), items: [entry] });
   }
   return groups;
 }
@@ -130,6 +138,7 @@ const controlFor = (id) => {
   return state.controls.get(id);
 };
 const active = (agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent?.status);
+const interruptible = (agent) => (!agent?.user_paused && active(agent)) || agent?.status === 'unknown' || ['stopping', 'unconfirmed'].includes(agent?.user_control_status);
 function updateAgent(id, fields) {
   const agent = state.agents.find((a) => idOf(a) === id);
   if (!agent) return false;
@@ -177,17 +186,20 @@ function addAttachments(control, paths) {
   control.attachments = selected;
   control.attachmentVersion++; control.attachmentNotice = '';
 }
-async function chooseAttachments($, id) {
+async function chooseAttachments($, id, source = 'file') {
   const control = controlFor(id);
   if (control.picking) return;
   control.picking = true; control.attachmentNotice = ''; invalidate($);
   try {
-    const result = await pickFiles($);
+    const result = await (source === 'clipboard' ? pasteAttachments($) : pickFiles($));
     if (state.controls.get(id) !== control) return;
-    if (result.unsupported) { control.pathEntry = true; control.attachmentNotice = '请输入文件的绝对路径。'; }
+    if (source === 'clipboard' && result.unsupported) control.attachmentNotice = '当前平台不支持粘贴附件，请添加文件。';
+    else if (source === 'clipboard' && result.error) control.attachmentNotice = `无法读取剪贴板：${safe(result.error?.message || result.error).slice(0, 300)}`;
+    else if (source === 'clipboard' && !result.paths?.length) control.attachmentNotice = '剪贴板中没有可添加的截图或文件。';
+    else if (result.unsupported) { control.pathEntry = true; control.attachmentNotice = '请输入文件的绝对路径。'; }
     else if (result.error) control.attachmentNotice = '无法选择文件，请输入文件路径。', control.pathEntry = true;
     else if (Array.isArray(result.paths)) addAttachments(control, result.paths);
-  } catch { if (state.controls.get(id) === control) { control.pathEntry = true; control.attachmentNotice = '无法选择文件，请输入文件路径。'; } }
+  } catch { if (state.controls.get(id) === control) { control.pathEntry = source !== 'clipboard'; control.attachmentNotice = source === 'clipboard' ? '无法读取剪贴板，请添加文件。' : '无法选择文件，请输入文件路径。'; } }
   finally { control.picking = false; if (state.opened && state.selected === id) invalidate($); }
 }
   const pageFor = (id) => {
@@ -204,7 +216,11 @@ async function chooseAttachments($, id) {
     const key = `${id}:${entryKey(entry)}`;
     return state.folds.has(key) || state.folds.has(`${key}:group`) || [...state.folds].some((fold) => fold.startsWith(`${key}:file:`));
   });
-  function invalidate($) { $.ui.invalidate('ui.render'); }
+  function invalidate($) {
+    // Reading this key in the pane renderer subscribes only that render site.
+    // Event-wide invalidation also rebuilds the host conversation's tool rows.
+    void $.state.set(PANE_REVISION, ++paneRevision).catch(() => {});
+  }
   async function poll($) {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
@@ -215,7 +231,8 @@ async function chooseAttachments($, id) {
       const result = await bridge($, 'ui_revision', { target: id, revision: page.revision });
       if (!state.opened || state.selected !== id || state.generation !== gen || result.error || result.offline) return;
       const changed = result.agent && control.mutationEpoch === mutationEpoch && !control.stopping && !control.sending && updateAgent(id, result.agent);
-      if (page.mode === 'live' && result.entries && result.revision !== page.revision && !reading(id, page)) {
+      if (result.entries && result.revision !== page.revision && (page.mode !== 'live' || !reading(id, page))) {
+        if (page.mode !== 'live') page.hasNew = true;
         page.revision = result.revision; page.live = result.entries;
         invalidate($);
       } else if (changed) invalidate($);
@@ -257,6 +274,7 @@ async function chooseAttachments($, id) {
     const result = await $.ui.open({ id: PANE, title: 'Codex 代理', focus: true, closeOnEscape: true, rows: 24 });
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
+    if (state.restore) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
     if (!state.timer) state.timer = $.clock.every(1000, () => { void poll($).catch(() => {}); });
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath) {
@@ -291,7 +309,13 @@ export function registerUI(on) {
     if (e.origin.kind === 'plugin' && state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(state.selected) || 0 }); }
     return next(e);
   });
-  on('ui.render', { component: 'Pane' }, ($, e, next) => {
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    if (e.requestId !== PANE) return next(e);
+    await $.state.get(PANE_REVISION);
+    return renderPane($, e, next);
+  });
+}
+function renderPane($, e, next) {
     if (e.requestId !== PANE) return next(e);
     const { Box, Text, Button, Input, Markdown, Image, Code } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
     const all = page.mode === 'history' ? page.entries : page.live;
@@ -300,96 +324,125 @@ export function registerUI(on) {
     const nativeMessages = (type) => all.filter((entry) => entry.type === type && !String(entry.id).startsWith('action:')).map(body);
     const nativeParent = nativeMessages('userMessage'), nativeUser = nativeMessages('directUserMessage');
     const entries = all.filter((entry) => !String(entry.id).startsWith('action:') || !['parentMessage', 'directUserMessage'].includes(entry.type) || !(entry.type === 'parentMessage' ? nativeParent : nativeUser).some((text) => entry.data?.text && text.includes(entry.data.text)));
-    const rows = [];
+    const rows = [], navigation = [], composer = [];
+    const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
+    const disclosure = (key, label, onPress) => Button({ key, plain: true, label, children: [caption(`${key}:label`, label)], onPress });
+    const sourceCode = (key, source) => typeof Code === 'function' ? Code({ key, source: safe(source), format: 'source', wrap: 'wrap' }) : Text({ key, mono: true, size: 'caption', children: [safe(source)] });
     const selected = state.agents.find((a) => idOf(a) === id);
     const stopStatus = selected?.user_control_status;
-    const stopLabel = ['stopping', 'unconfirmed'].includes(stopStatus) ? '重试停止' : '停止';
-    const stopButton = (key) => !control.stopping && stopStatus !== 'stopped' ? Button({ key, plain: true, label: stopLabel, onPress: () => stopAgent($, id) }) : Text({ dimColor: true, children: [control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'] });
+    // Keep handler identity stable across activity updates. Typing updates the
+    // draft without invalidating the pane or the host conversation.
+    control.actions ??= {
+      stop: () => stopAgent($, id), attach: () => chooseAttachments($, id), paste: () => chooseAttachments($, id, 'clipboard'),
+      input: (value) => { const wasEmpty = !control.draft.trim(); control.draft = value; if (wasEmpty !== !value.trim()) invalidate($); },
+      submit: (value) => {
+        control.draft = value;
+        const agent = state.agents.find((item) => idOf(item) === id);
+        if (!value.trim() && !control.attachments.length && interruptible(agent)) return stopAgent($, id);
+        return sendAgent($, id);
+      },
+    };
+    const canStop = interruptible(selected);
     const model = [selected?.model, selected?.reasoning_effort].filter(Boolean).join(' · ');
-    rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: [Button({ key: 'codex_back', plain: true, label: '← 返回', onPress: () => $.ui.close({ id: PANE }) }), Text({ children: [`${agentIcon(id)} ${safe(selected?.name || id || 'Codex')}`], bold: true }), ...(model ? [Text({ dimColor: true, children: [safe(model)] })] : []), stopButton(`codex_stop_header_${id}`)] }));
-    if (stopStatus === 'unconfirmed') rows.push(Text({ dimColor: true, children: ['停止状态未确认，工作可能仍在进行。'] }));
-    if (page.mode === 'live') rows.push(Button({ key: 'codex_history', plain: true, label: '查看历史', onPress: () => history($, id) }));
-    else {
-      rows.push(Button({ key: 'codex_live', plain: true, label: '实时活动', onPress: () => { page.mode = 'live'; page.historyGeneration++; page.detail = null; void poll($).catch(() => {}); invalidate($); } }));
-      if (page.cursor) rows.push(Button({ key: 'codex_older', plain: true, label: '更早的活动', onPress: () => history($, id, 'older') }));
-      if (page.cursorStack.length > (page.stackTruncated ? 1 : 0)) rows.push(Button({ key: 'codex_newer', plain: true, label: '较新的活动', onPress: () => history($, id, 'newer') }));
-      if (page.cursorStack.length) rows.push(Button({ key: 'codex_latest', plain: true, label: '最新历史', onPress: () => history($, id) }));
-    }
-    if (page.error) rows.push(Text({ children: [page.error] }));
+    navigation.push(Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [`${agentIcon(id)} ${safe(selected?.name || id || 'Codex')}`] }));
+    if (page.mode === 'live' || page.cursor) navigation.push(disclosure('codex_older', '更早消息', () => history($, id, page.mode === 'live' ? 'latest' : 'older')));
+    if (page.error) navigation.push(caption('codex_history_error', page.error));
     for (const group of groupEntries(entries)) {
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
-      if (group.items.length > 1) {
-        const groupLabel = group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
-        rows.push(Button({ key: `group_${groupKey}`, plain: true, label: `${groupLabel} (${group.items.length}) ${folded ? '▸' : '▾'}`, onPress: () => { toggle(groupKey); invalidate($); } }));
+      if (group.items.length > 1 || group.integration) {
+        const groupLabel = group.integration ? `已使用 ${safe(group.integration)} 集成` : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
+        rows.push(disclosure(`group_${groupKey}`, `${groupLabel}${!group.integration ? ` (${group.items.length})` : ''} ${folded ? '▸' : '▾'}`, () => { toggle(groupKey); invalidate($); }));
         if (folded) continue;
       }
+      const itemRows = [];
       for (const entry of group.items) {
         if (['collabAgentToolCall', 'collabToolCall', 'subAgentActivity'].includes(entry.type)) {
           const d = entry.data || {}, target = d.agentThreadId || d.agent_id || d.agentId || d.agents?.[0]?.id || d.receiverThreadIds?.[0] || d.name || d.names?.[0] || entry.id;
-          rows.push(Text({ children: [`${agentIcon(target)} ${safe(description(entry))}`] }));
+          itemRows.push(caption(`activity_${id}:${entryKey(entry)}`, `${agentIcon(target)} ${description(entry)}`));
           continue;
         }
-        if (entry.type === 'contextCompaction') { rows.push(Text({ dimColor: true, children: [safe(description(entry))] })); continue; }
+        if (entry.type === 'contextCompaction') { itemRows.push(caption(`activity_${id}:${entryKey(entry)}`, description(entry))); continue; }
         const key = `${id}:${entryKey(entry)}`, expanded = state.folds.has(key);
         if (['agentMessage', 'userMessage', 'parentMessage', 'directUserMessage', 'plan'].includes(entry.type)) {
           const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
-          rows.push(Text({ dimColor: true, children: [description(entry)] }));
-          rows.push(Markdown({ key: `message_${key}`, text: safe(loaded?.text ?? body(entry)) }));
+          const message = [];
+          if (['userMessage', 'parentMessage'].includes(entry.type)) message.push(caption(`author_${key}`, 'Claude'));
+          const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
+          const text = safe(loaded?.text ?? body(entry));
+          message.push(incoming ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text }));
           const attachments = Array.isArray(entry.data?.attachments) ? entry.data.attachments : Array.isArray(entry.data?.content) ? entry.data.content.filter((part) => ['localImage', 'mention'].includes(part?.type)) : [];
-          if (attachments.length) rows.push(Text({ dimColor: true, children: [attachments.map((part) => `附件：${safe(part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件')}`).join('  ')] }));
-          if (loaded?.offset > 0) rows.push(Button({ key: `message_prev_${key}`, plain: true, label: '上一页正文', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000)) }));
-          if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) rows.push(Button({ key: `item_${key}`, plain: true, label: loaded ? '下一页正文' : '展开全文', onPress: () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); } }));
+          if (attachments.length) message.push(caption(`attachments_${key}`, attachments.map((part) => `附件：${part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件'}`).join('  ')));
+          if (loaded?.offset > 0) message.push(disclosure(`message_prev_${key}`, '上一页正文', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
+          if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) message.push(disclosure(`item_${key}`, loaded ? '下一页正文' : '展开全文', () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); }));
+          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { width: '85%', borderStyle: 'round', borderDimColor: true, padding: 1 } : { width: '100%', paddingY: 1 }), children: message });
+          itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', justifyContent: incoming ? 'flex-end' : 'flex-start', children: [content] }));
           continue;
         }
         const fileList = entry.data?.fileSummary?.length ? entry.data.fileSummary : entry.data?.changes;
         if (entry.type === 'fileChange' && Array.isArray(fileList) && fileList.length) {
           fileList.forEach((change, index) => {
             const fileKey = `${key}:file:${index}`, open = state.folds.has(fileKey);
-            rows.push(Button({ key: `file_${fileKey}`, plain: true, label: `${changeLabel(change)} ${open ? '▾' : '▸'}`, onPress: () => { toggle(fileKey); invalidate($); } }));
+            itemRows.push(disclosure(`file_${fileKey}`, `${changeLabel(change)} ${open ? '▾' : '▸'}`, () => { toggle(fileKey); invalidate($); }));
             const diff = entry.data?.changes?.find((item) => item.path === change.path)?.diff ?? change.diff;
             if (open) {
               const filePath = typeof change.path === 'string' ? change.path : '';
               const loaded = page.detail?.key === entryKey(entry) && page.detail.filePath === filePath ? page.detail : null;
               const source = safe((loaded && !loaded.error ? loaded.text : diff) ?? '请查看完整内容');
               const complete = !loaded || loaded.error || (loaded.offset === 0 && loaded.next_offset == null && loaded.format !== 'source');
-              rows.push(typeof Code === 'function' ? Code({ source, ...(filePath ? { path: filePath } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: complete && isUnifiedDiff(source) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ children: [source] }));
-              if (loaded?.error) rows.push(Text({ children: [loaded.text] }));
-              if (filePath) rows.push(Button({ key: `file_copy_path_${fileKey}`, plain: true, label: '复制文件路径', onPress: press => $.ui.copy({ text: filePath, surface: press.surface }) }));
-              if ((loaded && !loaded.error && loaded.text) || diff) rows.push(Button({ key: `file_copy_diff_${fileKey}`, plain: true, label: '复制当前差异', onPress: press => $.ui.copy({ text: loaded && !loaded.error ? loaded.text : diff, surface: press.surface }) }));
-              if (loaded?.offset > 0) rows.push(Button({ key: `file_prev_${fileKey}`, plain: true, label: '上一页输出', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000), fileKey, filePath) }));
-              if (!String(entry.id).startsWith('action:') && (!loaded || loaded.error || loaded.next_offset != null)) rows.push(Button({ key: `file_detail_${fileKey}`, plain: true, label: loaded?.error ? '重试获取内容' : loaded ? '下一页输出' : '查看完整内容', onPress: () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0, fileKey, filePath) }));
+              itemRows.push(typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: complete && isUnifiedDiff(source) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] }));
+              if (loaded?.error) itemRows.push(caption(`file_error_${fileKey}`, loaded.text));
+              if (filePath) itemRows.push(disclosure(`file_copy_path_${fileKey}`, '复制文件路径', press => $.ui.copy({ text: filePath, surface: press.surface })));
+              if ((loaded && !loaded.error && loaded.text) || diff) itemRows.push(disclosure(`file_copy_diff_${fileKey}`, '复制当前差异', press => $.ui.copy({ text: loaded && !loaded.error ? loaded.text : diff, surface: press.surface })));
+              if (loaded?.offset > 0) itemRows.push(disclosure(`file_prev_${fileKey}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000), fileKey, filePath)));
+              const deferred = entry.deferred || !diff || diff.length >= 4096 || diff.includes('[truncated]');
+              if (!String(entry.id).startsWith('action:') && ((!loaded && deferred) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`file_detail_${fileKey}`, loaded?.error ? '重试获取内容' : loaded ? '下一页输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0, fileKey, filePath)));
             }
           });
           continue;
         }
-        rows.push(Button({ key: `item_${key}`, plain: true, label: `${group.items.length > 1 ? '│  ' : '⌘  '}${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, onPress: () => { toggle(key); if (expanded) page.detailGeneration++; invalidate($); } }));
+        itemRows.push(disclosure(`item_${key}`, `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, () => { toggle(key); if (expanded) page.detailGeneration++; invalidate($); }));
         if (expanded) {
           const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
-          rows.push(Box({ borderStyle: 'round', borderDimColor: true, paddingX: 1, children: [Text({ children: [safe(loaded?.text ?? body(entry))] })] }));
+          const sections = loaded ? [{ label: '输出', source: loaded.text }] : toolSections(entry);
+          const output = sections.filter((section) => ['输出', '错误'].includes(section.label));
+          const raw = sections.filter((section) => !['输出', '错误'].includes(section.label));
+          const contents = output.map((section, index) => sourceCode(`tool_source_${key}:${index}`, section.source));
+          if (!contents.length) contents.push(sections.length ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
+          if (raw.length) {
+            const rawKey = `${key}:raw`;
+            contents.push(disclosure(`tool_raw_${key}`, `‹/› 原始调用 ${state.folds.has(rawKey) ? '▾' : '▸'}`, () => { toggle(rawKey); invalidate($); }));
+            if (state.folds.has(rawKey)) raw.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
+          }
+          itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: contents }));
           const imagePath = entry.data?.path || entry.data?.savedPath || entry.data?.saved_path;
           const localImage = typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(imagePath);
           if (['imageView', 'imageGeneration'].includes(entry.type) && localImage) {
-            if (typeof Image === 'function' && /\.png$/i.test(imagePath)) rows.push(Image({ key: `image_${key}`, source: { file: imagePath, format: 'png' }, columns: 48, rows: 18, alt: `图片：${safe(imagePath)}` }));
-            rows.push(Button({ key: `copy_${key}`, plain: true, label: '复制图片路径', onPress: press => $.ui.copy({ text: imagePath, surface: press.surface }) }));
+            if (typeof Image === 'function' && /\.png$/i.test(imagePath)) itemRows.push(Image({ key: `image_${key}`, source: { file: imagePath, format: 'png' }, columns: 48, rows: 18, alt: `图片：${safe(imagePath)}` }));
+            itemRows.push(disclosure(`copy_${key}`, '复制图片路径', press => $.ui.copy({ text: imagePath, surface: press.surface })));
           }
-          if (loaded?.offset > 0) rows.push(Button({ key: `detail_prev_${key}`, plain: true, label: '上一页输出', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000)) }));
-          if (!String(entry.id).startsWith('action:') && (!loaded || loaded.next_offset != null)) rows.push(Button({ key: `detail_${key}`, plain: true, label: loaded ? '下一页输出' : '查看完整内容', onPress: () => detail($, id, entry, loaded?.next_offset ?? 0) }));
+          if (loaded?.offset > 0) itemRows.push(disclosure(`detail_prev_${key}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
+          const truncated = entry.deferred || (entry.preview?.length ?? 0) >= 4096 || JSON.stringify(entry.data || {}).includes('[truncated]');
+          if (!String(entry.id).startsWith('action:') && ((!loaded && truncated) || loaded?.next_offset != null)) itemRows.push(disclosure(`detail_${key}`, loaded ? '下一页输出' : '获取更多', () => detail($, id, entry, loaded?.next_offset ?? 0)));
         }
       }
+      if (group.integration) rows.push(Box({ key: `integration_${groupKey}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: itemRows }));
+      else rows.push(...itemRows);
     }
-    const sendLabel = active(selected) && !selected?.user_paused ? '发送' : '发送并继续';
-    if (control.attachments.length) rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: control.attachments.map((path, index) => Button({ key: `attachment_${id}_${index}`, plain: true, label: `${safe(path.split(/[\\/]/).at(-1) || path)} ×`, onPress: () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; invalidate($); } })) }));
-    if (control.pathEntry) rows.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; invalidate($); } }));
-    if (control.attachmentNotice) rows.push(Text({ dimColor: true, children: [control.attachmentNotice] }));
-    rows.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, label: '消息', placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '发送中…' : control.stopping || stopStatus === 'stopping' ? '等待停止' : sendLabel, onInput: (value) => { control.draft = value; }, onSubmit: (value) => { control.draft = value; return sendAgent($, id); } }));
+    if (page.mode !== 'live') rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.detail = null; void poll($).catch(() => {}); invalidate($); void $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
+    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => disclosure(`attachment_${id}_${index}`, `${safe(path.split(/[\\/]/).at(-1) || path)} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; invalidate($); })) }));
+    if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; invalidate($); } }));
+    if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
+    composer.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '…' : control.stopping || stopStatus === 'stopping' ? '…' : canStop && !control.draft.trim() && !control.attachments.length ? '■' : '↑', onInput: control.actions.input, onSubmit: control.actions.submit }));
     const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
     const used = selected?.context_used_tokens, limit = selected?.context_limit_tokens;
     const context = Number.isFinite(used) && used >= 0 && Number.isFinite(limit) && limit > 0 ? `上下文 ${Math.round(used / limit * 100)}%` : '';
-    rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: [Button({ key: `codex_attach_${id}`, plain: true, label: control.picking ? '选择中…' : '+ 添加文件', onPress: () => chooseAttachments($, id) }), ...(permission ? [Text({ dimColor: true, children: [permission] })] : []), ...(context ? [Text({ dimColor: true, children: [context] })] : []), ...(model ? [Text({ dimColor: true, children: [safe(model)] })] : []), !control.stopping && stopStatus !== 'stopped' ? Button({ key: `codex_stop_${id}`, plain: true, label: ['stopping', 'unconfirmed'].includes(stopStatus) ? '■ 重试停止' : '■ 停止', onPress: () => stopAgent($, id) }) : stopButton(`codex_stop_${id}`)] }));
-    if (control.sendResult) rows.push(Text({ dimColor: true, children: [control.sendResult] }));
-    if (state.restore) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
-    return Box({ flexDirection: 'column', children: rows });
-  });
+    const paste = Box({ key: `codex_paste_hover_${id}`, position: 'relative', children: [Button({ key: `codex_paste_${id}`, plain: true, label: '粘贴图片或文件', children: [caption(`codex_paste_icon_${id}`, '📋')], onPress: control.actions.paste }), Box({ position: 'absolute', top: -2, left: 0, width: 20, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: ['粘贴图片或文件'] })] })] });
+    const footer = [Button({ key: `codex_attach_${id}`, plain: true, label: '添加文件', children: [caption(`codex_attach_icon_${id}`, control.picking ? '…' : '+')], onPress: control.actions.attach }), paste, ...(permission ? [caption(`codex_permissions_${id}`, permission)] : []), ...(context ? [caption(`codex_context_${id}`, context)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
+    composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', alignItems: 'center', children: footer }));
+    if (control.stopping || stopStatus === 'stopping' || stopStatus === 'stopped') composer.push(caption(`codex_stop_status_${id}`, control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'));
+    if (stopStatus === 'unconfirmed') composer.push(caption(`codex_stop_notice_${id}`, '停止状态未确认，工作可能仍在进行。'));
+    if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));
+    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1, children: composer })] });
 }
 export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; clearIcons(); }
 export function observeUI($, result) {

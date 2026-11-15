@@ -13,12 +13,13 @@ function setup() {
   const $ = {
     session: { id: async () => 'owner', cwd: async () => '/work' }, env: { get: async () => undefined }, plugin: { root: '/plugin' },
     clock: { every: () => ({ cancel() {} }) },
+    state: { get: async () => ({ value: 0, version: 0 }), set: async () => ({ isSet: true, version: 1 }) },
     process: { run: async (_, options) => {
       const body = JSON.parse(options.stdin);
       if (body.operation === 'ui_revision') opened.push(body.args.target);
       return { stdout: JSON.stringify(body.operation === 'ui_list' ? { agents: Array.from({ length: 5 }, (_, i) => ({ agent_id: `id-${i}` })) } : { entries: [], revision: 0 }), exitCode: 0 };
     } },
-    ui: { open: async () => ({ isPlaced: true }), invalidate() {}, resolve: () => Object.fromEntries(['Box', 'Text', 'Button'].map(type => [type, props => ({ type, props })])) },
+    ui: { open: async () => ({ isPlaced: true }), scroll: async () => ({}), invalidate() {}, resolve: () => Object.fromEntries(['Box', 'Text', 'Button'].map(type => [type, props => ({ type, props })])) },
   };
   return { opened, render: (component, props) => hooks.get(component)($, { component, requestId: 'call', props }, () => 'native') };
 }
@@ -48,6 +49,15 @@ test('wrapped MCP results decode; oversized or invalid results preserve native f
   assert.deepEqual(parseDisplayResult({ content: [{ type: 'text', text: '{"agent_id":"a"}' }] }), { agent_id: 'a' });
   assert.equal(describeCall(full('wait_agent'), {}, 'not JSON'), null);
   assert.equal(describeCall(full('wait_agent'), {}, 'x'.repeat(524289)), null);
+});
+
+test('compact error rows retain the cause without repeating the plugin name', () => {
+  assert.match(describeCall(full('followup_task'), {}, { error: { code: 'helper_restart_required' } })[0].text, /重启 Claude/);
+  const h = setup();
+  const output = { error: { code: 'plugin_error', message: 'Connection refused' } };
+  const tree = h.render('ToolUse', { tool: full('followup_task'), output });
+  const visible = nodes(tree).filter(node => node.type === 'Text').flatMap(node => node.props.children).join('');
+  assert.equal(visible, 'Codex 请求失败：Connection refused');
 });
 
 test('user interruption and message events have accurate distinct timeline labels', () => {

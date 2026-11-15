@@ -10,10 +10,11 @@ const resultMessage = (result, tool_use_id = 'wait-1') => ({ role: 'user', conte
 
 async function setup(respond = () => ({}), history = [], userConfig = {}) {
   const { register } = await import('../hooks/register.js?' + randomUUID());
-  const handlers = new Map(), calls = [], envs = [], prompts = [], retained = [...history];
+  const handlers = new Map(), appendHandlers = [], calls = [], envs = [], prompts = [], retained = [...history];
   let timer, scans = 0, submit = async () => ({});
   register((event, filter, handler) => {
-    if (event === 'tool.call') handlers.set(filter.tool.split('__').at(-1), handler);
+    if (event === 'session.append') appendHandlers.push({ filter, handler });
+    else if (event === 'tool.call') handlers.set(filter.tool.split('__').at(-1), handler);
     else handlers.set(event, filter);
   }, userConfig);
   const $ = {
@@ -27,15 +28,22 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
     } },
   };
   return {
-    calls, envs, prompts, retained, get scans() { return scans; }, setSubmit: fn => { submit = fn; },
+    calls, envs, prompts, retained, appendHandlers, get scans() { return scans; }, setSubmit: fn => { submit = fn; },
     start: () => handlers.get('session.start')($, {}, async e => e), observe: () => timer(),
     emit: (name, args = {}) => handlers.get(name)($, args, async e => e),
     call: async (name, args = {}, signal) => JSON.parse((await handlers.get(name)($, args, { signal })).result),
-    append: async (message, { tool = WAIT_TOOL, door = 'tool-result', finish } = {}) => handlers.get('session.append')($, { message, door, origin: { kind: 'tool', tool } }, async e => {
-      const final = finish ? finish(e.message) : { message: e.message };
-      if (final.message && !final.deny) retained.push(final.message);
-      return final;
-    }),
+    append: async (message, { tool = WAIT_TOOL, door = 'tool-result', origin = { kind: 'tool', tool }, finish } = {}) => {
+      const e = { message, door, origin };
+      const matches = (filter, value) => Object.entries(filter).every(([key, expected]) => expected && typeof expected === 'object'
+        ? value?.[key] && matches(expected, value[key]) : value?.[key] === expected);
+      const handler = appendHandlers.find(({ filter }) => matches(filter, e))?.handler;
+      const next = async current => {
+        const final = finish ? finish(current.message) : { message: current.message };
+        if (final.message && !final.deny) retained.push(final.message);
+        return final;
+      };
+      return handler ? handler($, e, next) : next(e);
+    },
   };
 }
 
@@ -61,6 +69,23 @@ test('a bounded wait delivers an available event and confirms only after final a
   assert.equal(result.events[0].seq, 11); assert.equal(h.calls.length, 1);
   await h.append(resultMessage(result));
   assert.deepEqual(h.calls[1].args, { observations: [{ delivery_id: 'd1', sequences: [11], events: [event()] }] });
+});
+
+test('append subscriptions exclude protected doors and unrelated tool results', async () => {
+  const h = await setup(() => ({ events: [event()], delivery_id: 'd1' }));
+  assert.deepEqual(h.appendHandlers.map(({ filter }) => filter), [
+    { door: 'tool-result', origin: { kind: 'tool', tool: WAIT_TOOL } },
+    { door: 'prompt' },
+  ]);
+  const result = await h.call('wait_agent', { tool_use_id: 'wait-1' });
+  for (const options of [
+    { door: 'attachment' }, { door: 'hook-context' }, { door: 'compaction' },
+    { door: 'tool-message' }, { door: 'note' },
+    { tool: 'mcp__other__wait_agent' }, { origin: { kind: 'other', tool: WAIT_TOOL } },
+  ]) await h.append(resultMessage(result), options);
+  assert.deepEqual(h.calls.map(call => call.operation), ['wait']);
+  await h.append(resultMessage(result));
+  assert.equal(h.calls.at(-1).operation, 'confirm');
 });
 
 test('retained seq 11 is recovered once on reopen with exact acknowledgement', async () => {

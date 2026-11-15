@@ -34,3 +34,13 @@ export async function pickFiles($) {
   try { return JSON.parse(result.stdout); }
   catch { return { paths: [], unsupported: true }; }
 }
+
+export async function pasteAttachments($) {
+  try {
+    const node = await $.env.get('CODEX_SUBAGENTS_NODE_COMMAND') || 'node';
+    const result = await $.process.run([node, `${$.plugin.root}/runtime/picker.mjs`, '--clipboard'], { cwd: await $.session.cwd(), timeoutMs: 20000 });
+    const parsed = JSON.parse(result.stdout);
+    if (!Array.isArray(parsed.paths) || parsed.paths.some(path => typeof path !== 'string')) throw new Error('Invalid clipboard response');
+    return parsed;
+  } catch { return { paths: [], error: '无法读取剪贴板附件，请重试。' }; }
+}

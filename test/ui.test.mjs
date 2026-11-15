@@ -4,6 +4,7 @@ import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hook
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
 function connect($, handler) {
+  $.state ??= { get: async () => ({ value: undefined, version: 0 }), set: async () => { $.ui.invalidate(); return { isSet: true }; } };
   $.session = { id: async () => 'session', cwd: async () => 'C:/work' };
   $.env = { get: async () => undefined }; $.plugin = { root: 'C:/plugin' };
   $.process = { run: async (_argv, options) => {
@@ -48,28 +49,29 @@ test('direct controls preserve per-agent drafts and scope late results', async (
   });
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (tree, key) => nodes(tree).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
-  let tree = draw(); item(tree, 'codex_message_').props.onInput('first draft');
-  const send = item(tree, 'codex_message_').props.onSubmit('first draft');
-  item(draw(), 'codex_message_').props.onInput('edited while sending');
-  const stop = item(draw(), 'codex_stop_a').props.onPress();
-  assert.equal(item(draw(), 'codex_message_').props.submitLabel, '发送中…');
-  assert.equal(item(draw(), 'codex_stop_a'), undefined);
+  const item = async (tree, key) => nodes(tree).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
+  let tree = await draw(); (await item(tree, 'codex_message_')).props.onInput('first draft');
+  const send = (await item(tree, 'codex_message_')).props.onSubmit('first draft');
+  (await item(await draw(), 'codex_message_')).props.onInput('edited while sending');
+  const stop = (await item(await draw(), 'codex_message_')).props.onSubmit('');
+  (await item(await draw(), 'codex_message_')).props.onInput('edited while sending');
+  assert.equal((await item(await draw(), 'codex_message_')).props.submitLabel, '…');
+  assert.equal((await item(await draw(), 'codex_stop_a')), undefined);
   await new Promise((resolve) => setImmediate(resolve));
   assert.notEqual(requests[0].requestId, requests[1].requestId);
   assert.deepEqual(requests.map((r) => r.args.target), ['a', 'a']);
   await openAgent($, 'b');
-  tree = draw(); assert.equal(item(tree, 'codex_message_').props.value, '');
-  assert.equal(item(tree, 'codex_message_').props.submitLabel, '发送并继续');
-  item(tree, 'codex_message_').props.onInput('other draft');
+  tree = await draw(); assert.equal((await item(tree, 'codex_message_')).props.value, '');
+  assert.equal((await item(tree, 'codex_message_')).props.submitLabel, '↑');
+  (await item(tree, 'codex_message_')).props.onInput('other draft');
   pending.ui_interrupt({ agent_id: 'a', status: 'stopped' }); await stop;
   pending.ui_send({ agent_id: 'a', status: 'steered', user_paused: false, user_control_status: null }); await send;
-  assert.equal(item(draw(), 'codex_message_').props.value, 'other draft');
+  assert.equal((await item(await draw(), 'codex_message_')).props.value, 'other draft');
   Object.assign(agents[0], { user_paused: true, user_control_status: 'stopped' });
   await openAgent($, 'a');
-  tree = draw(); assert.equal(item(tree, 'codex_message_').props.value, 'edited while sending');
+  tree = await draw(); assert.equal((await item(tree, 'codex_message_')).props.value, 'edited while sending');
   assert.ok(JSON.stringify(tree).includes('已停止'));
-  assert.equal(item(tree, 'codex_message_').props.submitLabel, '发送并继续');
+  assert.equal((await item(tree, 'codex_message_')).props.submitLabel, '↑');
   closeUI();
 });
 
@@ -86,14 +88,14 @@ test('uncertain send retains draft and stop distinguishes unconfirmed from stopp
   });
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (key) => nodes(draw()).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
-  item('codex_message_').props.onInput('retain this');
-  await item('codex_message_').props.onSubmit('retain this');
-  assert.equal(item('codex_message_').props.value, 'retain this');
-  assert.match(JSON.stringify(draw()), /发送状态未知/);
-  await item('codex_stop_a').props.onPress();
-  assert.match(JSON.stringify(draw()), /停止状态未确认/);
-  assert.equal(item('codex_stop_a').props.label, '■ 重试停止');
+  const item = async (key) => nodes(await draw()).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
+  (await item('codex_message_')).props.onInput('retain this');
+  await (await item('codex_message_')).props.onSubmit('retain this');
+  assert.equal((await item('codex_message_')).props.value, 'retain this');
+  assert.match(JSON.stringify(await draw()), /发送状态未知/);
+  await (await item('codex_message_')).props.onSubmit('');
+  assert.match(JSON.stringify(await draw()), /停止状态未确认/);
+  assert.equal((await item('codex_message_')).props.submitLabel, '■');
   assert.equal(calls.filter((op) => op === 'ui_send').length, 1);
   closeUI();
 });
@@ -112,21 +114,21 @@ test('attachments stay scoped to drafts and uncertain or edited sends preserve t
   $.process.run = async (argv, options) => argv[1].endsWith('/runtime/picker.mjs') ? (pickerCount++, { stdout: '{"unsupported":true}', exitCode: 0 }) : run(argv, options);
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (key) => nodes(draw()).find((node) => node.props.key?.startsWith(key));
-  assert.equal(pickerCount, 0); assert.match(JSON.stringify(draw()), /上下文 50%/);
-  await item('codex_attach_a').props.onPress();
-  item('attachment_path_a').props.onSubmit('C:/docs/a.png');
-  await openAgent($, 'b'); assert.ok(!JSON.stringify(draw()).includes('a.png'));
-  await openAgent($, 'a'); assert.ok(JSON.stringify(draw()).includes('a.png'));
-  let send = item('codex_message_a').props.onSubmit('');
+  const item = async (key) => nodes(await draw()).find((node) => node.props.key?.startsWith(key));
+  assert.equal(pickerCount, 0); assert.match(JSON.stringify(await draw()), /上下文 50%/);
+  await (await item('codex_attach_a')).props.onPress();
+  (await item('attachment_path_a')).props.onSubmit('C:/docs/a.png');
+  await openAgent($, 'b'); assert.ok(!JSON.stringify(await draw()).includes('a.png'));
+  await openAgent($, 'a'); assert.ok(JSON.stringify(await draw()).includes('a.png'));
+  let send = (await item('codex_message_a')).props.onSubmit('');
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(requests[0], { target: 'a', message: '', attachments: [{ path: 'C:/docs/a.png' }] });
   resolveSend({ error: { code: 'action_status_unknown' } }); await send;
-  assert.ok(JSON.stringify(draw()).includes('a.png'));
-  send = item('codex_message_a').props.onSubmit(''); await new Promise((r) => setImmediate(r));
-  await item('codex_attach_a').props.onPress(); item('attachment_path_a').props.onSubmit('C:/docs/b.txt');
+  assert.ok(JSON.stringify(await draw()).includes('a.png'));
+  send = (await item('codex_message_a')).props.onSubmit(''); await new Promise((r) => setImmediate(r));
+  await (await item('codex_attach_a')).props.onPress(); (await item('attachment_path_a')).props.onSubmit('C:/docs/b.txt');
   resolveSend({ agent_id: 'a', status: 'steered' }); await send;
-  assert.ok(JSON.stringify(draw()).includes('a.png')); assert.ok(JSON.stringify(draw()).includes('b.txt'));
+  assert.ok(JSON.stringify(await draw()).includes('a.png')); assert.ok(JSON.stringify(await draw()).includes('b.txt'));
   closeUI();
 });
 
@@ -143,17 +145,16 @@ test('unchanged revision does not redraw and stopping blocks submit while allowi
   });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (key) => nodes(draw()).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
-  item('codex_message_').props.onInput('draft');
+  const item = async (key) => nodes(await draw()).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
+  (await item('codex_message_')).props.onInput('draft');
   const before = invalidations; timers[0](); await new Promise((r) => setImmediate(r));
   assert.equal(invalidations, before);
-  assert.equal(item('codex_message_').props.value, 'draft');
-  await item('codex_stop_a').props.onPress();
-  assert.equal(item('codex_stop_a').props.label, '■ 重试停止');
-  assert.equal(item('codex_message_').props.submitLabel, '等待停止');
-  await item('codex_message_').props.onSubmit('draft');
+  assert.equal((await item('codex_message_')).props.value, 'draft');
+  await (await item('codex_message_')).props.onSubmit('');
+  assert.equal((await item('codex_message_')).props.submitLabel, '…');
+  await (await item('codex_message_')).props.onSubmit('draft');
   assert.equal(sends, 0);
-  assert.equal(item('codex_message_').props.value, 'draft');
+  assert.equal((await item('codex_message_')).props.value, 'draft');
   closeUI();
 });
 
@@ -164,9 +165,9 @@ test('activity deduplication respects message origin', async () => {
   const entry = (id, type, data) => ({ id, type, data, turn_id: 't' });
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries: [entry('native', 'userMessage', { content: [{ text: 'same' }] }), entry('action:send:1', 'directUserMessage', { text: 'same' }), entry('action:send:2', 'parentMessage', { text: 'same' })] });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
-  const tree = hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  assert.ok(tree.props.children.some((node) => node.props.key?.includes('action:send:1')));
-  assert.ok(!tree.props.children.some((node) => node.props.key?.includes('action:send:2')));
+  const tree = await hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  assert.ok(nodes(tree).some((node) => node.props.key?.includes('action:send:1')));
+  assert.ok(!nodes(tree).some((node) => node.props.key?.includes('action:send:2')));
   closeUI();
 });
 
@@ -175,18 +176,18 @@ test('conversation shows prose and expandable file changes with authoritative co
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const diff = '@@ -1,1 +1,1 @@\n-old\n+one\n';
-  const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff }] } }];
+  const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', deferred: true, data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff }] } }];
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : op === 'ui_detail' ? { text: diff, next_offset: 16000, format: 'source' } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = draw(); assert.ok(tree.props.children.some(node => node.type === 'Markdown' && node.props.text === '正文直接显示'));
-  const file = tree.props.children.find(node => node.props.key?.startsWith('file_'));
+  let tree = await draw(); assert.ok(nodes(tree).some(node => node.type === 'Markdown' && node.props.text === '正文直接显示'));
+  const file = nodes(tree).find(node => node.props.key?.startsWith('file_'));
   assert.match(file.props.label, /test\.js \+5 -1/); file.props.onPress();
-  tree = draw(); const code = tree.props.children.find(node => node.type === 'Code');
-  assert.deepEqual(code.props, { source: diff, path: 'test.js', format: 'diff', wrap: 'wrap' });
-  await tree.props.children.find((node) => node.props.key?.startsWith('file_detail_')).props.onPress();
-  assert.equal(draw().props.children.find((node) => node.type === 'Code').props.format, 'source');
-  assert.equal(tree.props.children.at(-2).type, 'Input');
+  tree = await draw(); const code = nodes(tree).find(node => node.type === 'Code');
+  assert.deepEqual(code.props, { key: 'file_code_a:t:f:file:0', source: diff, path: 'test.js', format: 'diff', wrap: 'wrap' });
+  await nodes(tree).find((node) => node.props.key?.startsWith('file_detail_')).props.onPress();
+  assert.equal(nodes(await draw()).find((node) => node.type === 'Code').props.format, 'source');
+  assert.equal(nodes(tree).find((node) => node.props.key?.startsWith('codex_message_')).type, 'Input');
   closeUI();
 });
 
@@ -194,7 +195,7 @@ test('long messages and file output support next and previous pages', async () =
   const hooks = [], requests = [];
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
-  const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', preview: '摘要', deferred: true }, { id: 'f', type: 'fileChange', turn_id: 't', data: { changes: [{ path: 'test.js', diff: '+preview' }] } }];
+  const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', preview: '摘要', deferred: true }, { id: 'f', type: 'fileChange', turn_id: 't', deferred: true, data: { changes: [{ path: 'test.js', diff: '+preview' }] } }];
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] };
     if (op === 'ui_revision') return { revision: 1, entries };
@@ -202,17 +203,17 @@ test('long messages and file output support next and previous pages', async () =
   });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (prefix) => draw().props.children.find((node) => node.props.key?.startsWith(prefix));
-  await item('item_a:t:m').props.onPress();
-  await item('item_a:t:m').props.onPress();
-  assert.ok(JSON.stringify(draw()).includes('m page 16000'));
-  await item('message_prev_a:t:m').props.onPress();
-  assert.ok(JSON.stringify(draw()).includes('m page 0'));
-  item('file_a:t:f:file:0').props.onPress();
-  await item('file_detail_a:t:f:file:0').props.onPress();
-  await item('file_detail_a:t:f:file:0').props.onPress();
-  assert.ok(JSON.stringify(draw()).includes('f page 16000'));
-  await item('file_prev_a:t:f:file:0').props.onPress();
+  const item = async (prefix) => nodes(await draw()).find((node) => node.props.key?.startsWith(prefix));
+  await (await item('item_a:t:m')).props.onPress();
+  await (await item('item_a:t:m')).props.onPress();
+  assert.ok(JSON.stringify(await draw()).includes('m page 16000'));
+  await (await item('message_prev_a:t:m')).props.onPress();
+  assert.ok(JSON.stringify(await draw()).includes('m page 0'));
+  (await item('file_a:t:f:file:0')).props.onPress();
+  await (await item('file_detail_a:t:f:file:0')).props.onPress();
+  await (await item('file_detail_a:t:f:file:0')).props.onPress();
+  assert.ok(JSON.stringify(await draw()).includes('f page 16000'));
+  await (await item('file_prev_a:t:f:file:0')).props.onPress();
   assert.deepEqual(requests, [['m', 0, null], ['m', 16000, null], ['m', 0, null], ['f', 0, 'test.js'], ['f', 16000, 'test.js'], ['f', 0, 'test.js']]);
   closeUI();
 });
@@ -224,18 +225,18 @@ test('open file holds live entries through refresh and collapsing releases them'
   connect($, async (_$, op) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] };
     if (op === 'ui_detail') return { text: '完整输出', next_offset: null };
-    return revision === 1 ? { revision, entries: [{ id: 'f', type: 'fileChange', turn_id: 't', data: { changes: [{ path: 'old.js', diff: '+old' }] } }] } : { revision, entries: [{ id: 'new', type: 'agentMessage', turn_id: 't', data: { text: '新活动' } }] };
+    return revision === 1 ? { revision, entries: [{ id: 'f', type: 'fileChange', turn_id: 't', deferred: true, data: { changes: [{ path: 'old.js', diff: '+old' }] } }] } : { revision, entries: [{ id: 'new', type: 'agentMessage', turn_id: 't', data: { text: '新活动' } }] };
   });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (prefix) => draw().props.children.find((node) => node.props.key?.startsWith(prefix));
-  item('file_a:t:f:file:0').props.onPress();
-  await item('file_detail_a:t:f:file:0').props.onPress();
+  const item = async (prefix) => nodes(await draw()).find((node) => node.props.key?.startsWith(prefix));
+  (await item('file_a:t:f:file:0')).props.onPress();
+  await (await item('file_detail_a:t:f:file:0')).props.onPress();
   revision = 2; timers[0](); await new Promise((r) => setImmediate(r));
-  assert.match(JSON.stringify(draw()), /old\.js/); assert.ok(!JSON.stringify(draw()).includes('新活动'));
-  item('file_a:t:f:file:0').props.onPress();
+  assert.match(JSON.stringify(await draw()), /old\.js/); assert.ok(!JSON.stringify(await draw()).includes('新活动'));
+  (await item('file_a:t:f:file:0')).props.onPress();
   timers[0](); await new Promise((r) => setImmediate(r));
-  assert.ok(JSON.stringify(draw()).includes('新活动'));
+  assert.ok(JSON.stringify(await draw()).includes('新活动'));
   closeUI();
 });
 
@@ -247,17 +248,17 @@ test('native activity types render readable tool, search, plan and lifecycle det
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = draw();
+  let tree = await draw();
   assert.ok(JSON.stringify(tree).includes('上下文正在压缩'));
   assert.ok(JSON.stringify(tree).includes('研究已完成'));
   assert.ok(JSON.stringify(tree).includes('撰写开始工作'));
-  assert.ok(tree.props.children.some((node) => node.type === 'Markdown' && node.props.text.includes('检查结果')));
-  tree.props.children.find((node) => node.props.key?.startsWith('group_')).props.onPress();
-  tree = draw(); assert.ok(JSON.stringify(tree).includes('读取本地文件')); assert.ok(JSON.stringify(tree).includes('搜索文件内容'));
-  tree.props.children.find((node) => node.props.key?.startsWith('item_a:t:search')).props.onPress();
-  tree = draw(); assert.ok(JSON.stringify(tree).includes('中文查询')); assert.ok(JSON.stringify(tree).includes('https://example.com/'));
-  tree.props.children.find((node) => node.props.key?.startsWith('item_a:t:future')).props.onPress();
-  assert.ok(JSON.stringify(draw()).includes('opaque'));
+  assert.ok(nodes(tree).some((node) => node.type === 'Markdown' && node.props.text.includes('检查结果')));
+  nodes(tree).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  tree = await draw(); assert.ok(JSON.stringify(tree).includes('读取本地文件')); assert.ok(JSON.stringify(tree).includes('搜索文件内容'));
+  nodes(tree).find((node) => node.props.key?.startsWith('item_a:t:search')).props.onPress();
+  tree = await draw(); assert.ok(JSON.stringify(tree).includes('中文查询')); assert.ok(JSON.stringify(tree).includes('https://example.com/'));
+  nodes(tree).find((node) => node.props.key?.startsWith('item_a:t:future')).props.onPress();
+  assert.ok(JSON.stringify(await draw()).includes('opaque'));
   closeUI();
 });
 
@@ -268,11 +269,11 @@ test('expanded local PNG uses native image; other paths never load as files', as
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  assert.equal(draw().props.children.filter((node) => node.type === 'Image').length, 0);
-  for (const id of ['png', 'web', 'unc', 'jpg']) draw().props.children.find((node) => node.props.key?.startsWith(`item_a:t:${id}`)).props.onPress();
-  const images = draw().props.children.filter((node) => node.type === 'Image');
+  assert.equal(nodes(await draw()).filter((node) => node.type === 'Image').length, 0);
+  for (const id of ['png', 'web', 'unc', 'jpg']) nodes(await draw()).find((node) => node.props.key?.startsWith(`item_a:t:${id}`)).props.onPress();
+  const images = nodes(await draw()).filter((node) => node.type === 'Image');
   assert.equal(images.length, 1); assert.deepEqual(images[0].props.source, { file: 'C:\\images\\plot.png', format: 'png' });
-  assert.ok(draw().props.children.some((node) => node.props.key?.startsWith('copy_a:t:jpg')));
+  assert.ok(nodes(await draw()).some((node) => node.props.key?.startsWith('copy_a:t:jpg')));
   closeUI();
 });
 
@@ -284,7 +285,7 @@ test('only adjacent same-type calls within a turn group and retain items', () =>
   ];
   assert.deepEqual(groupEntries(entries).map((g) => g.items.map((i) => i.id)), [['1', '2'], ['3'], ['4'], ['5']]);
   const calls = ['grep', 'grep', 'glob'].map((tool, index) => ({ id: String(index), type: 'mcpToolCall', turn_id: 't', data: { server: 'fastctx', tool } }));
-  assert.deepEqual(groupEntries(calls).map((g) => g.items.length), [2, 1]);
+  assert.deepEqual(groupEntries(calls).map((g) => g.items.length), [3]);
 });
 
 test('history stays reachable after live rollover and past fifty pages; closed observation never redraws', async () => {
@@ -304,14 +305,13 @@ test('history stays reachable after live rollover and past fifty pages; closed o
   await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   live = 'live-200'; timers[0].fn(); await new Promise((r) => setImmediate(r));
-  let tree = draw(); assert.ok(JSON.stringify(tree).includes('live-200')); assert.ok(!JSON.stringify(tree).includes('live-100'));
-  await tree.props.children.find((x) => x.props.key === 'codex_history').props.onPress();
-  for (let i = 0; i < 56; i++) { tree = draw(); await tree.props.children.find((x) => x.props.key === 'codex_older').props.onPress(); }
-  tree = draw(); assert.ok(JSON.stringify(tree).includes('history-56')); assert.ok(tree.props.children.some((x) => x.props.key === 'codex_older'));
-  assert.ok(tree.props.children.some((x) => x.props.key === 'codex_latest'));
-  await tree.props.children.find((x) => x.props.key === 'codex_latest').props.onPress();
-  tree = draw(); assert.ok(JSON.stringify(tree).includes('history-0'));
-  await tree.props.children.find((x) => x.props.key === 'codex_live').props.onPress();
+  let tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200')); assert.ok(!JSON.stringify(tree).includes('live-100'));
+  await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
+  for (let i = 0; i < 56; i++) { tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress(); }
+  tree = await draw(); assert.ok(JSON.stringify(tree).includes('history-56')); assert.ok(nodes(tree).some((x) => x.props.key === 'codex_older'));
+  assert.ok(nodes(tree).some((x) => x.props.key === 'codex_latest'));
+  await nodes(tree).find((x) => x.props.key === 'codex_latest').props.onPress();
+  tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200'));
   await hooks.find((h) => h.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e);
   const count = invalidations; observeUI($, { agents: [{ ...agents[0], status: 'completed', name: 'Changed' }] }); assert.equal(invalidations, count);
 });
@@ -329,16 +329,16 @@ test('older pages stay visible during live updates and newer returns to latest',
   closeUI(); connect($, bridge); registerUI(on);
   await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = draw();
+  let tree = await draw();
   assert.ok(JSON.stringify(tree).includes('The full agent name'));
-  await tree.props.children.find((x) => x.props.key === 'codex_history').props.onPress();
-  tree = draw();
-  await tree.props.children.find((x) => x.props.key === 'codex_older').props.onPress();
-  tree = draw(); assert.ok(tree.props.children.some((x) => x.props.key?.includes('t:old')));
+  await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
+  tree = await draw();
+  await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
+  tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old')));
   timers[0].fn(); await new Promise((r) => setImmediate(r));
-  tree = draw(); assert.ok(tree.props.children.some((x) => x.props.key?.includes('t:old'))); assert.ok(!tree.props.children.some((x) => x.props.key?.includes('t:live')));
-  await tree.props.children.find((x) => x.props.key === 'codex_newer').props.onPress();
-  tree = draw(); assert.ok(tree.props.children.some((x) => x.props.key?.includes('t:new')));
+  tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old'))); assert.ok(!nodes(tree).some((x) => x.props.key?.includes('t:live')));
+  await nodes(tree).find((x) => x.props.key === 'codex_latest').props.onPress();
+  tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:live')));
 });
 
 test('late details from a previous selection are discarded', async () => {
@@ -347,18 +347,18 @@ test('late details from a previous selection are discarded', async () => {
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const bridge = async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', name: 'A' }, { agent_id: 'b', name: 'B' }] };
-    if (op === 'ui_history') return { entries: [{ id: args.target, turn_id: 't', type: 'commandExecution', data: { command: args.target } }] };
+    if (op === 'ui_history') return { entries: [{ id: args.target, turn_id: 't', type: 'commandExecution', deferred: true, data: { command: args.target } }] };
     if (op === 'ui_detail') return new Promise((resolve) => { deferred.resolve = resolve; });
     return { revision: 1, entries: [] };
   };
   closeUI(); connect($, bridge); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = draw(); await tree.props.children.find((x) => x.props.key === 'codex_history').props.onPress();
-  tree = draw(); tree.props.children.find((x) => x.props.key?.includes('item_a:t:a')).props.onPress();
-  tree = draw(); const pending = tree.props.children.find((x) => x.props.label === '查看完整内容').props.onPress();
+  let tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
+  tree = await draw(); nodes(tree).find((x) => x.props.key?.includes('item_a:t:a')).props.onPress();
+  tree = await draw(); const pending = nodes(tree).find((x) => x.props.label === '获取更多').props.onPress();
   await openAgent($, 'b'); await new Promise((r) => setImmediate(r));
   deferred.resolve({ text: 'old response', next_offset: null }); await pending;
-  tree = draw(); assert.ok(!JSON.stringify(tree).includes('old response'));
+  tree = await draw(); assert.ok(!JSON.stringify(tree).includes('old response'));
 });
 
 test('large detail pages can be navigated in both directions', async () => {
@@ -367,18 +367,18 @@ test('large detail pages can be navigated in both directions', async () => {
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const bridge = async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', name: 'A' }] };
-    if (op === 'ui_history') return { entries: [{ id: 'cmd', turn_id: 't', type: 'commandExecution', data: { command: 'run' } }] };
+    if (op === 'ui_history') return { entries: [{ id: 'cmd', turn_id: 't', type: 'commandExecution', deferred: true, data: { command: 'run' } }] };
     if (op === 'ui_detail') { offsets.push(args.offset); return { text: `Page ${args.offset}`, next_offset: args.offset ? null : 16000 }; }
     return { revision: 1, entries: [] };
   };
   closeUI(); connect($, bridge); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = draw(); await tree.props.children.find((x) => x.props.key === 'codex_history').props.onPress();
-  tree = draw(); tree.props.children.find((x) => x.props.key?.includes('item_a:t:cmd')).props.onPress();
-  tree = draw(); await tree.props.children.find((x) => x.props.label === '查看完整内容').props.onPress();
-  tree = draw(); await tree.props.children.find((x) => x.props.label === '下一页输出').props.onPress();
-  tree = draw(); assert.ok(JSON.stringify(tree).includes('Page 16000'));
-  await tree.props.children.find((x) => x.props.label === '上一页输出').props.onPress();
+  let tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
+  tree = await draw(); nodes(tree).find((x) => x.props.key?.includes('item_a:t:cmd')).props.onPress();
+  tree = await draw(); await nodes(tree).find((x) => x.props.label === '获取更多').props.onPress();
+  tree = await draw(); await nodes(tree).find((x) => x.props.label === '下一页输出').props.onPress();
+  tree = await draw(); assert.ok(JSON.stringify(tree).includes('Page 16000'));
+  await nodes(tree).find((x) => x.props.label === '上一页输出').props.onPress();
   assert.deepEqual(offsets, [0, 16000, 0]);
 });
 
@@ -395,15 +395,130 @@ test('agents have independent entries and polling ends when pane closes', async 
   await openAgent($, 'a');
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(timers[0].ms, 1000);
-  let pane = render('Pane')($, { requestId: 'codex_subagent_activity' }, () => null);
-  assert.equal(pane.props.children[0].props.flexWrap, 'wrap');
+  let pane = await render('Pane')($, { requestId: 'codex_subagent_activity' }, () => null);
+  assert.equal(nodes(pane).find((node) => node.props.key === 'codex_navigation').type, 'Box');
   assert.ok(JSON.stringify(pane).includes('a very long name'));
-  assert.ok(pane.props.children.some((c) => c.props.key?.includes('t:a')));
+  assert.ok(nodes(pane).some((c) => c.props.key?.includes('t:a')));
   await openAgent($, 'b');
   await new Promise((resolve) => setImmediate(resolve));
-  pane = render('Pane')($, { requestId: 'codex_subagent_activity' }, () => null);
-  assert.ok(pane.props.children.some((c) => c.props.key?.includes('t:b')));
+  pane = await render('Pane')($, { requestId: 'codex_subagent_activity' }, () => null);
+  assert.ok(nodes(pane).some((c) => c.props.key?.includes('t:b')));
   await hooks.find((h) => h.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e);
   assert.equal(timers[0].cancelled, true);
   const before = calls.length; await timers[0].fn(); await new Promise((resolve) => setImmediate(resolve)); assert.equal(calls.length, before);
+});
+
+test('tool details separate protocol commands and output into wrapped source panels', async () => {
+  const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const entries = [{ id: 'run', turn_id: 't', type: 'mcpToolCall', deferred: true, preview: 'Tool: fastctx/run Input: shortened preview', data: { server: 'fastctx', tool: 'run', arguments: { command: 'printf "one\\ntwo"', cwd: 'C:/work', timeout_ms: 1000 }, result: { content: [{ type: 'text', text: 'one\ntwo\n<html>literal</html>' }], structuredContent: { exit_code: 0 } } } }];
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_detail' ? { text: 'full raw page\nnext line', next_offset: null } : { revision: 1, entries });
+  closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  nodes(await draw()).find((node) => node.props.key === 'item_a:t:run').props.onPress();
+  let panels = nodes(await draw()).filter((node) => node.type === 'Code');
+  assert.equal(panels.length, 1);
+  assert.match(panels[0].props.source, /one\ntwo\n<html>literal<\/html>/);
+  assert.match(panels[0].props.source, /"exit_code": 0/);
+  nodes(await draw()).find((node) => node.props.key === 'tool_raw_a:t:run').props.onPress();
+  panels = nodes(await draw()).filter((node) => node.type === 'Code');
+  assert.deepEqual(panels.slice(1).map((node) => node.props.source), ['printf "one\\ntwo"', 'C:/work', '{\n  "timeout_ms": 1000\n}']);
+  assert.ok(panels.every((node) => node.props.format === 'source' && node.props.wrap === 'wrap'));
+  assert.ok(!panels.some((node) => node.props.source.includes('shortened preview')));
+  assert.equal(nodes(await draw()).filter((node) => node.props.key?.startsWith('codex_stop_')).length, 0);
+  await nodes(await draw()).find((node) => node.props.key === 'detail_a:t:run').props.onPress();
+  panels = nodes(await draw()).filter((node) => node.type === 'Code');
+  assert.deepEqual(panels.map((node) => node.props.source), ['full raw page\nnext line']);
+  closeUI();
+});
+
+test('unchanged completed polling and observations never refresh; changes target only the pane', async () => {
+  const hooks = [], timers = [], writes = [], reads = [], scrolls = []; let globalRefresh = 0, revision = 1;
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
+  const $ = { state: { get: async (ref) => { reads.push(ref); return { value: 0, version: 0 }; }, set: async (ref, value) => { writes.push({ ref, value }); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { globalRefresh++; }, open: async () => ({ isPlaced: true }), scroll: async (args) => { scrolls.push(args); return {}; } }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
+  const agents = [{ agent_id: 'a', status: 'completed', model: 'model' }];
+  connect($, async (_$, op) => op === 'ui_list' ? { agents } : { revision, entries: [], agent: agents[0] });
+  closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
+  const render = hooks.find((h) => h.event === 'ui.render');
+  assert.deepEqual(render.matcher, { component: 'Pane', requestId: 'codex_subagent_activity' });
+  const draw = () => render.fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  const first = await draw(), second = await draw();
+  assert.equal(scrolls.length, 1);
+  assert.deepEqual(reads[0], { plugin: 'codex-subagents', key: 'paneRevision' });
+  assert.equal(nodes(first).find((node) => node.type === 'Input').props.onInput, nodes(second).find((node) => node.type === 'Input').props.onInput);
+  writes.length = 0;
+  for (let i = 0; i < 12; i++) { timers[0](); observeUI($, { agents }); await new Promise((r) => setImmediate(r)); }
+  assert.equal(writes.length, 0); assert.equal(globalRefresh, 0);
+  revision = 2; timers[0](); await new Promise((r) => setImmediate(r));
+  assert.equal(writes.length, 1); assert.deepEqual(writes[0].ref, reads[0]); assert.equal(globalRefresh, 0);
+  closeUI();
+});
+
+test('clipboard attachments are read only by the explicit action and preserve useful failures', async () => {
+  const hooks = []; let reads = 0, clipboard = { paths: ['C:/screenshots/capture.png'] };
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : { revision: 1, entries: [] });
+  const run = $.process.run;
+  $.process.run = async (argv, options) => argv.includes('--clipboard') ? (reads++, { stdout: JSON.stringify(clipboard), exitCode: 0 }) : run(argv, options);
+  closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  const paste = async () => nodes(await draw()).find((node) => node.props.key === 'codex_paste_a').props.onPress();
+  assert.equal(reads, 0);
+  await paste(); assert.equal(reads, 1); assert.match(JSON.stringify(await draw()), /capture\.png/);
+  clipboard = { paths: [], error: 'Permission denied' }; await paste();
+  assert.match(JSON.stringify(await draw()), /Permission denied/);
+  clipboard = { paths: [], unsupported: true }; await paste();
+  assert.match(JSON.stringify(await draw()), /当前平台不支持/);
+  clipboard = { paths: [] }; await paste();
+  assert.match(JSON.stringify(await draw()), /没有可添加的截图或文件/);
+  assert.match(JSON.stringify(await draw()), /capture\.png/);
+  closeUI();
+});
+
+test('conversation keeps incoming line breaks in right bubbles and composer refreshes only at empty boundaries', async () => {
+  const hooks = [], writes = [], requests = [];
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async (ref, value) => { writes.push({ ref, value }); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const entries = [{ id: 'parent', type: 'parentMessage', turn_id: 't', data: { text: 'line one\r\nline two' } }, { id: 'direct', type: 'directUserMessage', turn_id: 't', data: { text: 'user\nmessage' } }, { id: 'reply', type: 'agentMessage', turn_id: 't', data: { text: '**reply**' } }, { id: 'tool', type: 'mcpToolCall', turn_id: 't', data: { server: 'fastctx', tool: 'run', arguments: { command: 'test' }, result: { content: [{ type: 'text', text: 'complete short output' }] } } }];
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
+    if (op === 'ui_revision') return { revision: 1, entries };
+    requests.push({ op, args });
+    return op === 'ui_interrupt' ? { agent_id: 'a', user_control_status: 'stopped', user_paused: true } : { agent_id: 'a', status: 'steered' };
+  });
+  closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  const input = async () => nodes(await draw()).find((node) => node.type === 'Input');
+  let tree = await draw();
+  for (const id of ['parent', 'direct']) {
+    const row = nodes(tree).find((node) => node.props.key === `message_container_a:t:${id}`);
+    assert.equal(row.props.justifyContent, 'flex-end');
+    assert.equal(row.props.children[0].props.width, '85%');
+    assert.equal(nodes(row).find((node) => node.props.key === `message_a:t:${id}`).type, 'Text');
+  }
+  assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:parent').props.children[0], 'line one\nline two');
+  assert.equal(nodes(tree).find((node) => node.props.key === 'message_container_a:t:reply').props.justifyContent, 'flex-start');
+  assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:reply').type, 'Markdown');
+  assert.equal(nodes(tree).filter((node) => node.props.key?.startsWith('author_')).length, 1);
+  assert.equal(nodes(tree).find((node) => node.props.key === 'codex_back'), undefined);
+  assert.equal((await input()).props.submitLabel, '■');
+  writes.length = 0;
+  (await input()).props.onInput('a'); assert.equal(writes.length, 1);
+  (await input()).props.onInput('ab'); assert.equal(writes.length, 1);
+  assert.equal((await input()).props.submitLabel, '↑');
+  await (await input()).props.onSubmit('ab');
+  assert.equal(requests[0].op, 'ui_send'); assert.equal(requests[0].args.message, 'ab');
+  writes.length = 0;
+  (await input()).props.onInput('x'); (await input()).props.onInput('');
+  assert.equal(writes.length, 2);
+  await (await input()).props.onSubmit(''); assert.equal(requests[1].op, 'ui_interrupt');
+  assert.equal(nodes(await draw()).some((node) => node.props.key?.startsWith('codex_stop_') && node.type === 'Button'), false);
+  nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  nodes(await draw()).find((node) => node.props.key === 'item_a:t:tool').props.onPress();
+  tree = await draw();
+  assert.equal(nodes(tree).find((node) => node.props.key === 'detail_a:t:tool'), undefined);
+  assert.deepEqual(nodes(tree).filter((node) => node.type === 'Code').map((node) => node.props.source), ['complete short output']);
+  closeUI();
 });
