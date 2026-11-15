@@ -1,11 +1,11 @@
-import { requestBridge as bridge } from './bridge.js';
+import { requestBridge as bridge, pickFiles } from './bridge.js';
 import { agentIcon, retainIcons, clearIcons } from './presentation.js';
 
 const PANE = 'codex_subagent_activity';
 const MAX_PAGES = 50;
 const safe = (value) => String(value).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
-const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), name: agent.name, model: agent.model, reasoning_effort: agent.reasoning_effort, status: agent.status, user_paused: agent.user_paused, user_control_status: agent.user_control_status }));
+const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), name: agent.name, model: agent.model, reasoning_effort: agent.reasoning_effort, permissions_mode: agent.permissions_mode, context_used_tokens: agent.context_used_tokens, context_limit_tokens: agent.context_limit_tokens, status: agent.status, user_paused: agent.user_paused, user_control_status: agent.user_control_status }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
 const groupable = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch']);
 const fastctxTitles = { inspect_local_file: '读取本地文件', grep: '搜索文件内容', glob: '匹配文件路径', run: '运行命令', run_background: '启动后台任务', job_output: '读取任务输出', job_list: '查看后台任务', job_kill: '停止后台任务', replace: '替换文件内容' };
@@ -45,6 +45,32 @@ function changeLabel(change) {
   const removed = lines.filter((line) => line.startsWith('-') && !line.startsWith('---')).length;
   const hasCounts = Number.isInteger(change.added) && Number.isInteger(change.removed);
   return `✎ 已编辑 ${safe(change.path || '文件')}${hasCounts ? ` +${change.added} -${change.removed}` : lines.length ? ` +${added} -${removed}` : ''}`;
+}
+// Only complete unified hunks are passed as diffs; bounded previews and output
+// pages may end mid-hunk and are still readable as ordinary code.
+function isUnifiedDiff(text) {
+  if (typeof text !== 'string' || !text) return false;
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  let oldLeft = 0, newLeft = 0, hunks = 0, inHunk = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i], header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/.exec(line);
+    if (header) {
+      if (inHunk && (oldLeft !== 0 || newLeft !== 0)) return false;
+      oldLeft = Number(header[2] ?? 1); newLeft = Number(header[4] ?? 1); inHunk = true; hunks++; continue;
+    }
+    if (!inHunk) {
+      if (/^(?:diff |index |--- |\+\+\+ |new file |deleted file |similarity |rename |Binary files )/.test(line) || line === '') continue;
+      return false;
+    }
+    if (line === '' && i === lines.length - 1) continue;
+    if (line.startsWith('\\ No newline at end of file')) continue;
+    if (line.startsWith(' ')) { oldLeft--; newLeft--; }
+    else if (line.startsWith('-')) oldLeft--;
+    else if (line.startsWith('+')) newLeft--;
+    else return false;
+    if (oldLeft < 0 || newLeft < 0) return false;
+  }
+  return hunks > 0 && oldLeft === 0 && newLeft === 0;
 }
 const description = (entry) => {
   const d = entry.data || {};
@@ -87,7 +113,8 @@ export function groupEntries(entries) {
   const groups = [];
   for (const entry of entries) {
     const last = groups.at(-1);
-    if (groupable.has(entry.type) && last && last.type === entry.type && last.turn_id === entry.turn_id) last.items.push(entry);
+    const sameTool = !['mcpToolCall', 'dynamicToolCall'].includes(entry.type) || (last?.items[0]?.data?.server === entry.data?.server && last?.items[0]?.data?.namespace === entry.data?.namespace && last?.items[0]?.data?.tool === entry.data?.tool);
+    if (groupable.has(entry.type) && last && last.type === entry.type && last.turn_id === entry.turn_id && sameTool) last.items.push(entry);
     else groups.push({ type: entry.type, turn_id: entry.turn_id, items: [entry] });
   }
   return groups;
@@ -99,7 +126,7 @@ const state = { agents: [], selected: null, opened: false, timer: null, pages: n
 let actionSequence = 0;
 const actionId = () => `ui-${Date.now().toString(36)}-${++actionSequence}-${Math.random().toString(36).slice(2)}`;
 const controlFor = (id) => {
-  if (!state.controls.has(id)) state.controls.set(id, { draft: '', inputVersion: 0, sending: false, stopping: false, stopEpoch: 0, mutationEpoch: 0, sendResult: '' });
+  if (!state.controls.has(id)) state.controls.set(id, { draft: '', attachments: [], attachmentVersion: 0, picking: false, pathEntry: false, attachmentNotice: '', inputVersion: 0, sending: false, stopping: false, stopEpoch: 0, mutationEpoch: 0, sendResult: '' });
   return state.controls.get(id);
 };
 const active = (agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent?.status);
@@ -107,7 +134,7 @@ function updateAgent(id, fields) {
   const agent = state.agents.find((a) => idOf(a) === id);
   if (!agent) return false;
   let changed = false;
-  for (const key of ['name', 'model', 'reasoning_effort', 'status', 'user_paused', 'user_control_status']) {
+  for (const key of ['name', 'model', 'reasoning_effort', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status']) {
     if (Object.hasOwn(fields, key) && agent[key] !== fields[key]) { agent[key] = fields[key]; changed = true; }
   }
   return changed;
@@ -125,21 +152,43 @@ async function stopAgent($, id) {
   finally { control.stopping = false; if (state.opened && state.selected === id) invalidate($); }
 }
 async function sendAgent($, id) {
-  const control = controlFor(id), message = control.draft, stopEpoch = control.stopEpoch;
+  const control = controlFor(id), message = control.draft, attachments = [...control.attachments], attachmentVersion = control.attachmentVersion, stopEpoch = control.stopEpoch;
   const selected = state.agents.find((agent) => idOf(agent) === id);
-  if (control.sending || control.stopping || selected?.user_control_status === 'stopping' || !message.trim()) return;
+  if (control.sending || control.stopping || selected?.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
   control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; invalidate($);
   try {
-    const result = await bridge($, 'ui_send', { target: id, message }, { requestId: actionId() });
+    const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
     if (result.error || result.offline) {
-      control.sendResult = result.offline || result.error?.code === 'action_status_unknown' ? '发送状态未知，请查看活动后再试。' : '发送失败，草稿已保留。';
+      control.sendResult = result.offline || result.error?.code === 'action_status_unknown' ? '发送状态未知，请查看活动后再试。' : `发送失败：${safe(result.error?.message || result.error).slice(0, 600)}。草稿已保留。`;
     } else if (result.agent_id === id && typeof result.status === 'string') {
       control.sendResult = result.status === 'steered' || result.user_paused || control.stopEpoch !== stopEpoch ? '消息已发送。' : '消息已发送，代理继续工作。';
       if (control.draft === message) { control.draft = ''; control.inputVersion++; }
+      if (control.attachmentVersion === attachmentVersion) { control.attachments = []; control.attachmentVersion++; }
       if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
     } else control.sendResult = '发送状态未知，请查看活动后再试。';
-  } catch { control.sendResult = '发送状态未知，请查看活动后再试。'; }
+  } catch (error) { control.sendResult = `发送状态未知：${safe(error?.message || error).slice(0, 600)}。请查看活动后再试，草稿已保留。`; }
   finally { control.sending = false; if (state.opened && state.selected === id) invalidate($); }
+}
+function addAttachments(control, paths) {
+  const additions = paths.filter((path) => typeof path === 'string' && path.trim());
+  if (!additions.length) return;
+  const selected = [...new Set([...control.attachments, ...additions])];
+  if (selected.length > 20) { control.attachmentNotice = '每条消息最多添加 20 个附件，请分次发送。'; return; }
+  control.attachments = selected;
+  control.attachmentVersion++; control.attachmentNotice = '';
+}
+async function chooseAttachments($, id) {
+  const control = controlFor(id);
+  if (control.picking) return;
+  control.picking = true; control.attachmentNotice = ''; invalidate($);
+  try {
+    const result = await pickFiles($);
+    if (state.controls.get(id) !== control) return;
+    if (result.unsupported) { control.pathEntry = true; control.attachmentNotice = '请输入文件的绝对路径。'; }
+    else if (result.error) control.attachmentNotice = '无法选择文件，请输入文件路径。', control.pathEntry = true;
+    else if (Array.isArray(result.paths)) addAttachments(control, result.paths);
+  } catch { if (state.controls.get(id) === control) { control.pathEntry = true; control.attachmentNotice = '无法选择文件，请输入文件路径。'; } }
+  finally { control.picking = false; if (state.opened && state.selected === id) invalidate($); }
 }
   const pageFor = (id) => {
     if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, busy: false, historyGeneration: 0, detailGeneration: 0, detail: null });
@@ -210,12 +259,12 @@ async function sendAgent($, id) {
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
     if (!state.timer) state.timer = $.clock.every(1000, () => { void poll($).catch(() => {}); });
   }
-  async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`) {
+  async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath) {
     const page = pageFor(id), key = entryKey(entry), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailGeneration;
-    const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset });
+    const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset, ...(filePath !== undefined ? { file_path: filePath } : {}) });
     if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || request !== page.detailGeneration || !state.folds.has(foldKey)) return;
-    if (result.error || result.offline) page.detail = { key, text: '无法获取完整内容', next_offset: null, offset };
-    else page.detail = { key, text: result.text || '', next_offset: result.next_offset, offset };
+    if (result.error || result.offline) page.detail = { key, filePath, text: '无法获取完整内容', error: true, next_offset: null, offset };
+    else page.detail = { key, filePath, text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line };
     invalidate($);
   }
 export function registerUI(on) {
@@ -244,7 +293,7 @@ export function registerUI(on) {
   });
   on('ui.render', { component: 'Pane' }, ($, e, next) => {
     if (e.requestId !== PANE) return next(e);
-    const { Box, Text, Button, Input, Markdown, Image } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
+    const { Box, Text, Button, Input, Markdown, Image, Code } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
     const all = page.mode === 'history' ? page.entries : page.live;
     // The action gives immediate feedback while native history catches up. Once
     // the same message is persisted, retain the native copy for pagination.
@@ -270,8 +319,7 @@ export function registerUI(on) {
     for (const group of groupEntries(entries)) {
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
       if (group.items.length > 1) {
-        const sameFastctx = group.items.every((item) => /fastctx/i.test(`${item.data?.server || ''} ${item.data?.tool || ''}`));
-        const groupLabel = ['mcpToolCall', 'dynamicToolCall'].includes(group.type) ? (sameFastctx ? '使用 FastCtx' : '使用工具') : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
+        const groupLabel = group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
         rows.push(Button({ key: `group_${groupKey}`, plain: true, label: `${groupLabel} (${group.items.length}) ${folded ? '▸' : '▾'}`, onPress: () => { toggle(groupKey); invalidate($); } }));
         if (folded) continue;
       }
@@ -287,6 +335,8 @@ export function registerUI(on) {
           const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
           rows.push(Text({ dimColor: true, children: [description(entry)] }));
           rows.push(Markdown({ key: `message_${key}`, text: safe(loaded?.text ?? body(entry)) }));
+          const attachments = Array.isArray(entry.data?.attachments) ? entry.data.attachments : Array.isArray(entry.data?.content) ? entry.data.content.filter((part) => ['localImage', 'mention'].includes(part?.type)) : [];
+          if (attachments.length) rows.push(Text({ dimColor: true, children: [attachments.map((part) => `附件：${safe(part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件')}`).join('  ')] }));
           if (loaded?.offset > 0) rows.push(Button({ key: `message_prev_${key}`, plain: true, label: '上一页正文', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000)) }));
           if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) rows.push(Button({ key: `item_${key}`, plain: true, label: loaded ? '下一页正文' : '展开全文', onPress: () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); } }));
           continue;
@@ -298,11 +348,16 @@ export function registerUI(on) {
             rows.push(Button({ key: `file_${fileKey}`, plain: true, label: `${changeLabel(change)} ${open ? '▾' : '▸'}`, onPress: () => { toggle(fileKey); invalidate($); } }));
             const diff = entry.data?.changes?.find((item) => item.path === change.path)?.diff ?? change.diff;
             if (open) {
-              rows.push(Box({ borderStyle: 'round', borderDimColor: true, paddingX: 1, children: [Text({ children: [safe(diff || '请查看完整内容')] })] }));
-              const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
-              if (loaded) rows.push(Text({ children: [safe(loaded.text)] }));
-              if (loaded?.offset > 0) rows.push(Button({ key: `file_prev_${fileKey}`, plain: true, label: '上一页输出', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000), fileKey) }));
-              if (!String(entry.id).startsWith('action:') && (!loaded || loaded.next_offset != null)) rows.push(Button({ key: `file_detail_${fileKey}`, plain: true, label: loaded ? '下一页输出' : '查看完整内容', onPress: () => detail($, id, entry, loaded?.next_offset ?? 0, fileKey) }));
+              const filePath = typeof change.path === 'string' ? change.path : '';
+              const loaded = page.detail?.key === entryKey(entry) && page.detail.filePath === filePath ? page.detail : null;
+              const source = safe((loaded && !loaded.error ? loaded.text : diff) ?? '请查看完整内容');
+              const complete = !loaded || loaded.error || (loaded.offset === 0 && loaded.next_offset == null && loaded.format !== 'source');
+              rows.push(typeof Code === 'function' ? Code({ source, ...(filePath ? { path: filePath } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: complete && isUnifiedDiff(source) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ children: [source] }));
+              if (loaded?.error) rows.push(Text({ children: [loaded.text] }));
+              if (filePath) rows.push(Button({ key: `file_copy_path_${fileKey}`, plain: true, label: '复制文件路径', onPress: press => $.ui.copy({ text: filePath, surface: press.surface }) }));
+              if ((loaded && !loaded.error && loaded.text) || diff) rows.push(Button({ key: `file_copy_diff_${fileKey}`, plain: true, label: '复制当前差异', onPress: press => $.ui.copy({ text: loaded && !loaded.error ? loaded.text : diff, surface: press.surface }) }));
+              if (loaded?.offset > 0) rows.push(Button({ key: `file_prev_${fileKey}`, plain: true, label: '上一页输出', onPress: () => detail($, id, entry, Math.max(0, loaded.offset - 16000), fileKey, filePath) }));
+              if (!String(entry.id).startsWith('action:') && (!loaded || loaded.error || loaded.next_offset != null)) rows.push(Button({ key: `file_detail_${fileKey}`, plain: true, label: loaded?.error ? '重试获取内容' : loaded ? '下一页输出' : '查看完整内容', onPress: () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0, fileKey, filePath) }));
             }
           });
           continue;
@@ -323,8 +378,14 @@ export function registerUI(on) {
       }
     }
     const sendLabel = active(selected) && !selected?.user_paused ? '发送' : '发送并继续';
+    if (control.attachments.length) rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: control.attachments.map((path, index) => Button({ key: `attachment_${id}_${index}`, plain: true, label: `${safe(path.split(/[\\/]/).at(-1) || path)} ×`, onPress: () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; invalidate($); } })) }));
+    if (control.pathEntry) rows.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; invalidate($); } }));
+    if (control.attachmentNotice) rows.push(Text({ dimColor: true, children: [control.attachmentNotice] }));
     rows.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, label: '消息', placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '发送中…' : control.stopping || stopStatus === 'stopping' ? '等待停止' : sendLabel, onInput: (value) => { control.draft = value; }, onSubmit: (value) => { control.draft = value; return sendAgent($, id); } }));
-    rows.push(stopButton(`codex_stop_${id}`));
+    const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
+    const used = selected?.context_used_tokens, limit = selected?.context_limit_tokens;
+    const context = Number.isFinite(used) && used >= 0 && Number.isFinite(limit) && limit > 0 ? `上下文 ${Math.round(used / limit * 100)}%` : '';
+    rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: [Button({ key: `codex_attach_${id}`, plain: true, label: control.picking ? '选择中…' : '+ 添加文件', onPress: () => chooseAttachments($, id) }), ...(permission ? [Text({ dimColor: true, children: [permission] })] : []), ...(context ? [Text({ dimColor: true, children: [context] })] : []), ...(model ? [Text({ dimColor: true, children: [safe(model)] })] : []), !control.stopping && stopStatus !== 'stopped' ? Button({ key: `codex_stop_${id}`, plain: true, label: ['stopping', 'unconfirmed'].includes(stopStatus) ? '■ 重试停止' : '■ 停止', onPress: () => stopAgent($, id) }) : stopButton(`codex_stop_${id}`)] }));
     if (control.sendResult) rows.push(Text({ dimColor: true, children: [control.sendResult] }));
     if (state.restore) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
     return Box({ flexDirection: 'column', children: rows });

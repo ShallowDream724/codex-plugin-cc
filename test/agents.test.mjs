@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentController } from '../runtime/agents.mjs';
+import { prepareAttachments } from '../runtime/attachments.mjs';
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 class MockClient extends EventEmitter {
@@ -39,6 +41,80 @@ async function setup(t, options = {}) {
   return { client, controller, spawn: (args = {}) => controller.dispatch('spawn_agent', { message: 'Solve task', cwd: '/workspace', context_mode: 'none', ...args }) };
 }
 const pendingQuestion = (threadId = 'thread-1', turnId = 'turn-1') => ({ threadId, turnId, itemId: 'q-item', questions: [{ id: 'choice', header: 'Choose', question: 'Which?' }], isBlocking: true });
+const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
+const tinyGif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+
+test('direct user attachments steer as native images and file paths without forwarding file contents', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-user-attachments-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const imagePath = path.join(dir, 'photo.txt'), pdfPath = path.join(dir, 'document.png');
+  const imageBytes = tinyPng;
+  await writeFile(imagePath, imageBytes); await writeFile(pdfPath, '%PDF-1.7\nPRIVATE FILE CONTENT');
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  const actions = []; controller.on('agentAction', a => actions.push(a));
+  const result = await controller.dispatch('ui_send', { target: agent.id, message: 'Please inspect', attachments: [{ path: imagePath }, { path: pdfPath }] });
+  assert.equal(result.delivery, 'steered');
+  const wire = client.calls.find(c => c.method === 'turn/steer').params.input;
+  assert.equal(wire[0].type, 'text'); assert.deepEqual(wire[0].text_elements, []);
+  assert.match(wire[0].text, /^\[Direct message from the user\]\n\nPlease inspect/);
+  assert.deepEqual(wire[1], { type: 'localImage', path: await realpath(imagePath) });
+  assert.equal(wire.length, 2); assert.ok(wire[0].text.includes(JSON.stringify(await realpath(pdfPath))));
+  const action = actions.find(a => a.kind === 'send');
+  assert.equal(action.origin, 'user'); assert.deepEqual(action.attachments.map(a => a.type), ['image', 'file']);
+  const event = controller.eventsAfter().find(e => e.action === 'send' && e.phase === 'delivered');
+  assert.deepEqual(event.attachments, action.attachments);
+  assert.doesNotMatch(JSON.stringify({ wire, action, event }), /PRIVATE FILE CONTENT/);
+  assert.deepEqual(await readFile(imagePath), imageBytes);
+});
+
+test('attachment-only resume starts same thread and invalid paths preserve pause', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-user-attachments-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'data.bin'); await writeFile(filePath, 'hello');
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  await controller.dispatch('ui_interrupt', { target: agent.id }); client.complete(agent.thread_id, agent.turn_id, 'interrupted');
+  const count = client.calls.length;
+  for (const invalid of [dir, path.join(dir, 'missing'), 'relative.txt', '\\\\server\\share\\file', '\\\\?\\C:\\device']) {
+    await assert.rejects(controller.dispatch('ui_send', { target: agent.id, attachments: [{ path: invalid }] }));
+    assert.equal(controller.find(agent.id).userPaused, true);
+  }
+  assert.equal(client.calls.length, count);
+  await controller.dispatch('ui_send', { target: agent.id, attachments: [{ path: filePath }] });
+  const start = client.calls.filter(c => c.method === 'turn/start').at(-1);
+  assert.equal(start.params.threadId, agent.thread_id);
+  assert.equal(start.params.input.length, 1); assert.ok(start.params.input[0].text.includes(JSON.stringify(await realpath(filePath))));
+  assert.equal(client.calls.filter(c => c.method === 'thread/start').length, 1);
+  assert.equal(client.calls.filter(c => c.method === 'thread/inject_items').length, 0);
+});
+
+test('image classification checks supported headers and bounds attachment count', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-image-headers-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const samples = [tinyPng, tinyGif, Buffer.from('%PDF-1.7')];
+  const files = [];
+  for (let i = 0; i < samples.length; i++) { const filePath = path.join(dir, String(i)); await writeFile(filePath, samples[i]); files.push({ path: filePath }); }
+  assert.deepEqual((await prepareAttachments(files)).map(file => file.type), ['image', 'image', 'file']);
+  await assert.rejects(prepareAttachments(Array.from({ length: 21 }, () => files[0])), /at most 20/);
+  for (const bytes of [tinyPng.subarray(0, 8), Buffer.from([255, 216, 255, 224]), Buffer.from('GIF89a'), Buffer.from('RIFFxxxxWEBP')]) {
+    await writeFile(files[0].path, bytes);
+    await assert.rejects(prepareAttachments([files[0]]), /appears truncated or invalid/);
+  }
+});
+
+test('a FIFO is rejected without waiting for a writer', { skip: process.platform !== 'linux' }, async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-attachment-fifo-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const fifo = path.join(dir, 'pipe');
+  assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
+  await assert.rejects(prepareAttachments([{ path: fifo }]), /not a regular file/);
+});
+
+test('stop during attachment validation prevents a later resume', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-attachment-stop-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'file.txt'); await writeFile(filePath, 'content');
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  const send = controller.dispatch('ui_send', { target: agent.id, message: 'inspect', attachments: [{ path: filePath }] });
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  await assert.rejects(send, /paused by the user/);
+  assert.equal(client.calls.filter(c => c.method === 'turn/steer').length, 0);
+  assert.equal(controller.find(agent.id).userPaused, true);
+});
 
 test('user stop isolates the tree, waits for descendants, and resumes with user attribution', async t => {
   const { client, controller, spawn } = await setup(t);

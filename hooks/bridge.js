@@ -27,3 +27,10 @@ export async function requestBridge($, operation, args = {}, extras = {}) {
   try { return JSON.parse(result.stdout); }
   catch { throw new Error(`Codex bridge returned no valid response (exit ${result.exitCode}).`); }
 }
+
+export async function pickFiles($) {
+  const node = await $.env.get('CODEX_SUBAGENTS_NODE_COMMAND') || 'node';
+  const result = await $.process.run([node, `${$.plugin.root}/runtime/picker.mjs`], { cwd: await $.session.cwd(), timeoutMs: 210000 });
+  try { return JSON.parse(result.stdout); }
+  catch { return { paths: [], unsupported: true }; }
+}

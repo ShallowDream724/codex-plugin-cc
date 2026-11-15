@@ -18,7 +18,7 @@ function clean(value, limit = PREVIEW_BUDGET) {
     }
     if (!v || typeof v !== 'object') { remaining -= 8; return v; }
     if (depth >= 6) return '[nested data omitted]';
-    if (/^(?:image|blob|audio)$/i.test(v.type ?? '')) return { type: v.type, path: typeof v.path === 'string' ? visit(v.path, depth + 1) : undefined };
+    if (/^(?:image|blob|audio)$/i.test(v.type ?? '')) return { type: v.type, path: typeof v.path === 'string' ? visit(v.path, depth + 1) : undefined, ...(typeof v.name === 'string' ? { name: visit(v.name, depth + 1) } : {}) };
     if (Array.isArray(v)) return v.slice(0, 40).map((x) => visit(x, depth + 1));
     const out = {};
     for (const [k, x] of Object.entries(v).slice(0, 40)) {
@@ -48,7 +48,7 @@ const fileSummary = (item) => (item.changes ?? []).map((change) => {
   }
   return summary;
 });
-const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item.type === 'subAgentActivity' ? subagentFields(item) : item.type === 'fileChange' ? { fileSummary: fileSummary(item), ...item } : item;
+const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item.type === 'subAgentActivity' ? subagentFields(item) : item.type === 'fileChange' ? { fileSummary: fileSummary(item), ...item } : item.type === 'directUserMessage' ? { id: item.id, type: item.type, attachments: item.attachments, text: item.text } : item;
 const binaryString = (value) => typeof value === 'string' && /^data:[^,]*;base64,/i.test(value);
 const textValue = (value) => {
   if (binaryString(value)) return '[binary omitted]';
@@ -90,7 +90,16 @@ function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
   const directPrefix = '[Direct message from the user]\n\n';
   if (item.content[0]?.text?.startsWith(directPrefix)) {
-    return { ...item, type: 'directUserMessage', text: item.content.map((part, index) => typeof part.text === 'string' ? index === 0 ? part.text.slice(directPrefix.length) : part.text : '').filter(Boolean).join('\n\n') };
+    let text = item.content.map((part, index) => typeof part.text === 'string' ? index === 0 ? part.text.slice(directPrefix.length) : part.text : '').filter(Boolean).join('\n\n');
+    let attachments = item.content.filter(part => part.type === 'localImage' && typeof part.path === 'string').map(part => ({ type: 'image', path: part.path, name: part.path.split(/[\\/]/).at(-1) }));
+    const marker = '\n\nAttached local files: ', at = text.lastIndexOf(marker);
+    if (at >= 0 && text.endsWith('.')) {
+      try {
+        const saved = JSON.parse(text.slice(at + marker.length, -1));
+        if (Array.isArray(saved) && saved.every(a => a && typeof a.name === 'string' && typeof a.path === 'string' && ['file', 'image'].includes(a.type))) { attachments = saved; text = text.slice(0, at); }
+      } catch { /* Ordinary user text remains visible. */ }
+    }
+    return { ...item, type: 'directUserMessage', text, ...(attachments.length ? { attachments } : {}) };
   }
   const prefixes = [guidance?.collaboration?.trim(), 'Claude is your parent agent.', guidance?.default?.instructions?.trim()].filter(Boolean);
   return { ...item, content: item.content.map((part) => {
@@ -124,6 +133,9 @@ export class ActivityStore {
   }
   summary(a) { return { id: a.id, agent_id: a.id, name: a.name, status: a.status, activity: a.activity,
     model: a.model, reasoning_effort: a.effort,
+    permissions_mode: this.controller.settings?.permissionsMode ?? null,
+    context_used_tokens: Number.isSafeInteger(a.tokenUsage?.last?.totalTokens) && a.tokenUsage.last.totalTokens >= 0 ? a.tokenUsage.last.totalTokens : null,
+    context_limit_tokens: Number.isSafeInteger(a.tokenUsage?.modelContextWindow) && a.tokenUsage.modelContextWindow > 0 ? a.tokenUsage.modelContextWindow : null,
     user_paused: a.userPaused === true, user_control_status: a.userControlStatus ?? null }; }
   list() { return { agents: [...this.controller.agents.values()].map((a) => this.summary(a)) }; }
   bucket(id) {
@@ -145,7 +157,7 @@ export class ActivityStore {
     const agent = this.controller.agents.get(action.agent_id);
     if (action.kind === 'close') { this.live.delete(action.agent_id); return; }
     if (!agent || action.thread_id !== agent.threadId || typeof action.message !== 'string') return;
-    this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '', type: action.origin === 'user' ? 'directUserMessage' : 'parentMessage', data: { text: clean(action.message) } });
+    this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '', type: action.origin === 'user' ? 'directUserMessage' : 'parentMessage', data: { text: clean(action.message), ...(action.attachments?.length ? { attachments: clean(action.attachments) } : {}) } });
   }
   decorate(item) {
     if (['collabAgentToolCall', 'collabToolCall'].includes(item.type)) return { ...item, displayAgentNames: Object.fromEntries([...(item.receiverThreadIds ?? []), ...Object.keys(item.agentsStates ?? {})].filter(id => this.agentNames.has(id)).map(id => [id, this.agentNames.get(id)])) };
@@ -207,14 +219,18 @@ export class ActivityStore {
     const next_cursor = page.nextCursor ? { turn_id: turnId, items_cursor: page.nextCursor, turns_cursor: turnsCursor } : turnsCursor ? { turns_cursor: turnsCursor } : null;
     return { agent: this.summary(agent), entries, next_cursor };
   }
-  async detail({ target, turn_id, item_id, offset = 0 } = {}) {
+  async detail({ target, turn_id, item_id, offset = 0, file_path } = {}) {
     const agent = this.find(target);
     if (typeof turn_id !== 'string' || !turn_id || typeof item_id !== 'string' || !item_id) throw new TypeError('turn_id and item_id are required.');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid detail offset.');
+    if (file_path !== undefined && (typeof file_path !== 'string' || !file_path)) throw new TypeError('Invalid file path.');
     const page = await this.client.request('thread/items/read', { threadId: agent.threadId, turnId: turn_id, itemIds: [item_id] });
     const item = page.data?.[0]?.item;
     if (!visible(item)) return { text: '', next_offset: null };
-    const text = formatItem(removeGuidance(item, this.controller.guidance));
-    return { text: text.slice(offset, offset + 16000), next_offset: offset + 16000 < text.length ? offset + 16000 : null };
+    const change = file_path !== undefined && item.type === 'fileChange' ? item.changes?.find(change => change.path === file_path) : null;
+    if (file_path !== undefined && !change) throw new Error('File is not part of this recorded change.');
+    const text = change ? change.diff ?? '' : formatItem(removeGuidance(item, this.controller.guidance));
+    const next_offset = offset + 16000 < text.length ? offset + 16000 : null;
+    return { text: text.slice(offset, offset + 16000), next_offset, ...(change ? { file_path, format: offset === 0 && next_offset === null && /^@@ -\d+(?:,\d+)? \+\d+/m.test(text) ? 'diff' : 'source' } : {}) };
   }
 }

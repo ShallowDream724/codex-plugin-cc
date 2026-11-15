@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hooks/ui.js';
+const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
 function connect($, handler) {
   $.session = { id: async () => 'session', cwd: async () => 'C:/work' };
@@ -47,13 +48,13 @@ test('direct controls preserve per-agent drafts and scope late results', async (
   });
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (tree, key) => tree.props.children.find((node) => node.props.key?.startsWith(key));
+  const item = (tree, key) => nodes(tree).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
   let tree = draw(); item(tree, 'codex_message_').props.onInput('first draft');
   const send = item(tree, 'codex_message_').props.onSubmit('first draft');
   item(draw(), 'codex_message_').props.onInput('edited while sending');
-  const stop = item(draw(), 'codex_stop_').props.onPress();
+  const stop = item(draw(), 'codex_stop_a').props.onPress();
   assert.equal(item(draw(), 'codex_message_').props.submitLabel, '发送中…');
-  assert.equal(item(draw(), 'codex_stop_'), undefined);
+  assert.equal(item(draw(), 'codex_stop_a'), undefined);
   await new Promise((resolve) => setImmediate(resolve));
   assert.notEqual(requests[0].requestId, requests[1].requestId);
   assert.deepEqual(requests.map((r) => r.args.target), ['a', 'a']);
@@ -85,15 +86,47 @@ test('uncertain send retains draft and stop distinguishes unconfirmed from stopp
   });
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (key) => draw().props.children.find((node) => node.props.key?.startsWith(key));
+  const item = (key) => nodes(draw()).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
   item('codex_message_').props.onInput('retain this');
   await item('codex_message_').props.onSubmit('retain this');
   assert.equal(item('codex_message_').props.value, 'retain this');
   assert.match(JSON.stringify(draw()), /发送状态未知/);
-  await item('codex_stop_').props.onPress();
+  await item('codex_stop_a').props.onPress();
   assert.match(JSON.stringify(draw()), /停止状态未确认/);
-  assert.equal(item('codex_stop_').props.label, '重试停止');
+  assert.equal(item('codex_stop_a').props.label, '■ 重试停止');
   assert.equal(calls.filter((op) => op === 'ui_send').length, 1);
+  closeUI();
+});
+
+test('attachments stay scoped to drafts and uncertain or edited sends preserve them', async () => {
+  const hooks = [], requests = []; let resolveSend, pickerCount = 0;
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const agents = [{ agent_id: 'a', status: 'running', permissions_mode: 'full-access', context_used_tokens: 500, context_limit_tokens: 1000 }, { agent_id: 'b', status: 'running' }];
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents };
+    if (op === 'ui_revision') return { revision: 1, entries: [] };
+    if (op === 'ui_send') { requests.push(args); return new Promise((resolve) => { resolveSend = resolve; }); }
+  });
+  const run = $.process.run;
+  $.process.run = async (argv, options) => argv[1].endsWith('/runtime/picker.mjs') ? (pickerCount++, { stdout: '{"unsupported":true}', exitCode: 0 }) : run(argv, options);
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  const item = (key) => nodes(draw()).find((node) => node.props.key?.startsWith(key));
+  assert.equal(pickerCount, 0); assert.match(JSON.stringify(draw()), /上下文 50%/);
+  await item('codex_attach_a').props.onPress();
+  item('attachment_path_a').props.onSubmit('C:/docs/a.png');
+  await openAgent($, 'b'); assert.ok(!JSON.stringify(draw()).includes('a.png'));
+  await openAgent($, 'a'); assert.ok(JSON.stringify(draw()).includes('a.png'));
+  let send = item('codex_message_a').props.onSubmit('');
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(requests[0], { target: 'a', message: '', attachments: [{ path: 'C:/docs/a.png' }] });
+  resolveSend({ error: { code: 'action_status_unknown' } }); await send;
+  assert.ok(JSON.stringify(draw()).includes('a.png'));
+  send = item('codex_message_a').props.onSubmit(''); await new Promise((r) => setImmediate(r));
+  await item('codex_attach_a').props.onPress(); item('attachment_path_a').props.onSubmit('C:/docs/b.txt');
+  resolveSend({ agent_id: 'a', status: 'steered' }); await send;
+  assert.ok(JSON.stringify(draw()).includes('a.png')); assert.ok(JSON.stringify(draw()).includes('b.txt'));
   closeUI();
 });
 
@@ -110,13 +143,13 @@ test('unchanged revision does not redraw and stopping blocks submit while allowi
   });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  const item = (key) => draw().props.children.find((node) => node.props.key?.startsWith(key));
+  const item = (key) => nodes(draw()).find((node) => node.props.key === key || (key !== 'codex_stop_a' && node.props.key?.startsWith(key)));
   item('codex_message_').props.onInput('draft');
   const before = invalidations; timers[0](); await new Promise((r) => setImmediate(r));
   assert.equal(invalidations, before);
   assert.equal(item('codex_message_').props.value, 'draft');
-  await item('codex_stop_').props.onPress();
-  assert.equal(item('codex_stop_').props.label, '重试停止');
+  await item('codex_stop_a').props.onPress();
+  assert.equal(item('codex_stop_a').props.label, '■ 重试停止');
   assert.equal(item('codex_message_').props.submitLabel, '等待停止');
   await item('codex_message_').props.onSubmit('draft');
   assert.equal(sends, 0);
@@ -140,15 +173,19 @@ test('activity deduplication respects message origin', async () => {
 test('conversation shows prose and expandable file changes with authoritative counts', async () => {
   const hooks = [];
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
-  const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff: '+one\n-old' }] } }];
-  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : { revision: 1, entries });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const diff = '@@ -1,1 +1,1 @@\n-old\n+one\n';
+  const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff }] } }];
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : op === 'ui_detail' ? { text: diff, next_offset: 16000, format: 'source' } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = draw(); assert.ok(tree.props.children.some(node => node.type === 'Markdown' && node.props.text === '正文直接显示'));
   const file = tree.props.children.find(node => node.props.key?.startsWith('file_'));
   assert.match(file.props.label, /test\.js \+5 -1/); file.props.onPress();
-  tree = draw(); assert.ok(JSON.stringify(tree).includes('+one\\n-old'));
+  tree = draw(); const code = tree.props.children.find(node => node.type === 'Code');
+  assert.deepEqual(code.props, { source: diff, path: 'test.js', format: 'diff', wrap: 'wrap' });
+  await tree.props.children.find((node) => node.props.key?.startsWith('file_detail_')).props.onPress();
+  assert.equal(draw().props.children.find((node) => node.type === 'Code').props.format, 'source');
   assert.equal(tree.props.children.at(-2).type, 'Input');
   closeUI();
 });
@@ -161,7 +198,7 @@ test('long messages and file output support next and previous pages', async () =
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] };
     if (op === 'ui_revision') return { revision: 1, entries };
-    if (op === 'ui_detail') { requests.push([args.item_id, args.offset]); return { text: `${args.item_id} page ${args.offset}`, next_offset: args.offset === 0 ? 16000 : null }; }
+    if (op === 'ui_detail') { requests.push([args.item_id, args.offset, args.file_path ?? null]); return { text: `${args.item_id} page ${args.offset}`, next_offset: args.offset === 0 ? 16000 : null }; }
   });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
@@ -176,7 +213,7 @@ test('long messages and file output support next and previous pages', async () =
   await item('file_detail_a:t:f:file:0').props.onPress();
   assert.ok(JSON.stringify(draw()).includes('f page 16000'));
   await item('file_prev_a:t:f:file:0').props.onPress();
-  assert.deepEqual(requests, [['m', 0], ['m', 16000], ['m', 0], ['f', 0], ['f', 16000], ['f', 0]]);
+  assert.deepEqual(requests, [['m', 0, null], ['m', 16000, null], ['m', 0, null], ['f', 0, 'test.js'], ['f', 16000, 'test.js'], ['f', 0, 'test.js']]);
   closeUI();
 });
 
@@ -206,7 +243,7 @@ test('native activity types render readable tool, search, plan and lifecycle det
   const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entry = (id, type, data) => ({ id, type, turn_id: 't', data });
-  const entries = [entry('a', 'mcpToolCall', { server: 'fastctx', tool: 'inspect_local_file' }), entry('b', 'mcpToolCall', { server: 'fastctx', tool: 'grep' }), entry('search', 'webSearch', { action: { query: '中文查询', url: 'https://example.com/' } }), entry('plan', 'plan', { text: '检查结果' }), entry('compact', 'contextCompaction', { stage: 'started' }), entry('child', 'subAgentActivity', { name: '研究', kind: 'completed', agentThreadId: 'child' }), entry('spawn', 'collabAgentToolCall', { name: '撰写', tool: 'spawnAgent', stage: 'completed', agents: [{ id: 'child2', status: 'running' }] }), entry('future', 'futureItem', { opaque: 4 })];
+  const entries = [entry('a', 'mcpToolCall', { server: 'fastctx', tool: 'inspect_local_file' }), entry('a2', 'mcpToolCall', { server: 'fastctx', tool: 'inspect_local_file' }), entry('b', 'mcpToolCall', { server: 'fastctx', tool: 'grep' }), entry('search', 'webSearch', { action: { query: '中文查询', url: 'https://example.com/' } }), entry('plan', 'plan', { text: '检查结果' }), entry('compact', 'contextCompaction', { stage: 'started' }), entry('child', 'subAgentActivity', { name: '研究', kind: 'completed', agentThreadId: 'child' }), entry('spawn', 'collabAgentToolCall', { name: '撰写', tool: 'spawnAgent', stage: 'completed', agents: [{ id: 'child2', status: 'running' }] }), entry('future', 'futureItem', { opaque: 4 })];
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
@@ -246,6 +283,8 @@ test('only adjacent same-type calls within a turn group and retain items', () =>
     { id: '5', type: 'commandExecution', turn_id: 'u' },
   ];
   assert.deepEqual(groupEntries(entries).map((g) => g.items.map((i) => i.id)), [['1', '2'], ['3'], ['4'], ['5']]);
+  const calls = ['grep', 'grep', 'glob'].map((tool, index) => ({ id: String(index), type: 'mcpToolCall', turn_id: 't', data: { server: 'fastctx', tool } }));
+  assert.deepEqual(groupEntries(calls).map((g) => g.items.length), [2, 1]);
 });
 
 test('history stays reachable after live rollover and past fifty pages; closed observation never redraws', async () => {

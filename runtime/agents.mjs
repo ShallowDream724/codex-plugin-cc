@@ -5,6 +5,7 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
+import { prepareAttachments, directUserInput } from './attachments.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const ACTIVE = new Set(['starting', 'running', 'waiting', 'compacting']);
@@ -145,7 +146,7 @@ export class AgentController extends EventEmitter {
       case 'followup_task': return this.followup(args.target, args.message);
       case 'interrupt_agent': return this.interrupt(this.find(args.target));
       case 'ui_interrupt': return this.uiInterrupt(this.find(args.target));
-      case 'ui_send': return this.uiSend(this.find(args.target), args.message);
+      case 'ui_send': return this.uiSend(this.find(args.target), args.message, args.attachments);
       case 'close_agent': return this.closeSelected(args);
       case 'answer_agent': return this.answer(this.find(args.target), args.request_id, args.answer);
       default: throw new Error(`Unknown operation: ${operation}`);
@@ -171,8 +172,8 @@ export class AgentController extends EventEmitter {
     return true;
   }
 
-  action(kind, a, message, origin) {
-    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: a.turnId ?? null, name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }) });
+  action(kind, a, message, origin, attachments) {
+    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: a.turnId ?? null, name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }), ...(attachments?.length ? { attachments: copy(attachments) } : {}) });
   }
 
   updateResolved(a, response) {
@@ -266,7 +267,7 @@ export class AgentController extends EventEmitter {
     a.startEvents = [];
     let response;
     try {
-      response = await this.rpc('turn/start', { threadId: a.threadId, input: input(text),
+      response = await this.rpc('turn/start', { threadId: a.threadId, input: Array.isArray(text) ? text : input(text),
         ...(a.effort ? { effort: a.effort } : {}), serviceTierForTurn: 'default' });
       if (!nonempty(response?.turn?.id)) throw new Error('turn/start returned no turn id; start outcome is unknown.');
       a.startingTurn = false;
@@ -409,12 +410,12 @@ export class AgentController extends EventEmitter {
     } finally { const a = this.threads.get(id); if (a) a.adopting = false; this.reservations.delete(reservation); this.adoptions.delete(id); }
   }
 
-  async send(a, message, followup, existingReservation, origin, resumeToken) {
-    if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+  async send(a, message, followup, existingReservation, origin, resumeToken, attachments = []) {
+    if (!nonempty(message) && !(origin === 'user' && attachments.length)) throw new TypeError('message must be nonempty.');
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
     if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
     const epoch = a.controlEpoch ?? 0;
-    const wireMessage = origin === 'user' ? `[Direct message from the user]\n\n${message}` : message;
+    const wireInput = origin === 'user' ? directUserInput(message, attachments) : input(message);
     if (a.adopting && !existingReservation) throw new Error(`Thread ${a.threadId} is being adopted.`);
     if (a.externalConflict) throw new Error(`Thread ${a.threadId} became active in another client. Close this agent and retry adoption once the native thread is idle.`);
     const reconciliation = await this.reconcileUnknown(a);
@@ -428,8 +429,8 @@ export class AgentController extends EventEmitter {
       const turnId = a.turnId;
       a.sending = (a.sending ?? 0) + 1;
       try {
-        const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: input(wireMessage) });
-        this.action('send', a, message, origin);
+        const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: wireInput });
+        this.action('send', a, message, origin, attachments);
         return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
       } finally { a.sending--; if (a.interrupted) this.stopTree(a).catch(() => {}); }
     }
@@ -453,11 +454,11 @@ export class AgentController extends EventEmitter {
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
           items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
-        this.action('send', a, message, origin);
+        this.action('send', a, message, origin, attachments);
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
-      await this.startTurn(a, wireMessage, true);
-      this.action('send', a, message, origin);
+      await this.startTurn(a, wireInput, true);
+      this.action('send', a, message, origin, attachments);
       return this.view(a);
     } finally { a.resuming = false; if (a.interrupted) this.stopTree(a).catch(() => {}); }
   }
@@ -570,34 +571,41 @@ export class AgentController extends EventEmitter {
     return { ...result, user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
   }
 
-  async uiSend(a, message) {
-    if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+  async uiSend(a, message, attachments) {
+    if (message !== undefined && typeof message !== 'string') throw new TypeError('message must be a string.');
     if (a.userResumeToken) throw new Error('A direct user message is already being delivered.');
-    if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; answer the pending request first.');
-    if (a.userPaused && (this.treeBusy(a) || a.stopPromise)) throw new Error('Interruption is not yet confirmed; retry after all agent work stops.');
-    if (!ACTIVE.has(a.status) && [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id))) throw new Error('Agent has an active descendant; wait for it to finish before resuming.');
-    const wasPaused = !!a.userPaused;
     const resumeToken = Symbol('user resume');
+    const epoch = a.controlEpoch ?? 0;
     a.userResumeToken = resumeToken;
     try {
-      a.userPaused = false; a.userControlStatus = null;
-      if (wasPaused) await this.persist();
-      const result = await this.send(a, message, true, undefined, 'user', resumeToken);
-      if (wasPaused && !a.userPaused && a.threadId) this.pausedThreads.delete(a.threadId);
-      this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'delivered', message, delivery_status: result.status === 'steered' ? 'steered' : 'started' });
-      await this.persist();
-      return { ...result, delivery: result.status === 'steered' ? 'steered' : 'started', user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
-    } catch (error) {
-      if (wasPaused && !a.userPaused) {
-        a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
-        if (a.threadId) this.pausedThreads.add(a.threadId);
-        a.userControlStatus = this.treeBusy(a) ? 'unconfirmed' : 'stopped';
+      const files = await prepareAttachments(attachments);
+      if ((a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
+      message ??= '';
+      if (!nonempty(message) && !files.length) throw new TypeError('A message or attachment is required.');
+      if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; answer the pending request first.');
+      if (a.userPaused && (this.treeBusy(a) || a.stopPromise)) throw new Error('Interruption is not yet confirmed; retry after all agent work stops.');
+      if (!ACTIVE.has(a.status) && [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id))) throw new Error('Agent has an active descendant; wait for it to finish before resuming.');
+      const wasPaused = !!a.userPaused;
+      try {
+        a.userPaused = false; a.userControlStatus = null;
+        if (wasPaused) await this.persist();
+        const result = await this.send(a, message, true, undefined, 'user', resumeToken, files);
+        if (wasPaused && !a.userPaused && a.threadId) this.pausedThreads.delete(a.threadId);
+        this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'delivered', message, ...(files.length ? { attachments: files } : {}), delivery_status: result.status === 'steered' ? 'steered' : 'started' });
+        await this.persist();
+        return { ...result, delivery: result.status === 'steered' ? 'steered' : 'started', user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
+      } catch (error) {
+        if (wasPaused && !a.userPaused) {
+          a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
+          if (a.threadId) this.pausedThreads.add(a.threadId);
+          a.userControlStatus = this.treeBusy(a) ? 'unconfirmed' : 'stopped';
+        }
+        this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'failed', message, ...(files.length ? { attachments: files } : {}), delivery_status: 'unconfirmed', error: error.message });
+        a.pauseDurable = this.persist();
+        await a.pauseDurable;
+        if (a.userPaused && this.treeBusy(a)) await this.stopTree(a);
+        throw error;
       }
-      this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'failed', message, delivery_status: 'unconfirmed', error: error.message });
-      a.pauseDurable = this.persist();
-      await a.pauseDurable;
-      if (a.userPaused && this.treeBusy(a)) await this.stopTree(a);
-      throw error;
     } finally { if (a.userResumeToken === resumeToken) a.userResumeToken = null; }
   }
 

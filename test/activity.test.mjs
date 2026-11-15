@@ -102,10 +102,14 @@ test('user source and stop status survive the display projection without consumi
   const { store, client, controller } = fixture();
   const agent = controller.agents.get('a');
   agent.userPaused = true; agent.userControlStatus = 'stopping';
+  agent.tokenUsage = { last: { totalTokens: 600 }, total: { totalTokens: 90000 }, modelContextWindow: 1000 };
+  controller.settings = { permissionsMode: 'full-access' };
   controller.pendingEvents = [{ seq: 1, origin: 'user' }];
   controller.emit('agentAction', { kind: 'send', origin: 'user', agent_id: 'a', thread_id: 'root', turn_id: 't', message: 'Keep the source files.' });
   const before = store.revision({ target: 'a' });
   assert.equal(before.agent.user_paused, true); assert.equal(before.agent.user_control_status, 'stopping');
+  assert.equal(before.agent.context_used_tokens, 600); assert.equal(before.agent.context_limit_tokens, 1000);
+  assert.equal(before.agent.permissions_mode, 'full-access');
   assert.equal(before.entries[0].type, 'directUserMessage');
   agent.userControlStatus = 'stopped';
   const after = store.revision({ target: 'a', revision: before.revision });
@@ -147,4 +151,27 @@ test('root lifecycle rows distinguish compaction stages and keep only child iden
   assert.equal(entries[1].data.name, 'Scout');
   assert.ok(!JSON.stringify(entries).includes('private'));
   assert.deepEqual(controller.pendingEvents, [{ seq: 1 }]);
+});
+
+test('native user attachments and long text remain readable after history projection', () => {
+  const { store, client } = fixture();
+  const attachments = [{ name: 'report.pdf', path: 'C:/work/report.pdf', type: 'file' }, { name: 'image.png', path: 'C:/work/image.png', type: 'image' }];
+  const text = 'Review these results. '.repeat(300);
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: { id: 'user', type: 'userMessage', content: [{ type: 'text', text: `[Direct message from the user]\n\n${text}\n\nAttached local files: ${JSON.stringify(attachments)}.` }, { type: 'localImage', path: 'C:/work/image.png' }] } } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.ok(entry.preview.startsWith('Review these results.'));
+  assert.ok(!entry.preview.includes('Attached local files:'));
+  assert.equal(entry.type, 'directUserMessage');
+  assert.deepEqual(entry.data.attachments, attachments);
+});
+
+test('file detail selects only the recorded file and preserves truthful page formats', async () => {
+  const { store, client } = fixture();
+  const first = '--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-old\n+new';
+  client.request = async () => ({ data: [{ item: { id: 'edits', type: 'fileChange', changes: [{ path: 'a.js', diff: first }, { path: 'b.js', diff: 'line\n'.repeat(5000) }] } }] });
+  const result = await store.detail({ target: 'a', turn_id: 't', item_id: 'edits', file_path: 'a.js' });
+  assert.equal(result.text, first); assert.equal(result.format, 'diff');
+  const page = await store.detail({ target: 'a', turn_id: 't', item_id: 'edits', file_path: 'b.js' });
+  assert.equal(page.format, 'source'); assert.equal(page.next_offset, 16000);
+  await assert.rejects(store.detail({ target: 'a', turn_id: 't', item_id: 'edits', file_path: 'foreign.js' }), /not part/);
 });
