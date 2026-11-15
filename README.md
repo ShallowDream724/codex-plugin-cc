@@ -1,18 +1,54 @@
 # Codex Subagents
 
-让 Claude Code 负责沟通、判断和调度，让 Codex 执行任务。支持连续发消息、等待、提问回传、中断，以及沿用原历史继续工作。
+在 Claude Code 中调用 Codex 子代理执行任务，并在侧栏查看消息、工具调用和文件修改。支持继续原对话、直接给子代理发消息、等待答复和停止任务。
 
-这是从 `y-cruce/codex-plugin-cc` 精简出的独立插件。运行时只依赖 Node 和 Codex CLI；没有 ACP、Qoder、Antigravity、DSH、额外管理代理、固定模型清单或旧模型提示教程。
+仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件位于 **[feat/codex-subagents 分支](https://github.com/ShallowDream724/codex-plugin-cc/tree/feat/codex-subagents)**；分享和安装时请使用这个分支，默认 `main` 是上游项目。
 
-当前源码为 **0.2.0-rc.12**。经验性文字集中在 [审阅稿](docs/GUIDANCE_REVIEW.md)。候选包不会自动替换已安装版本。
+当前版本为 **0.2.0-rc.12（候选测试版）**。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 
 - Node.js 22 或更新版本。
 - 已配置并登录的 Codex CLI **0.169.0 或更新版本**。使用原生线程、当前上下文注入和历史分页接口。
-- 支持 JavaScript mods 的 Claude Code。开发适配对象为本机 `@cometix/claude-code 2.1.303`。
+- 支持 JavaScript mods 的 Claude Code；当前验证的宿主版本是 `@cometix/claude-code 2.1.303`。仅有普通插件安装功能、但没有 mods 接口的宿主不满足要求。
 
-终端和 Desktop 使用同一份插件，宿主需要提供 mods 与 `session.messages({as:'api'})` 能力。插件不修改 Claude Code 的安装文件。Desktop 的实际内核和通知呈现由使用者验收，不用 CLI 测试代替 Desktop 验收。
+终端和 Desktop 使用同一份插件，宿主需要提供 mods 与 `session.messages({as:'api'})` 能力。插件不修改 Claude Code 的安装文件。桌面功能的适配与验证范围见 [验证记录](docs/VERIFICATION.md)。
+
+## 安装与首次使用
+
+在 Claude Code 对话中依次执行以下两条命令（不是在系统终端执行）：
+
+```text
+/plugin marketplace add ShallowDream724/codex-plugin-cc#feat/codex-subagents
+/plugin install codex-subagents@codex-subagents
+```
+
+安装后重启 Claude Code，打开需要工作的项目，在对话中加载：
+
+```text
+/codex-subagents:codex-delegation
+```
+
+然后直接描述任务，例如：
+
+```text
+让 Codex 创建一个子代理，只读检查当前项目的结构和主要问题，不修改文件，完成后向你汇报。
+```
+
+后续可以继续说「让刚才的 Codex 子代理继续检查测试覆盖」。插件沿用该代理的原生对话，无须每次重新创建。
+
+- 点击代理名称查看侧栏，也可输入 `/codex-agents`。
+- 在侧栏直接发消息：运行中指导当前轮，空闲时继续原对话。
+- 输入 `/codex-stop` 立即停止当前 Claude 会话的全部 Codex 代理及其后代；Claude 自己的停止按钮保持原行为。
+
+已安装用户可在系统终端更新：
+
+```bash
+claude plugin marketplace update codex-subagents
+claude plugin update codex-subagents@codex-subagents
+```
+
+更新后重启 Claude Code，继续原对话即可，无须新建聊天。插件更新不会自动续跑已经停止的任务。
 
 ## 上下文范围
 
@@ -24,7 +60,7 @@
 
 侧栏区分「新建」「继承 Claude」「Codex 历史」三种来源，后续续接不会改变来源；缺少可靠来源信息的旧登记显示「来源未记录」。继承的 Claude 窗口供模型使用，不再作为一串重复气泡显示。接入 Codex 深链接时则显示该线程原有的消息和工具历史，按需分页读取，包括原生接口仍保留的压缩前记录。深链接续接不同时注入 Claude 窗口；需要补充的任务信息可以写在续接消息里。
 
-## 加载
+## 本地开发加载
 
 从当前目录加载到一次 Claude Code 会话：
 
@@ -32,16 +68,9 @@
 claude --plugin-dir "/absolute/path/to/codex-subagents"
 ```
 
-在 Claude 中加载 `/codex-subagents:codex-delegation`，然后正常说明工作。工具定义按需通过 ToolSearch 加载。
+在 Claude 中加载 `/codex-subagents:codex-delegation`，然后正常说明工作。工具定义按需通过 ToolSearch 加载。协作指引集中在 [审阅稿](docs/GUIDANCE_REVIEW.md)。
 
 开发期间安装到日常会话时，先将已提交版本打包，解压到独立的版本目录，再以该目录作为本地 marketplace。不要将正在编辑的工作区作为长期安装来源；宿主会直接读取目录，运行中的 helper 会拒绝混用不同版本。更新后重启 Claude，再继续原对话。
-
-从 GitHub 分支安装时，使用该分支作为 marketplace 来源：
-
-```text
-/plugin marketplace add ShallowDream724/codex-plugin-cc#feat/codex-subagents
-/plugin install codex-subagents@codex-subagents
-```
 
 ## 工具
 

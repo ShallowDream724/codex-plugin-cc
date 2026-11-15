@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
+const CLIENT_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const STDERR_TAIL_BYTES = 4096;
 const MAX_TIMER_MS = 2_147_483_647;
@@ -133,7 +134,7 @@ export class AppServerClient extends EventEmitter {
         this.#resolveExit();
       });
       const result = await this.request('initialize', {
-        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.2.0-rc.6' },
+        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: CLIENT_VERSION },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       await this.#send({ method: 'initialized', params: {} });
