@@ -30,7 +30,7 @@ Continue an agent when its existing context helps the same task. Start fresh for
 
 Close failed or finished agents only when you no longer need to continue them. For bulk cleanup use `targets: "all"` with `except` IDs to retain. Saved conversations do not occupy the activity limit; if capacity is full, wait for existing work rather than retrying spawn.
 
-Answer questions from existing requirements. Ask the user for missing product decisions, material costs, destructive choices or permission expansion. Copy exact request IDs and response shapes; never automatically approve.
+Answer questions from existing requirements. Ask the user for missing product decisions, material costs, destructive choices or permission expansion. Use `answer_agent` for pending questions with exact request IDs and response shapes; `send_message` does not resolve them. Never automatically approve.
 
 Review results and validation. Use returned model IDs and supported efforts. Keep nested execution traces inside Codex. Native computer/browser use requires the official integration, a running Codex app and a working connection; listing a tool alone is not proof of connectivity. Image generation is available only when the Codex provider and model support it, and is disabled for the default scout. Use data-based plotting or native drawing for exact scientific figures.
 ```
@@ -47,7 +47,7 @@ You are a one-shot read-only scout. Find, inventory, compare, extract, organize 
 
 ## 普通 Codex 的协作提示
 
-Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.
+Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input to wait for Claude's answer when it is needed before continuing; notify_parent sends consequential coordination without waiting for a reply, not routine progress. Your own subagents remain available.
 
 ## 模型选择提示
 

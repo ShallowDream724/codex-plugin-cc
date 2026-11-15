@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { AgentController } from '../runtime/agents.mjs';
 import { prepareAttachments } from '../runtime/attachments.mjs';
+import { ActivityStore } from '../runtime/activity.mjs';
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 class MockClient extends EventEmitter {
@@ -43,6 +44,90 @@ async function setup(t, options = {}) {
 const pendingQuestion = (threadId = 'thread-1', turnId = 'turn-1') => ({ threadId, turnId, itemId: 'q-item', questions: [{ id: 'choice', header: 'Choose', question: 'Which?' }], isBlocking: true });
 const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
 const tinyGif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+
+test('spawn task action uses its exact first turn even when native completion precedes the start reply', async t => {
+  for (const lostReply of [false, true]) {
+    const { client, controller, spawn } = await setup(t); const activity = ActivityStore.attach(client, controller); t.after(() => activity.close());
+    const actions = []; controller.on('agentAction', action => actions.push(action));
+    client.handler = (method, params) => {
+      if (method !== 'turn/start') return;
+      client.note('turn/started', { threadId: params.threadId, turn: { id: 'first-turn' } });
+      client.note('item/completed', { threadId: params.threadId, turnId: 'first-turn', item: { id: 'native-user', type: 'userMessage', content: [{ text: params.input[0].text }] } });
+      client.complete(params.threadId, 'first-turn');
+      if (lostReply) throw new Error('Lost start reply');
+      return { turn: { id: 'first-turn', status: 'completed' } };
+    };
+    if (lostReply) await assert.rejects(spawn({ message: 'Initial task' }), /Lost start reply/);
+    else await spawn({ message: 'Initial task' });
+    assert.equal(actions.filter(action => action.kind === 'spawn').length, 1);
+    assert.equal(actions[0].turn_id, 'first-turn');
+    const agent = controller.snapshot().agents[0]; assert.equal(agent.turn_id, null);
+    const entries = activity.revision({ target: agent.id }).entries;
+    const task = entries.find(entry => entry.type === 'parentMessage'), native = entries.find(entry => entry.id === 'native-user');
+    assert.equal(task.turn_id, 'first-turn'); assert.equal(native.turn_id, task.turn_id);
+    assert.equal(task.data.text, 'Initial task'); assert.equal(native.preview, task.data.text);
+  }
+});
+
+test('spawn action retains one unbound task when native turn creation is rejected', async t => {
+  const { client, controller, spawn } = await setup(t); const activity = ActivityStore.attach(client, controller); t.after(() => activity.close());
+  const actions = []; controller.on('agentAction', action => actions.push(action));
+  client.handler = method => { if (method === 'turn/start') throw Object.assign(new Error('Start rejected'), { code: -32602 }); };
+  await assert.rejects(spawn({ message: 'Unstarted task' }), /Start rejected/);
+  assert.equal(actions.length, 1); assert.equal(actions[0].kind, 'spawn'); assert.equal(actions[0].turn_id, null);
+  const entries = activity.revision({ target: actions[0].agent_id }).entries;
+  assert.equal(entries.length, 1); assert.equal(entries[0].data.text, 'Unstarted task'); assert.equal(entries[0].turn_id, '');
+});
+
+test('context source identifies new, Claude-inherited and native conversations across followups and restart', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-context-source-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json'); const nativeId = '12345678-1234-4234-8234-123456789abc';
+  const { client, controller, spawn } = await setup(t, { statePath });
+  const fresh = await spawn(); client.complete(fresh.thread_id, fresh.turn_id);
+  const snapshot = { history: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Claude context' }] }], digest: 'context-digest', stats: { messages: 1 } };
+  const inherited = await spawn({ context_mode: 'available', snapshot }); client.complete(inherited.thread_id, inherited.turn_id);
+  client.handler = (method, params) => method === 'thread/read' ? { thread: { id: params.threadId, cwd: '/workspace', status: { type: 'idle' } } }
+    : method === 'thread/resume' ? { thread: { status: { type: 'idle' } } } : undefined;
+  // Extra caller data cannot add a Claude snapshot to native-ID/deeplink followup.
+  const native = await controller.dispatch('followup_task', { target: `codex://threads/${nativeId}`, message: 'Continue native work', context_mode: 'available', snapshot });
+  client.complete(nativeId, native.turn_id);
+  assert.deepEqual([fresh.context_source, inherited.context_source, native.context_source], ['new', 'claude', 'codex']);
+  for (const [agent, source] of [[fresh, 'new'], [inherited, 'claude'], [native, 'codex']]) {
+    const continued = await controller.dispatch('followup_task', { target: `codex://threads/${agent.thread_id}`, message: 'Continue again', context_mode: 'available', snapshot });
+    assert.equal(continued.context_source, source); assert.equal(continued.thread_id, agent.thread_id);
+    client.complete(agent.thread_id, continued.turn_id);
+  }
+  assert.equal(client.calls.filter(call => call.method === 'thread/start').length, 2);
+  const injections = client.calls.filter(call => call.method === 'thread/inject_items');
+  assert.equal(injections.length, 1); assert.equal(injections[0].params.threadId, inherited.thread_id);
+  await controller.persist();
+  const restored = new AgentController({ client: new MockClient(), statePath, nativeRoleResolver: async () => undefined });
+  await restored.init(); t.after(() => restored.close());
+  assert.deepEqual((await restored.dispatch('list_agents')).agents.map(agent => agent.context_source), ['new', 'claude', 'codex']);
+  assert.deepEqual(JSON.parse(await readFile(statePath, 'utf8')).agents.map(agent => agent.contextSource), ['new', 'claude', 'codex']);
+});
+
+test('legacy context-source migration only infers origins with positive evidence', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-context-migration-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const evidence = [
+    { id: 'unproven', injected: false, snapshot: null },
+    { id: 'injected', injected: true },
+    { id: 'snapshot', snapshot: { digest: 'recorded-digest', stats: {} } },
+    { id: 'external', externalThread: true },
+    { id: 'adopted', externalAdopted: true },
+    { id: 'invalid-snapshot', snapshot: {} },
+    { id: 'explicit-new', contextSource: 'new' },
+    { id: 'invalid-enum', contextSource: 'other', injected: true },
+  ];
+  await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: evidence.map(agent => ({ status: 'completed', ...agent })) }));
+  const restored = new AgentController({ client: new MockClient(), statePath, nativeRoleResolver: async () => undefined });
+  await restored.init(); t.after(() => restored.close());
+  const listed = (await restored.dispatch('list_agents')).agents;
+  assert.deepEqual(listed.map(agent => agent.context_source), ['unknown', 'claude', 'claude', 'codex', 'codex', 'unknown', 'new', 'claude']);
+  assert.equal(listed[0].context_source, 'unknown');
+  assert.deepEqual(JSON.parse(await readFile(statePath, 'utf8')).agents.map(agent => agent.contextSource), listed.map(agent => agent.context_source));
+});
 
 test('private sidebar followup keeps native history and Claude can reuse the same agent afterward', async t => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn();

@@ -2,6 +2,20 @@
 import { toolOutputText } from '../shared/tool-output.mjs';
 const text = (value) => typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '';
 const outputText = toolOutputText;
+const completedStates = new Set(['completed', 'complete', 'success', 'succeeded']);
+
+function statusText(data) {
+  const seen = new Set(), parts = [];
+  for (const value of [data.status, data.stage]) {
+    if (value == null || value === '') continue;
+    const label = String(value), normalized = label.trim().toLowerCase();
+    if (completedStates.has(normalized) || seen.has(normalized)) continue;
+    seen.add(normalized); parts.push(label);
+  }
+  if (data.exitCode != null) parts.push(`退出码 ${data.exitCode}`);
+  if (data.durationMs != null) parts.push(`${data.durationMs} ms`);
+  return parts.join(' · ');
+}
 
 export function toolSections(entry) {
   const data = entry.data || {}, sections = [];
@@ -27,9 +41,11 @@ export function toolSections(entry) {
   } else if (entry.type === 'functionCallOutput') { consumed = ['output']; add('输出', outputText(data.output)); }
   add('错误', data.error);
   if (consumed) {
-    const status = [data.status, data.stage, data.exitCode != null ? `退出码 ${data.exitCode}` : null, data.durationMs != null ? `${data.durationMs} ms` : null].filter((value) => value != null && value !== '').join(' · ');
+    const status = statusText(data);
     if (status) sections.push({ label: '状态', source: status, compact: true });
-    const metadata = Object.fromEntries(Object.entries(data).filter(([key]) => !['id', 'type', 'display_title', 'error', 'status', 'stage', 'exitCode', 'durationMs', ...consumed].includes(key)));
+    const metadata = Object.fromEntries(Object.entries(data).filter(([key, value]) =>
+      !['id', 'type', 'display_title', 'error', 'status', 'stage', 'exitCode', 'durationMs', 'startedAtMs', 'completedAtMs', 'namespace', ...consumed].includes(key)
+      && !(key === 'success' && value === true)));
     if (Object.keys(metadata).length) sections.push({ label: '详情', source: text(metadata), collapsible: true });
   }
   return sections;

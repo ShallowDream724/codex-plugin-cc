@@ -116,7 +116,8 @@ function removeGuidance(item, guidance) {
     }
     return { ...item, type: 'directUserMessage', text, ...(attachments.length ? { attachments } : {}) };
   }
-  const prefixes = [guidance?.collaboration?.trim(), 'Claude is your parent agent.', guidance?.default?.instructions?.trim()].filter(Boolean);
+  const legacyCollaboration = 'Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.';
+  const prefixes = [guidance?.collaboration?.trim(), legacyCollaboration, 'Claude is your parent agent.', guidance?.default?.instructions?.trim()].filter(Boolean);
   return { ...item, content: item.content.map((part) => {
     if (typeof part.text !== 'string') return part;
     let text = part.text;
@@ -147,7 +148,7 @@ export class ActivityStore {
     return agent;
   }
   summary(a) { return { id: a.id, agent_id: a.id, name: a.name, status: a.status, activity: a.activity,
-    model: a.model, reasoning_effort: a.effort,
+    model: a.model, reasoning_effort: a.effort, context_source: a.contextSource ?? 'unknown',
     permissions_mode: this.controller.settings?.permissionsMode ?? null,
     context_used_tokens: Number.isSafeInteger(a.tokenUsage?.last?.totalTokens) && a.tokenUsage.last.totalTokens >= 0 ? a.tokenUsage.last.totalTokens : null,
     context_limit_tokens: Number.isSafeInteger(a.tokenUsage?.modelContextWindow) && a.tokenUsage.modelContextWindow > 0 ? a.tokenUsage.modelContextWindow : null,

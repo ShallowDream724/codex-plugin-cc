@@ -401,7 +401,7 @@ test('desktop tool expansion keeps the pane valid through output and raw-call di
     { id: 'answer', turn_id: 't', type: 'agentMessage', data: { text: '已完成。' } },
   ];
   connect($, async (_$, op, args) => {
-    if (op === 'ui_list') return { agents: [{ agent_id: 'a', name: 'terra-test', status: 'completed', model: 'gpt-6.1-terra', reasoning_effort: 'high', permissions_mode: 'full-access', context_used_tokens: 7, context_limit_tokens: 100 }] };
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', name: 'terra-test', context_source: 'claude', status: 'completed', model: 'gpt-6.1-terra', reasoning_effort: 'high', permissions_mode: 'full-access', context_used_tokens: 7, context_limit_tokens: 100 }] };
     if (op === 'ui_revision') return { revision: 1, entries };
     if (op === 'ui_detail') return { text: `output: ${args.item_id}`, offset: 0, next_offset: null, format: 'source' };
     return { entries: [], next_cursor: null };
@@ -416,6 +416,7 @@ test('desktop tool expansion keeps the pane valid through output and raw-call di
   };
   const click = async key => (nodes(await draw()).find(node => node.props.key === key).props.onPress());
   const groupKey = nodes(await draw()).find(node => node.props.key?.startsWith('group_')).props.key;
+  assert.deepEqual(nodes(await draw()).find(node => node.props.key === 'codex_origin_a').props.children, ['继承 Claude']);
   assert.equal(nodes(await draw()).find(node => node.props.key === groupKey).props.label, '已使用 FastCtx 集成');
   assert.ok(nodes(await draw()).some(node => node.type === 'Svg' && node.props.key === `icon_chevron_${groupKey}`));
   await click(groupKey);

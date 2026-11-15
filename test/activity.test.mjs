@@ -20,6 +20,17 @@ function fixture() {
   return { client, controller, requests, store: ActivityStore.attach(client, controller) };
 }
 
+test('activity summaries expose persistent context origins without guessing missing metadata', () => {
+  const { controller, store } = fixture();
+  const agent = controller.agents.get('a'); assert.equal(store.list().agents[0].context_source, 'unknown');
+  for (const source of ['new', 'claude', 'codex', 'unknown']) {
+    agent.contextSource = source;
+    assert.equal(store.list().agents[0].context_source, source);
+    assert.equal(store.summary(agent).context_source, source);
+  }
+  store.close();
+});
+
 test('history uses owned native thread and bounded deferred pages', async () => {
   const { store, requests } = fixture();
   await assert.rejects(() => store.history({ target: 'foreign' }), /Unknown/);
@@ -88,23 +99,27 @@ test('history rejects repeated and malformed cursors across pages', async () => 
   await assert.rejects(() => store.history({ target: 'a', cursor: { seen_turn_cursors: Array.from({ length: 65 }, (_, i) => String(i)) } }), /Invalid history cursor/);
 });
 
-test('history keeps a bounded cursor trail while paging through long histories', async () => {
-  const { client, store } = fixture();
+test('adopted history crosses repeated compactions with a bounded cursor trail', async () => {
+  const { client, store, controller } = fixture();
+  controller.agents.get('a').contextSource = 'codex';
   client.request = async (method, args) => {
     if (method === 'thread/turns/list') {
       const index = Number(args.cursor ?? 0);
-      return { data: [{ id: `turn${index}` }], nextCursor: index < 149 ? String(index + 1) : null };
+      return { data: [{ id: `turn${index}`, status: 'completed' }], nextCursor: index < 149 ? String(index + 1) : null };
     }
-    return { data: [{ item: { id: args.turnId, type: 'agentMessage', text: 'x' } }], nextCursor: null };
+    return { data: [{ item: { id: args.turnId, type: Number(args.turnId.slice(4)) % 10 === 0 ? 'contextCompaction' : 'agentMessage', text: 'x' } }], nextCursor: null };
   };
-  let cursor, count = 0;
+  let cursor, count = 0, compactions = 0;
   do {
     const page = await store.history({ target: 'a', limit: 1, cursor });
     assert.equal(page.entries[0].id, `turn${count++}`);
+    assert.equal(page.agent.context_source, 'codex');
+    if (page.entries[0].type === 'contextCompaction') { compactions++; assert.equal(page.entries[0].data.stage, 'completed'); }
     cursor = page.next_cursor;
     assert.ok((cursor?.seen_turn_cursors?.length ?? 0) <= 64);
   } while (cursor);
   assert.equal(count, 150);
+  assert.equal(compactions, 15);
 });
 
 test('live cache excludes descendant and reasoning events and never touches pending events', () => {
@@ -159,6 +174,14 @@ test('previews bound deep data and image payloads while details format native it
   controller.guidance = { collaboration: 'Shared rules.', default: { instructions: 'Scout rules.' } };
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: { id: 'user', type: 'userMessage', content: [{ text: 'Claude is your parent agent.\n\nScout rules.\n\nFind the issue' }] } } });
   assert.equal(store.revision({ target: 'a' }).entries.find((e) => e.id === 'user').preview, 'Find the issue');
+  const legacy = 'Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.';
+  const original = { id: 'legacy-user', type: 'userMessage', content: [{ text: legacy + '\n\nOriginal task' }] };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'old-turn', item: original } });
+  assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'legacy-user').preview, 'Original task');
+  assert.equal(original.content[0].text, legacy + '\n\nOriginal task');
+  const quoted = 'Explain these historical instructions: ' + legacy + '\n\nKeep this user text';
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'later-turn', item: { id: 'quoted-guidance', type: 'userMessage', content: [{ text: quoted }] } } });
+  assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').preview, quoted);
 });
 
 test('tool call titles survive live and deferred history projection without reading output titles', async () => {

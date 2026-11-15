@@ -1,5 +1,5 @@
 {
-  "collaboration": "Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.",
+  "collaboration": "Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input to wait for Claude's answer when it is needed before continuing; notify_parent sends consequential coordination without waiting for a reply, not routine progress. Your own subagents remain available.",
   "default": {
     "model": "gpt-6-luna",
     "reasoning_effort": "medium",

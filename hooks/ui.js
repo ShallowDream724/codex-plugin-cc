@@ -14,7 +14,7 @@ const MAX_DETAILS = 16;
 const VISIBLE_ENTRIES = 500;
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
-const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
+const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
 const detailKey = (entry, filePath) => JSON.stringify([entryKey(entry), filePath ?? null]);
 const detailFor = (page, entry, filePath) => page.details.get(detailKey(entry, filePath));
@@ -227,7 +227,7 @@ function updateAgent(id, fields) {
   const agent = state.agents.find((a) => idOf(a) === id);
   if (!agent) return false;
   let changed = false;
-  for (const key of ['name', 'model', 'reasoning_effort', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status']) {
+  for (const key of ['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status']) {
     if (Object.hasOwn(fields, key) && agent[key] !== fields[key]) { agent[key] = fields[key]; changed = true; }
   }
   return changed;
@@ -612,6 +612,8 @@ function renderPane($, e, next, attempt = {}) {
     const effort = rawEffort ? rawEffort[0].toUpperCase() + rawEffort.slice(1) : '';
     const model = [friendlyModel, effort].filter(Boolean).join(' · ');
     navigation.push(Box({ key: `codex_title_row_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [agentMark(`codex_title_icon_${id}`, id), Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [safe(agentDisplayName(selected.name || 'Codex'))] })] }));
+    const sourceLabel = ({ new: '新建', claude: '继承 Claude', codex: 'Codex 历史', unknown: '来源未记录' })[selected.context_source];
+    if (sourceLabel) navigation.push(caption(`codex_origin_${id}`, sourceLabel));
     if (state.error) navigation.push(caption('codex_open_error', state.error));
     if (state.error || page.liveError || page.historyError) {
       if (page.liveError) navigation.push(caption('codex_update_error', page.liveError));
