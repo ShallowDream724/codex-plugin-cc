@@ -8,26 +8,26 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const resultMessage = (result, tool_use_id = 'wait-1') => ({ role: 'user', content: [{ type: 'tool_result', tool_use_id, content: JSON.stringify(result) }] });
 
-async function setup(respond = () => ({}), history = []) {
+async function setup(respond = () => ({}), history = [], userConfig = {}) {
   const { register } = await import('../hooks/register.js?' + randomUUID());
-  const handlers = new Map(), calls = [], prompts = [], retained = [...history];
+  const handlers = new Map(), calls = [], envs = [], prompts = [], retained = [...history];
   let timer, scans = 0, submit = async () => ({});
   register((event, filter, handler) => {
     if (event === 'tool.call') handlers.set(filter.tool.split('__').at(-1), handler);
     else handlers.set(event, filter);
-  });
+  }, userConfig);
   const $ = {
     session: { id: async () => 'owner', cwd: async () => '/workspace', messages: async () => { scans++; return retained; } },
     env: { get: async () => undefined }, plugin: { root: '/plugin' },
-    tool: { register: async () => {} }, clock: { every: (_, callback) => { timer = callback; } }, ui: { status: async () => {} },
+    tool: { register: async () => {} }, clock: { every: (_, callback) => { timer = callback; } }, ui: { status: async () => {}, invalidate: () => {} },
     prompt: { submit: args => { prompts.push(args); return submit(args); } },
     process: { run: async (_, options) => {
-      const body = JSON.parse(options.stdin); calls.push(body);
+      const body = JSON.parse(options.stdin); calls.push(body); envs.push(options.env);
       return { stdout: JSON.stringify(await respond(body, calls.length)), exitCode: 0 };
     } },
   };
   return {
-    calls, prompts, retained, get scans() { return scans; }, setSubmit: fn => { submit = fn; },
+    calls, envs, prompts, retained, get scans() { return scans; }, setSubmit: fn => { submit = fn; },
     start: () => handlers.get('session.start')($, {}, async e => e), observe: () => timer(),
     emit: (name, args = {}) => handlers.get(name)($, args, async e => e),
     call: async (name, args = {}, signal) => JSON.parse((await handlers.get(name)($, args, { signal })).result),
@@ -193,4 +193,27 @@ test('close filters only its agent from an undelivered shared batch', async () =
   const h = await setup(body => body.operation === 'close_agent' ? { status: 'closed', agent_id: 'closed' } : { events: [event(11, 'closed'), event(12, 'open')], delivery_id: 'd1' });
   const result = await h.call('wait_agent', { tool_use_id: 'wait-1' }); await h.call('close_agent', { target: 'closed-name-alias', tool_use_id: 'close-1' });
   await h.append(resultMessage(result)); assert.deepEqual(h.calls.at(-1).args.observations, [{ delivery_id: 'd1', sequences: [12], events: [event(12, 'open')] }]); assert.equal(h.calls[1].requestId, 'close-1');
+});
+
+test('default role skips the host context read and user permissions stay outside model arguments', async () => {
+  const h = await setup(() => ({ agent_id: 'a' }), [], { maxActiveAgents: '7', permissionsMode: 'auto-review' });
+  await h.call('spawn_agent', { role: 'default', message: 'Locate the symbol', tool_use_id: 'scout' });
+  assert.equal(h.scans, 0);
+  assert.equal(h.calls[0].args.context_mode, 'none');
+  assert.equal(h.calls[0].args.role, 'default');
+  assert.equal(h.calls[0].context, undefined);
+  assert.deepEqual(JSON.parse(h.envs[0].CODEX_SUBAGENTS_SETTINGS), { maxActiveAgents: 7, permissionsMode: 'auto-review' });
+  assert.equal(h.calls[0].args.permissionsMode, undefined);
+  const refused = await h.call('spawn_agent', { role: 'default', context_mode: 'available', message: 'task' });
+  assert.match(refused.error.message, /task-only context/);
+  assert.equal(h.scans, 0); assert.equal(h.calls.length, 1);
+});
+
+test('bulk close hides long ID receipts from Claude while filtering every closed agent', async () => {
+  const events = [event(11, 'a'), event(12, 'b'), event(13, 'keep')];
+  const h = await setup(body => body.operation === 'close_agent' ? { closed_count: 2, closed_ids: ['a', 'b'], skipped: [] } : { events, delivery_id: 'batch' });
+  const result = await h.call('wait_agent', { tool_use_id: 'wait-1' });
+  assert.deepEqual(await h.call('close_agent', { targets: 'all', except: ['keep'], tool_use_id: 'close' }), { closed_count: 2, skipped: [] });
+  await h.append(resultMessage(result));
+  assert.deepEqual(h.calls.at(-1).args.observations[0].sequences, [13]);
 });

@@ -3,8 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { loadSettings, permissionParams } from './settings.mjs';
+import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 
-const ROLE = 'Claude is your parent agent. Work independently first. Ask the parent for necessary decisions using request_user_input. Use notify_parent only for a real blocker; omit routine progress reports. Finish with a concise result and validation report.\n\n';
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const ACTIVE = new Set(['starting', 'running', 'waiting', 'compacting']);
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'unknown']);
@@ -14,14 +15,20 @@ const nonempty = (x) => typeof x === 'string' && x.trim().length > 0;
 const copy = (x) => structuredClone(x);
 const input = (text) => [{ type: 'text', text }];
 const isOverflow = (error) => error?.codexErrorInfo === 'contextWindowExceeded' || error?.code === 'contextWindowExceeded';
+const roleConfig = (role) => role === 'default' ? { 'features.default_mode_request_user_input': false, 'features.multi_agent': false, 'features.multi_agent_v2': false, 'features.image_generation': false } : undefined;
 
 /** Owns directly-created Codex threads; never forwards nested agents or tool traces. */
 export class AgentController extends EventEmitter {
-  constructor({ client, statePath } = {}) {
+  constructor({ client, statePath, settings, nativeRoleResolver = resolveNativeDefault } = {}) {
     super();
     if (!client) throw new TypeError('client is required.');
     this.client = client;
     this.statePath = statePath;
+    this.settings = loadSettings(settings);
+    this.guidance = loadGuidance();
+    this.nativeRoleResolver = nativeRoleResolver;
+    this.adoptions = new Map();
+    this.reservations = new Set();
     this.agents = new Map();
     this.threads = new Map();
     this.descendants = new Map();
@@ -58,11 +65,14 @@ export class AgentController extends EventEmitter {
       this.agents.set(a.id, a);
       if (a.threadId) this.threads.set(a.threadId, a);
       if (ACTIVE.has(a.status)) {
-        a.status = 'interrupted'; a.turnId = null; a.activity = 'stale_pending';
-        this.publish(a, 'interrupted', { reason: 'controller_restarted', stale_pending: true });
+        a.status = 'unknown'; a.turnId = null; a.activity = 'stale_pending';
+        this.publish(a, 'unknown', { reason: 'controller_restarted', stale_pending: true });
       }
     }
     this.pendingEvents = this.pendingEvents.filter((event) => this.agents.has(event.agent_id));
+    // A restarted controller cannot assume an active turn stopped. Reconcile
+    // native state now so confirmed idle threads release capacity automatically.
+    await Promise.allSettled([...this.agents.values()].filter((a) => a.status === 'unknown' && a.threadId).map((a) => this.reconcileUnknown(a)));
     await this.persist();
     return this;
   }
@@ -113,18 +123,42 @@ export class AgentController extends EventEmitter {
       case 'list_agents': return { agents: [...this.agents.values()].map((a) => this.view(a)) };
       case 'list_models': return this.models();
       case 'send_message': return this.send(this.find(args.target), args.message, false);
-      case 'followup_task': return this.send(this.find(args.target), args.message, true);
+      case 'followup_task': return this.followup(args.target, args.message);
       case 'interrupt_agent': return this.interrupt(this.find(args.target));
-      case 'close_agent': return this.closeAgent(this.find(args.target));
+      case 'close_agent': return this.closeSelected(args);
       case 'answer_agent': return this.answer(this.find(args.target), args.request_id, args.answer);
       default: throw new Error(`Unknown operation: ${operation}`);
     }
   }
 
   find(target) {
+    if (typeof target === 'string' && target.startsWith('codex://threads/')) target = target.slice('codex://threads/'.length);
     const matches = [...this.agents.values()].filter((a) => a.id === target || a.threadId === target || a.name === target);
     if (matches.length !== 1) throw new Error(matches.length ? 'Ambiguous agent target.' : 'Unknown agent target.');
     return matches[0];
+  }
+
+  occupies(a) {
+    return ACTIVE.has(a.status) || a.status === 'unknown' || !!a.turnId || !!a.pending.length || a.spawning || a.resuming || a.startingTurn || a.recovery || [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id));
+  }
+
+  reserve(key, a) {
+    if (a && this.occupies(a)) return false;
+    const count = [...this.agents.values()].filter((agent) => this.occupies(agent)).length + this.reservations.size;
+    if (count >= this.settings.maxActiveAgents) throw new Error(`Active agent limit (${this.settings.maxActiveAgents}) reached.`);
+    this.reservations.add(key);
+    return true;
+  }
+
+  action(kind, a, message) {
+    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: a.turnId ?? null, name: a.name ?? null, ...(message === undefined ? {} : { message }) });
+  }
+
+  updateResolved(a, response) {
+    const model = response?.model ?? response?.thread?.model;
+    const effort = response?.reasoningEffort ?? response?.thread?.reasoningEffort;
+    if (nonempty(model)) a.model = model;
+    if (nonempty(effort)) a.effort = effort;
   }
 
   async rpc(method, params) {
@@ -132,24 +166,36 @@ export class AgentController extends EventEmitter {
     return Promise.race([this.client.request(method, params, { timeoutMs: 120000 }), this.closedPromise.then(() => { throw new Error('App-server connection closed.'); })]);
   }
 
-  async spawn({ message, cwd, model, reasoning_effort, name, context_mode = 'available', snapshot }) {
+  async spawn({ message, cwd, model, reasoning_effort, name, context_mode, snapshot, role }) {
+    let roleInstructions = '';
+    if (role !== undefined) {
+      if (role !== 'default') throw new TypeError('Unknown role.');
+      const preset = defaultRole(this.guidance);
+      if (model !== undefined && model !== preset.model || reasoning_effort !== undefined && reasoning_effort !== preset.reasoning_effort || context_mode !== undefined && context_mode !== 'none') throw new TypeError('role default requires its configured model, effort, and context_mode none.');
+      model = preset.model; reasoning_effort = preset.reasoning_effort; context_mode = 'none'; roleInstructions = `${preset.instructions}\n\n`;
+    }
+    context_mode ??= 'available';
     if (!nonempty(message) || !nonempty(cwd)) throw new TypeError('message and cwd are required.');
     if (!path.posix.isAbsolute(cwd) && !path.win32.isAbsolute(cwd)) throw new TypeError('cwd must be an absolute path.');
     if (!['available', 'none'].includes(context_mode)) throw new TypeError('context_mode must be available or none.');
     if (context_mode === 'available' && (!object(snapshot) || !Array.isArray(snapshot.history) || !nonempty(snapshot.digest) || !object(snapshot.stats))) {
       throw new Error('context_mode available requires a validated snapshot.');
     }
-    if (name && [...this.agents.values()].some((a) => a.name === name)) throw new Error('Agent name is already in use.');
-    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, status: 'starting', activity: 'starting',
+    const reservation = Symbol('spawn'); this.reserve(reservation);
+    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, role, status: 'starting', activity: 'starting',
       pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: true, recoveryUsed: false, interrupted: false, spawning: true };
     this.agents.set(a.id, a);
+    this.reservations.delete(reservation);
     this.starting++;
     try {
-      const response = await this.rpc('thread/start', { cwd, ...(model ? { model } : {}), ephemeral: false, serviceTier: 'default',
-        config: { 'features.default_mode_request_user_input': true }, dynamicTools: [{ type: 'function', name: 'notify_parent',
-          description: 'Report a real blocker to the Claude parent.', inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'], additionalProperties: false } }] });
+      const nativeDefault = role === undefined ? await this.nativeRoleResolver({ cwd, guidance: this.guidance, readConfig: (params) => this.rpc('config/read', params) }) : undefined;
+      const response = await this.rpc('thread/start', { cwd, ...(model ? { model } : {}), ...permissionParams(this.settings), ephemeral: false, serviceTier: 'default',
+        config: roleConfig(role) ?? { 'features.default_mode_request_user_input': true, ...nativeDefault }, dynamicTools: role === 'default' ? [] : [{ type: 'function', name: 'notify_parent',
+          description: 'Send a necessary coordination message to Claude.', inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'], additionalProperties: false } }] });
       if (!nonempty(response.thread?.id)) throw new Error('thread/start returned no thread id.');
+      this.updateResolved(a, response);
       a.threadId = response.thread.id;
+      this.action('spawn', a, message);
       this.threads.set(a.threadId, a);
       this.linkDescendants();
       this.replayEarly(a.threadId);
@@ -158,11 +204,13 @@ export class AgentController extends EventEmitter {
         a.snapshot = { digest: snapshot.digest, stats: snapshot.stats };
         a.injected = true;
       }
-      if (!a.interrupted) await this.startTurn(a, ROLE + message, true);
+      const collaboration = role === 'default' ? 'Claude is your parent agent.\n\n' : `${this.guidance.collaboration.trim()}\n\n`;
+      if (!a.interrupted) await this.startTurn(a, collaboration + roleInstructions + message, true);
       return { ...this.view(a), context_snapshot: a.snapshot ? { ...copy(a.snapshot), ...(Object.hasOwn(snapshot, 'preview') ? { preview: copy(snapshot.preview) } : {}) } : null };
     } catch (error) {
       if (ACTIVE.has(a.status) && !a.turnId) this.finish(a, this.closing ? 'interrupted' : 'failed', { message: error.message });
-      throw error;
+      const recovery = a.threadId ? `Inspect or continue agent ${a.id} on native thread ${a.threadId}; do not create replacement work until its state is known.` : `Agent ${a.id} has no confirmed native thread; inspect its status or close it before retrying.`;
+      throw Object.assign(new Error(`Agent ${a.id}${a.threadId ? ` (thread ${a.threadId})` : ''}: ${error.message} ${recovery}`, { cause: error }), { agent_id: a.id, thread_id: a.threadId ?? null, status: a.status, recovery });
     } finally {
       a.spawning = false;
       this.starting--;
@@ -259,7 +307,8 @@ export class AgentController extends EventEmitter {
         if (a.status !== 'unknown') return;
         let status = response?.thread?.status?.type;
         if (status === 'active' && !a.loaded) {
-          const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true });
+          const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+          this.updateResolved(a, response);
           resumed = true; a.loaded = true;
           if (a.status !== 'unknown') return { resumed };
           // The thread may finish while its subscription is being restored.
@@ -298,8 +347,45 @@ export class AgentController extends EventEmitter {
     return new Error(`Previous turn/start outcome is unknown; native metadata could not confirm a safe operation (${a.error?.reconciliation_error ?? a.error?.reconciliation_status ?? 'unconfirmed thread'}). Inspect thread ${a.threadId} in Codex before retrying.`);
   }
 
-  async send(a, message, followup) {
+  async followup(target, message) {
     if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    let id = typeof target === 'string' && target.startsWith('codex://threads/') ? target.slice('codex://threads/'.length) : target;
+    if (typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) id = id.toLowerCase();
+    const matches = [...this.agents.values()].filter((a) => a.id === id || a.threadId === id || a.name === id);
+    if (matches.length > 1) throw new Error('Ambiguous agent target. Use an agent ID.');
+    const existing = matches[0];
+    if (this.adoptions.has(existing?.threadId ?? id)) throw new Error(`Thread ${existing?.threadId ?? id} is already being adopted; retry using the registered agent after it completes.`);
+    if (existing) return this.send(existing, message, true);
+    if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Unknown agent target; native thread IDs must be UUIDs.');
+    const reservation = Symbol('adopt'); this.reserve(reservation);
+    this.adoptions.set(id, true);
+    try {
+      const response = await this.rpc('thread/read', { threadId: id, includeTurns: false });
+      const thread = response?.thread;
+      if (thread?.id !== id || !nonempty(thread.cwd) || !path.posix.isAbsolute(thread.cwd) && !path.win32.isAbsolute(thread.cwd)) throw new Error('Native thread metadata has no matching ID and absolute cwd.');
+      if (!['idle', 'notLoaded'].includes(thread.status?.type)) throw new Error(`Native thread status is ${thread.status?.type ?? 'unknown'}; active or unconfirmed external threads cannot be adopted.`);
+      const clientTools = await externalClientTools(thread);
+      const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, status: 'interrupted', activity: 'adopted',
+        pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: false, recoveryUsed: false, interrupted: false, terminalEmitted: true, adopting: true, externalAdopted: true, externalThread: true };
+      this.updateResolved(a, { thread });
+      this.retiredThreads.delete(id); this.agents.set(a.id, a); this.threads.set(id, a);
+      try {
+        await this.persist();
+        const result = await this.send(a, message, true, reservation);
+        return { ...result, client_tools_unavailable: clientTools, limitations: ['Original client dynamic tools are unavailable here. Continue in the original Codex client if those tools are needed.'] };
+      } catch (error) {
+        throw new Error(`Thread ${id} is registered as agent ${a.id}. ${error.message} Inspect the thread in Codex or retry using this agent ID; do not create replacement work.`, { cause: error });
+      }
+    } catch (error) {
+      if (error.cause) throw error;
+      throw new Error(`Could not adopt native thread ${id}: ${error.message} Inspect the thread in Codex and retry when its state is confirmed.`, { cause: error });
+    } finally { const a = this.threads.get(id); if (a) a.adopting = false; this.reservations.delete(reservation); this.adoptions.delete(id); }
+  }
+
+  async send(a, message, followup, existingReservation) {
+    if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (a.adopting && !existingReservation) throw new Error(`Thread ${a.threadId} is being adopted.`);
+    if (a.externalConflict) throw new Error(`Thread ${a.threadId} became active in another client. Close this agent and retry adoption once the native thread is idle.`);
     const reconciliation = await this.reconcileUnknown(a);
     if (a.status === 'unknown') throw this.unknownError(a);
     if (a.removing) throw new Error('Agent is closing.');
@@ -310,27 +396,59 @@ export class AgentController extends EventEmitter {
       a.sending = (a.sending ?? 0) + 1;
       try {
         const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: input(message) });
+        this.action('send', a, message);
         return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
       } finally { a.sending--; }
     }
     if (a.resuming) throw new Error('Agent followup is already starting.');
+    const reservation = existingReservation ?? Symbol('followup');
+    if (followup && !existingReservation) this.reserve(reservation, a);
     a.resuming = true;
+    this.reservations.delete(reservation);
     try {
-      if ((followup && !reconciliation?.resumed) || !a.loaded) await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true });
+      if ((followup && !reconciliation?.resumed) || !a.loaded) {
+        const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+        this.updateResolved(a, response);
+        if (a.externalAdopted && !a.loaded && !['idle', 'notLoaded'].includes(response?.thread?.status?.type)) {
+          a.externalConflict = true;
+          throw new Error(`Native thread ${a.threadId} became active or unconfirmed during resume; no task was sent.`);
+        }
+      }
       a.loaded = true;
+      a.externalAdopted = false;
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
           items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
+        this.action('send', a, message);
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
       await this.startTurn(a, message, true);
+      this.action('send', a, message);
       return this.view(a);
     } finally { a.resuming = false; }
   }
 
+  async closeSelected(args) {
+    const { target, targets, except } = args;
+    if (target !== undefined && targets !== undefined) throw new TypeError('Specify target or targets, not both.');
+    if (except !== undefined && (!Array.isArray(except) || except.some((x) => !nonempty(x)))) throw new TypeError('except must be an array of nonempty targets.');
+    if (except !== undefined && targets !== 'all') throw new TypeError('except is only valid with targets all.');
+    if (targets === undefined && target !== undefined && except === undefined) return this.closeAgent(this.find(target));
+    if (targets !== 'all' && (!Array.isArray(targets) || targets.length === 0 || targets.some((x) => !nonempty(x)))) throw new TypeError('targets must be all or a nonempty array of targets.');
+    const excluded = new Set((except ?? []).map((x) => this.find(x).id));
+    const selected = targets === 'all' ? [...this.agents.values()] : targets.map((x) => this.find(x));
+    const snapshot = [...new Map(selected.filter((a) => !excluded.has(a.id)).map((a) => [a.id, a])).values()];
+    const closed_ids = [], skipped = [];
+    for (const a of snapshot) {
+      try { await this.closeAgent(a); closed_ids.push(a.id); }
+      catch (error) { skipped.push({ agent_id: a.id, reason: error.message }); }
+    }
+    return { closed_count: closed_ids.length, closed_ids, skipped };
+  }
+
   canClose(a) {
     if (a.status === 'unknown') throw new Error('Agent turn/start outcome is unknown; reconcile the native Codex thread before closing ownership.');
-    if (!TERMINAL.has(a.status) || a.turnId || a.pending.length || a.spawning || a.resuming || a.startingTurn || a.sending || a.recovery) {
+    if (!TERMINAL.has(a.status) || a.turnId || a.pending.length || a.spawning || a.adopting || a.resuming || a.startingTurn || a.sending || a.recovery) {
       throw new Error('Agent must be idle and terminal with no pending requests or operations before closing.');
     }
     for (const [threadId, root] of this.descendants) {
@@ -345,9 +463,14 @@ export class AgentController extends EventEmitter {
     this.canClose(a);
     a.removing = true;
     try {
-      if (a.loaded && a.threadId) await this.rpc('thread/unsubscribe', { threadId: a.threadId });
+      let unsubscribed = false;
+      if (a.loaded && a.threadId) { await this.rpc('thread/unsubscribe', { threadId: a.threadId }); a.loaded = false; unsubscribed = true; }
       // A server event can reveal an active descendant while unsubscribe is pending.
-      this.canClose(a);
+      try { this.canClose(a); }
+      catch (error) {
+        if (unsubscribed) await this.restoreSubscription(a);
+        throw error;
+      }
       const threadIds = new Set(a.threadId ? [a.threadId] : []);
       for (const [id, root] of this.descendants) if (root === a) threadIds.add(id);
       let changed;
@@ -365,8 +488,28 @@ export class AgentController extends EventEmitter {
       this.pendingEvents = this.pendingEvents.filter((event) => event.agent_id !== a.id);
       this.early = this.early.filter((entry) => !threadIds.has(this.threadId(entry.message.params)));
       await this.persist();
+      this.action('close', a);
       return { agent_id: a.id, thread_id: a.threadId, status: 'closed' };
     } finally { a.removing = false; }
+  }
+
+  async restoreSubscription(a) {
+    try {
+      const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+      this.updateResolved(a, response);
+      a.loaded = true;
+      if (response?.thread?.status?.type !== 'idle') {
+        a.status = 'unknown'; a.activity = 'subscription restored; native status unconfirmed';
+        await this.reconcileUnknown(a);
+      }
+      if (a.status !== 'unknown') { await this.persist(); return; }
+      throw new Error('Native status remains unconfirmed after restoring subscription.');
+    } catch (error) {
+      a.status = 'unknown'; a.activity = 'subscription recovery required';
+      a.error = { code: 'subscription_restore_failed', message: error.message, recovery: `Inspect native thread ${a.threadId} in Codex, then retry an operation on agent ${a.id} to reconcile its state.` };
+      this.publish(a, 'message', { code: 'subscription_restore_failed', message: `Closing agent ${a.id} was cancelled and subscription recovery is unconfirmed: ${error.message}. ${a.error.recovery}` });
+      await this.persist();
+    }
   }
 
   async interrupt(a) {
@@ -578,6 +721,16 @@ export class AgentController extends EventEmitter {
     if (!direct && !activeTurnId) { await this.client.reject(message.id, -32602, 'Descendant has no active turn.'); return; }
     if (activeTurnId && p.turnId && p.turnId !== activeTurnId) { await this.client.reject(message.id, -32602, 'Stale agent turn.'); return; }
     if (direct && a.terminalEmitted) { await this.client.reject(message.id, -32602, 'Agent has no active turn.'); return; }
+    if (message.method === 'item/tool/call' && a.externalThread) {
+      const tool = nonempty(p.tool) ? p.tool : '(unknown)';
+      a.unavailableTools ??= [];
+      if (!a.unavailableTools.includes(tool)) {
+        a.unavailableTools.push(tool);
+        this.publish(a, 'message', { code: 'client_tools_unavailable', message: `Original client dynamic tool ${tool} is unavailable here. Continue the thread in its original Codex client if needed.` });
+      }
+      await this.client.respond(message.id, { contentItems: [{ type: 'inputText', text: 'This dynamic tool belongs to the original client and is unavailable here. Continue this thread in its original Codex client if the tool is needed.' }], success: false });
+      return;
+    }
     if (message.method === 'item/tool/call' && p.tool === 'notify_parent') {
       const valid = nonempty(p.arguments?.message);
       if (valid && direct) this.publish(a, 'message', { message: p.arguments.message });
@@ -626,8 +779,12 @@ export class AgentController extends EventEmitter {
     const models = [], seen = new Set(); let cursor;
     do {
       const page = await this.rpc('model/list', { ...(cursor ? { cursor } : {}) });
-      for (const model of page.data ?? []) models.push({ id: model.model || model.id, name: model.displayName, default: model.isDefault,
-        efforts: (model.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort), default_effort: model.defaultReasoningEffort });
+      for (const model of page.data ?? []) {
+        const id = model.model || model.id;
+        models.push({ id, name: model.displayName, description: model.description, default: model.isDefault,
+          efforts: (model.supportedReasoningEfforts ?? []).map((effort) => effort.reasoningEffort), default_effort: model.defaultReasoningEffort,
+          ...(this.guidance.models?.[id]?.selection_note ? { selection_note: this.guidance.models[id].selection_note } : {}) });
+      }
       cursor = page.nextCursor;
       if (cursor && seen.has(cursor)) throw new Error('model/list returned a repeated cursor.');
       seen.add(cursor);
@@ -653,9 +810,9 @@ export class AgentController extends EventEmitter {
     const write = this.persistTail.then(() => {
       this.persistScheduled = null;
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
-      id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, status: a.status,
+      id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
       activity: a.activity, turnId: a.turnId, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
-      snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed,
+      snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools,
     })) };
       return (async () => {
       await mkdir(path.dirname(this.statePath), { recursive: true });
@@ -735,7 +892,14 @@ function replyFormat(method, params) {
   if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
     return { decision: Array.isArray(params.availableDecisions) ? '<one value from availableDecisions>' : 'accept|acceptForSession|decline|cancel' };
   }
-  if (method === 'item/permissions/requestApproval') return { permissions: '<granted subset of requested permissions>', scope: 'turn|session' };
+  if (method === 'item/permissions/requestApproval') {
+    const requested = params.permissions ?? {};
+    const permissions = {};
+    if (requested.network) permissions.network = { enabled: requested.network.enabled ?? null };
+    if (requested.fileSystem) permissions.fileSystem = { read: requested.fileSystem.read ?? null, write: requested.fileSystem.write ?? null,
+      ...(requested.fileSystem.entries ? { entries: copy(requested.fileSystem.entries) } : {}) };
+    return { permissions, scope: 'turn' };
+  }
   if (method === 'mcpServer/elicitation/request') return { action: 'accept|decline|cancel', content: '<form data or null>', _meta: null };
   throw new TypeError('Unsupported response format.');
 }

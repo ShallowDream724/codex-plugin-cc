@@ -1,7 +1,21 @@
 {
   "name": "codex-subagents",
-  "version": "0.1.2",
+  "version": "0.2.0-rc.1",
   "description": "Use Codex as persistent subagents: delegate, steer, answer questions, wait, interrupt and resume.",
   "author": { "name": "ShallowDream724" },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "userConfig": {
+    "maxActiveAgents": {
+      "type": "string",
+      "title": "Concurrent Codex tasks",
+      "description": "Maximum active tasks in this Claude session (1–7). Saved conversations do not count.",
+      "default": "5"
+    },
+    "permissionsMode": {
+      "type": "string",
+      "title": "Codex permissions",
+      "description": "full-access, auto-review, or ask. Applies to new and resumed Codex threads.",
+      "default": "full-access"
+    }
+  }
 }

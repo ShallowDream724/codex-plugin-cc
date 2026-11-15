@@ -10,6 +10,8 @@ import { AgentController } from './agents.mjs';
 import { createBroker } from './broker.mjs';
 import { DiskReceipts } from './receipts.mjs';
 import { DeliveryStore } from './delivery.mjs';
+import { ActivityStore } from './activity.mjs';
+import { loadSettings } from './settings.mjs';
 import { ownerDirectory, ensureDirectory, readJson, writeJson, acquireOwnedLock } from './storage.mjs';
 
 const entry = fileURLToPath(import.meta.url);
@@ -24,6 +26,9 @@ export function runtimeSignature() {
     for (const name of (await readdir(runtime)).filter(name => name.endsWith('.mjs')).sort()) {
       hash.update(name).update(await readFile(join(runtime, name)));
     }
+    hash.update(await readFile(join(runtime, '..', 'config', 'guidance.json')));
+    hash.update(await readFile(join(runtime, '..', 'config', 'default-agent.toml')));
+    hash.update(JSON.stringify(loadSettings()));
     return { protocol: PROTOCOL, version: pkg.version, build: hash.digest('hex') };
   })();
 }
@@ -118,7 +123,7 @@ export async function serve(owner, { directory = ownerDirectory(owner), clientFa
   await ensureDirectory(directory);
   const ownership = await acquireOwnedLock(join(directory, 'service'));
   if (!ownership) return null;
-  let shuttingDown = false, shutdownPromise, server, controller, client, lease, listening = false;
+  let shuttingDown = false, shutdownPromise, server, controller, client, activity, lease, listening = false;
   let finishStartup;
   const startupFinished = new Promise(done => { finishStartup = done; });
   const endpointPath = join(directory, 'endpoint.json');
@@ -135,6 +140,7 @@ export async function serve(owner, { directory = ownerDirectory(owner), clientFa
       // Keep service ownership until initialization stops publishing state.
       await startupFinished;
       server?.close();
+      activity?.close();
       try { await controller?.close(); }
       finally {
         try { await client?.close(); }
@@ -168,11 +174,12 @@ export async function serve(owner, { directory = ownerDirectory(owner), clientFa
         .finally(() => shutdown()).catch(() => exit(1));
     });
     await controller.init();
+    activity = ActivityStore.attach(client, controller);
     assertConnected();
     const receiptStore = await DiskReceipts.open(join(directory, 'receipts'), { legacyPath: join(directory, 'receipts.json') });
     const deliveryStore = await DeliveryStore.open({ directory: join(directory, 'deliveries'), controller });
     assertConnected();
-    server = brokerFactory({ controller, token, receiptStore, deliveryStore, requiredProtocol: PROTOCOL,
+    server = brokerFactory({ controller, token, receiptStore, deliveryStore, activity, requiredProtocol: PROTOCOL,
       getHealth: () => ({ ready: ready(), ...signature,
         active: controller.hasActiveWork?.() ?? [...(controller.agents?.values() || [])].some(agent => ['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown'].includes(agent.status)) }),
       onActivity: () => { idle.touch(); }, onShutdown: shutdown });

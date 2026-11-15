@@ -4,10 +4,12 @@
 
 这是从 `y-cruce/codex-plugin-cc` 精简出的独立插件。运行时只依赖 Node 和 Codex CLI；没有 ACP、Qoder、Antigravity、DSH、额外管理代理、固定模型清单或旧模型提示教程。
 
+当前源码为 **0.2.0-rc.1**。经验性文字集中在 [审阅稿](docs/GUIDANCE_REVIEW.md)，审定前不替换已安装版本。
+
 ## 安装条件
 
 - Node.js 22 或更新版本。
-- 已配置并登录的 Codex CLI。协议以 `0.153.4` 的 App Server 为基线，使用 `thread/inject_items`。
+- 已配置并登录的 Codex CLI **0.169.0 或更新版本**。使用原生线程、当前上下文注入和历史分页接口。
 - 支持 JavaScript mods 的 Claude Code。开发适配对象为本机 `@cometix/claude-code 2.1.303`。
 
 终端和 Desktop 使用同一份插件，宿主需要提供 mods 与 `session.messages({as:'api'})` 能力。插件不修改 Claude Code 的安装文件。Desktop 的实际内核和通知呈现由使用者验收，不用 CLI 测试代替 Desktop 验收。
@@ -41,15 +43,15 @@ claude --plugin-dir "/absolute/path/to/codex-subagents"
 
 | 工具 | 行为 |
 |---|---|
-| `spawn_agent` | 新建 Codex；`available` 继承接口提供的当前上下文，`none` 独立开始 |
+| `spawn_agent` | 新建 Codex；可选 `role: default` 使用 Luna medium 的独立只读探子 |
 | `send_message` | 运行时 steering；空闲时仅将消息写入原历史 |
-| `followup_task` | 续接同一线程，运行时直接 steering |
+| `followup_task` | 续接已有代理；原生线程 ID 或 `codex://threads/<id>` 可接入闲置外部对话 |
 | `wait_agent` | 在程序里等待重要事件，不反复采样 Claude |
 | `answer_agent` | 按原请求 ID 回答问题或审批 |
 | `interrupt_agent` | 中断当前轮，保留历史与文件修改 |
-| `close_agent` | 从当前会话移除闲置代理，保留 Codex 历史 |
+| `close_agent` | 关闭指定代理，或批量关闭并保留指定集合；保留原生历史 |
 | `list_agents` | 简短状态，供恢复 ID 或诊断 |
-| `list_models` | 读取当前 Codex 配置的模型目录与推理档位 |
+| `list_models` | 读取 Codex 模型目录、描述、选型提示和支持的推理档位 |
 
 默认等待。只有确有必要的独立工作才并行。Codex 仍能调用自己的原生子代理；其工具过程和结果不会逐层灌入 Claude。必要的后代提问或审批会归到直接代理，由同一请求 ID 回答。
 
@@ -57,7 +59,46 @@ claude --plugin-dir "/absolute/path/to/codex-subagents"
 
 等待覆盖整个会话，按 `agent_id` 判断归属。同一时刻只保留一批待交付事件，并发等待立即告知已有等待者。事件进入 Claude 的实际历史后才持久确认；正常重启只扫描一次当前窗口补确认，不反复读取长上下文。取消、拒收或无法确认时保留事件，后续仍用原 `seq` 交付，不重新执行任务。
 
-模型目录由外部 Codex CLI 管理。配置了 `model_catalog_json` 时，该文件决定列表；把条目的 `visibility` 改为 `hide` 后，重启桥接进程即可隐藏。新模型通常不要求更新插件；静态目录由使用者维护，模型选择偏好也由 Claude 的指令决定。插件不内置 CLI，不另设白名单或模型排名。CLI 升级与插件升级相互独立。
+模型目录由外部 Codex CLI 管理。配置了 `model_catalog_json` 时，该文件决定列表；把条目的 `visibility` 改为 `hide` 后，重启桥接进程即可隐藏。没有该配置时使用 Codex 自己的目录。插件不内置 CLI 或另设白名单，不过滤 ultra 等原生档位。额外选型提示位于 `config/guidance.json`，未列在该文件里的新模型仍正常返回原始描述和档位。CLI 升级与插件升级相互独立。
+
+## 默认角色、并发与权限
+
+`spawn_agent({"role":"default","message":"…"})` 使用 Luna medium 和任务独立上下文；省略 model、reasoning_effort、context_mode 即可。角色负责快速检索、整理和事实核验，单轮交付；不修改文件、不派生子代理、不生图。普通 Codex 保留多轮协作、原生子代理和其账户支持的生图能力。
+
+插件不覆盖用户的 Codex 原生角色。只有可靠确认没有自定义角色配置时，才给新建普通线程提供同款原生 default 角色；发现任何角色 TOML、子目录或无法确认的配置时保留原生行为。你的原生 default 若已配置，将继续生效。
+
+宿主的插件设置提供两个用户选项，它们不会成为 Claude 的工具参数：
+
+| 设置 | 默认 | 含义 |
+|---|---|---|
+| `maxActiveAgents` | `5` | 当前 Claude 会话的直接活动任务上限，可设 1–7；历史记录不占名额 |
+| `permissionsMode` | `full-access` | 完全访问；可改为 `auto-review`（Codex 自动审查）或 `ask`（请求批准） |
+
+启动中、运行中、等待回答、压缩中、状态不明的任务都保守占用名额；有活动后代的根代理也占名额。Codex 自己的后代不单独计入直接任务上限。角色的只读职责不另设只读沙箱。权限及名额配置变化需要重启当前 helper，不能静默改变正在运行的任务。
+
+完全访问明确设置 `danger-full-access` 和 `never`。其他两种模式设置 `workspace-write`、`on-request`，分别使用原生 `auto_review` 或 `user` 审批者。命令规则、组织约束及工具宿主授权仍由 Codex 和相应工具决定；错误保留来源，不笼统归为权限不足。
+
+批量关闭示例：`{"targets":["agent-a","agent-b"]}`，或 `{"targets":"all","except":["keep-a","keep-b"]}`。只处理调用开始时的名单，活动及待处理请求的代理会跳过；给 Claude 的结果仅包含关闭数量和例外，不重复列出全部成功 ID。
+
+## 查看过程
+
+派发和完成记录中的代理名称可点击；经典终端可运行 `/codex-agents`。详情显示往来消息、Codex 进度、命令输出、工具输入输出、文件 diff 和图片文件路径。长输出分段加载，较早历史可翻页；图片路径可复制。相邻同类调用可分组展开，下级代理只显示委派记录。
+
+界面展开与模型通信独立：查看过程不会确认或消耗 Claude 的消息。未打开详情时不轮询详情；打开时每秒查询一次有界增量，变化才重绘；阅读旧页或展开内容时暂停实时跟随。切换代理保留各自页面与折叠状态，关闭面板不停止任务。面板在终端和 Desktop 的具体位置由 Claude 宿主决定。
+
+## 复用原生对话
+
+把线程 ID 或 `codex://threads/<id>` 作为 `followup_task.target`。插件读取原生元数据、保留 cwd 和历史，登记后在原线程继续，不复制新的 Claude 上下文。活跃或状态未确认的外部线程不能接入；原生客户端的并发限制仍然生效。
+
+旧对话可能保存原客户端提供的动态工具。0.169 的 resume/fork 接口不能替换这些工具；插件会报告可读取到的工具元数据及 `client_tools_unavailable`，无法执行的调用明确返回失败，不伪造结果，也不自动另开替代任务。原生 CLI/MCP 工具与原客户端专属工具应分别验收。
+
+## 桌面、浏览器和图像生成
+
+原生 Computer Use/浏览器功能需要安装并启用对应官方插件、保持 Codex App 运行，并建立实际连接。插件不会自动打开 App，也不把工具已列出当作桌面或浏览器已连接；App 未运行或连接失败时，这些能力不可用，普通任务不受影响。
+
+`npm run doctor` 可只读查询 CLI 版本、模型档位和 MCP 工具注册情况；`npm run doctor -- --json` 输出精简诊断。它不创建任务、不请求模型、不调用电脑或浏览器工具，输出明确注明宿主连接尚未验证。
+
+原生生图是否可用由 Codex 的模型、账户、后端和功能开关共同决定。当前原生入口由服务端选择尺寸，插件不声明固定 1.5K 上限，不额外调用生图供应商。默认探子禁用生图；生成文件仍由 Codex 管理。
 
 ## 上下文与缓存
 
@@ -71,19 +112,21 @@ claude --plugin-dir "/absolute/path/to/codex-subagents"
 
 ## 状态与生命周期
 
-Claude 界面显示简短代理状态；问题、重要通知和最终结果进入对话。没有过程读取工具，也没有递归工具日志面板。
+Claude 界面显示简短生命周期记录，过程按需展开。普通工具调用和进度不唤醒 Claude；协调消息、问题、审批、完成/失败/中断和压缩通知才进入事件队列。没有新增给模型的过程读取工具，也没有递归子代理日志面板。
 
 状态默认位于 `~/.claude/codex-subagents/<session-hash>/`。只保存线程标识、快照摘要、状态、未确认的重要事件和实际 usage，不另存整份 Claude 快照。Codex 的原生线程历史由 Codex 自己持久化。
 
-不再需要的失败或已完成代理可用 `close_agent` 清理；有活动任务、待回答请求或活动后代时拒绝关闭。关闭后不再出现在本插件的列表中，也不能通过本插件 followup；原生历史仍保留。需要继续协作的代理应保留。
+不再需要的失败或已完成代理可用 `close_agent` 清理；有活动任务、待回答请求或活动后代时保留。关闭后旧插件代理 ID 不再可用，但可用原生线程 ID 重新接入；原生历史始终保留。
 
-正常会话结束会关闭所属桥接进程；异常断开后租约最多约 90 秒过期。下次由 `followup_task` 恢复原线程，不自动重跑旧任务。中断等待只结束等待订阅，不中断正在工作的 Codex。
+正常会话结束会关闭所属桥接进程；宿主失联后约 90 秒租约过期，清理所属任务。等待和每 10 秒的本机后台观察会续租；它不是任务执行时限，也不产生模型心跳。下次由 `followup_task` 恢复原线程，不自动重跑旧任务。中断等待只结束等待订阅，不中断正在工作的 Codex。
 
 每个会话的桥接进程拥有整个生命周期的独占锁。插件更新不会替换正在工作的旧进程；版本不一致会要求结束旧会话后重开。机器从较长暂停恢复时有额外续租宽限。回执按动作单独保存，避免长线程反复重写全部旧回执；旧版本数据会自动迁移，原文件保留为备份。
 
 若启动下一轮时回复丢失，代理会标为 `unknown`，避免盲目重复开工。对同一代理显式发送、续接、中断或关闭时，插件先只读查询线程状态，必要时恢复订阅；状态明确后才执行该操作。单个代理的普通启动失败不会终止其他代理。无法持久保存状态时停止服务，让已保存记录用于恢复。
 
-可配置环境变量：`CODEX_SUBAGENTS_NODE_COMMAND`、`CODEX_SUBAGENTS_CODEX_COMMAND`、`CODEX_SUBAGENTS_STATE_DIR`。可执行文件路径与参数分开传递，不通过 shell 拼接。保持用户现有 Codex 凭据、sandbox 和审批策略；不启用 fast/priority。
+可配置环境变量：`CODEX_SUBAGENTS_NODE_COMMAND`、`CODEX_SUBAGENTS_CODEX_COMMAND`、`CODEX_SUBAGENTS_STATE_DIR`。显式 `CODEX_SUBAGENTS_SETTINGS` JSON 可覆盖宿主插件设置，例如 `{"maxActiveAgents":7,"permissionsMode":"auto-review"}`；未知键或非法值明确报错。可执行文件路径与参数分开传递，不通过 shell 拼接。保持用户现有 Codex 登录，不启用 fast/priority。
+
+经验性内容维护在 `config/guidance.json` 和 skill 中；修改后运行 `node scripts/guidance.mjs`，同步生成原生 default 配置与完整审阅稿。`npm run check` 会检查它们一致。
 
 ## 验证
 

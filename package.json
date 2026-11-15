@@ -1,6 +1,6 @@
 {
   "name": "codex-subagents",
-  "version": "0.1.2",
+  "version": "0.2.0-rc.1",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -9,6 +9,7 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "check": "node scripts/check.mjs",
+    "doctor": "node scripts/doctor.mjs",
     "package": "node scripts/package.mjs"
   }
 }

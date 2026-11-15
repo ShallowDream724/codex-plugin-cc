@@ -31,6 +31,25 @@ test('local transport requires a session secret', async t => {
   assert.equal(response.status, 403); assert.equal(controller.calls.length, 0);
 });
 
+test('UI reads never claim or confirm Claude events, even with extraneous restore evidence', async t => {
+  const { post, controller } = await setup(t, { activity: { list: () => ({ agents: [{ agent_id: 'a' }] }) } });
+  controller.publish();
+  const view = await post({ operation: 'ui_list', restore: { legacy_events: controller.events } });
+  assert.equal(view.status, 200); assert.equal(view.body.agents[0].agent_id, 'a');
+  assert.equal(controller.events.length, 1); assert.deepEqual(controller.acks, []);
+  const wait = await post({ operation: 'wait', args: { timeout_ms: 0 } });
+  assert.equal(wait.body.events.length, 1);
+});
+
+test('default preset is normalized before snapshot capture without weakening normal context validation', async t => {
+  const { post, controller } = await setup(t);
+  const result = await post({ operation: 'spawn_agent', requestId: 'scout', args: { role: 'default' } });
+  assert.equal(result.status, 200); assert.equal(controller.calls[0].args.context_mode, 'none');
+  assert.equal(controller.calls[0].args.snapshot, undefined);
+  const conflict = await post({ operation: 'spawn_agent', requestId: 'conflict', args: { role: 'default', context_mode: 'available' } });
+  assert.equal(conflict.status, 400); assert.equal(controller.calls.length, 1);
+});
+
 test('snapshot validation fails before a Codex mutation', async t => {
   const { post, controller } = await setup(t);
   const result = await post({ operation: 'spawn_agent', requestId: 'call1', args: { context_mode: 'available' }, context: { messages: [], source: 'unknown' } });

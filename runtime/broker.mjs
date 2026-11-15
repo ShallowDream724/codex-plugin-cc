@@ -9,6 +9,7 @@ const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
 const errorBody = error => ({ code: error.code || 'bridge_error', message: error.message,
+  ...Object.fromEntries(['agent_id', 'thread_id', 'status', 'recovery', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
   ...(error.code === 'invalid_answer' ? { request_id: error.request_id, reply_format: error.reply_format } : {}) });
 
 function authorized(value, token) {
@@ -17,7 +18,7 @@ function authorized(value, token) {
 }
 
 export function createBroker({ controller, token, receipts = {}, saveReceipts = async () => {}, receiptStore,
-  deliveryStore, onActivity = () => {}, onShutdown = () => {}, getHealth, requiredProtocol,
+  deliveryStore, activity, onActivity = () => {}, onShutdown = () => {}, getHealth, requiredProtocol,
   waitTimeoutMs = 25000 } = {}) {
   const journal = receiptStore ?? new MemoryReceipts(receipts, saveReceipts);
   const delivery = deliveryStore ?? new DeliveryStore({ controller });
@@ -45,6 +46,11 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     if (operation === 'shutdown') { setImmediate(onShutdown); return { stopped: true }; }
     if (requiredProtocol !== undefined && body.protocolVersion !== requiredProtocol) {
       throw Object.assign(new Error('Restart Claude Code to load the current Codex plugin bridge.'), { code: 'bridge_version_mismatch' });
+    }
+    if (['ui_list', 'ui_history', 'ui_detail', 'ui_revision'].includes(operation)) {
+      if (!activity) throw new Error('Activity view is unavailable.');
+      const method = { ui_list: 'list', ui_history: 'history', ui_detail: 'detail', ui_revision: 'revision' }[operation];
+      return activity[method](args);
     }
     if (body.restore) await delivery.confirm(body.restore);
     if (operation === 'confirm') return delivery.confirm(args);
@@ -93,6 +99,10 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     actions.add(requestId);
     try {
       const requestArgs = { ...args }; delete requestArgs.snapshot;
+      if (operation === 'spawn_agent' && args.role === 'default') {
+        if (args.context_mode !== undefined && args.context_mode !== 'none') throw new Error('The default role requires context_mode none.');
+        args.context_mode = 'none';
+      }
       if (operation === 'spawn_agent' && (args.context_mode || 'available') === 'available') args.snapshot = prepareContextSnapshot(body.context || {});
       const fingerprint = requestFingerprint(operation, requestArgs, args.snapshot?.digest);
       const previous = await journal.get(requestId);

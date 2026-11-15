@@ -33,7 +33,7 @@ class MockClient extends EventEmitter {
 }
 async function setup(t, options = {}) {
   const client = new MockClient();
-  const controller = new AgentController({ client, ...options });
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined, ...options });
   await controller.init();
   t.after(() => controller.close());
   return { client, controller, spawn: (args = {}) => controller.dispatch('spawn_agent', { message: 'Solve task', cwd: '/workspace', context_mode: 'none', ...args }) };
@@ -95,7 +95,8 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   assert.equal(start.serviceTier, 'default'); assert.equal(start.ephemeral, false);
   assert.equal(start.model, 'dynamic-model'); assert.equal(start.config['features.default_mode_request_user_input'], true);
   assert.equal(start.dynamicTools[0].type, 'function'); assert.equal(start.dynamicTools[0].name, 'notify_parent');
-  for (const key of ['sandbox', 'approvalPolicy', 'baseInstructions', 'developerInstructions', 'multiAgentMode']) assert.equal(Object.hasOwn(start, key), false);
+  assert.equal(start.sandbox, 'danger-full-access'); assert.equal(start.approvalPolicy, 'never');
+  for (const key of ['baseInstructions', 'developerInstructions', 'multiAgentMode']) assert.equal(Object.hasOwn(start, key), false);
   assert.deepEqual(client.calls[1], { method: 'thread/inject_items', params: { threadId: 'thread-1', items: snapshot.history } });
   assert.equal(client.calls[2].params.effort, 'high'); assert.equal(client.calls[2].params.serviceTierForTurn, 'default');
   assert.match(client.calls[2].params.input[0].text, /Claude is your parent/);
@@ -107,7 +108,7 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   await controller.dispatch('followup_task', { target: agent.id, message: 'second task' });
   assert.equal(client.calls.filter((c) => c.method === 'thread/start').length, 1);
   assert.equal(client.calls.filter((c) => c.method === 'thread/inject_items').length, 2);
-  assert.deepEqual(client.calls.find((c) => c.method === 'thread/resume').params, { threadId: 'thread-1', excludeTurns: true });
+  assert.deepEqual(client.calls.find((c) => c.method === 'thread/resume').params, { threadId: 'thread-1', excludeTurns: true, approvalPolicy: 'never', sandbox: 'danger-full-access' });
   assert.equal(client.calls.at(-1).params.input[0].text, 'second task');
 });
 
@@ -177,7 +178,7 @@ test('all approval families require explicit valid protocol response', async (t)
   const formats = [
     { decision: 'accept|acceptForSession|decline|cancel' },
     { decision: 'accept|acceptForSession|decline|cancel' },
-    { permissions: '<granted subset of requested permissions>', scope: 'turn|session' },
+    { permissions: {}, scope: 'turn' },
     { action: 'accept|decline|cancel', content: '<form data or null>', _meta: null },
   ];
   for (const [index, [method, answer]] of cases.entries()) {
@@ -533,10 +534,27 @@ test('close_agent preserves ownership if unsubscribe fails or a descendant start
       client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
       return {};
     }
+    if (method === 'thread/resume') return { thread: { status: { type: 'idle' } } };
   };
   await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /active descendant/);
   assert.equal(controller.find(agent.id).status, 'completed');
+  assert.equal(controller.find(agent.id).loaded, true);
+  assert.equal(client.calls.filter((call) => call.method === 'thread/resume').length, 1);
   assert.equal(controller.descendantTurns.get('child'), 'child-turn');
+});
+
+test('failed subscription restoration remains unconfirmed and reports recovery', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+  client.handler = method => {
+    if (method === 'thread/unsubscribe') {
+      client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
+      client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } }); return {};
+    }
+    if (method === 'thread/resume') throw new Error('resume failed');
+  };
+  await assert.rejects(controller.dispatch('close_agent', { target: agent.id }), /active descendant/);
+  assert.equal(controller.find(agent.id).loaded, false); assert.equal(controller.find(agent.id).status, 'unknown');
+  assert.match(controller.eventsAfter(0).find(e => e.code === 'subscription_restore_failed').message, /resume failed/);
 });
 
 test('automatic compaction emits once per item without claiming an overflow', async (t) => {
@@ -564,7 +582,7 @@ test('durable journal preserves cached usage and result, ack retains sequence, r
   client.ask('q', 'item/tool/requestUserInput', pendingQuestion()); await controller.persist();
   const serialized = await readFile(statePath, 'utf8'); assert.doesNotMatch(serialized, /PRIVATE LONG INPUT/);
   const restarted = new AgentController({ client: new MockClient(), statePath }); await restarted.init(); t.after(() => restarted.close());
-  assert.equal(restarted.snapshot().agents[0].status, 'interrupted'); assert.deepEqual(restarted.snapshot().agents[0].pending_requests, []);
+  assert.equal(restarted.snapshot().agents[0].status, 'unknown'); assert.deepEqual(restarted.snapshot().agents[0].pending_requests, []);
   assert.equal(restarted.snapshot().agents[0].token_usage.total.cachedInputTokens, 80);
   const seq = restarted.snapshot().nextSeq; await restarted.ackEvents(seq - 1);
   assert.equal(restarted.eventsAfter(0).length, 0); assert.equal(restarted.snapshot().nextSeq, seq);
@@ -715,7 +733,7 @@ test('restart discards nonrecoverable requests and orphan journal entries', asyn
   controller.pendingEvents.push({ seq: controller.nextSeq++, agent_id: 'missing', kind: 'completed' });
   await controller.persist();
   const restarted = new AgentController({ client: new MockClient(), statePath }); await restarted.init(); t.after(() => restarted.close());
-  assert.deepEqual(restarted.eventsAfter(0).map((event) => event.kind), ['interrupted']);
+  assert.deepEqual(restarted.eventsAfter(0).map((event) => event.kind), ['unknown']);
 });
 
 test('turn-local deduplication remains bounded and rejects late prior-turn notifications', async (t) => {
@@ -820,7 +838,7 @@ test('persisted unknown starts reconcile idle metadata before an explicit new fo
     restartedClient.turnCount = 10;
     restartedClient.handler = (method) => { if (method === 'thread/read') return { thread: { id: 'thread-1', status: { type: nativeStatus } } }; };
     const restarted = new AgentController({ client: restartedClient, statePath }); await restarted.init(); t.after(() => restarted.close());
-    assert.equal(restarted.snapshot().agents[0].status, 'unknown'); assert.equal(restarted.hasActiveWork(), true);
+    assert.equal(restarted.snapshot().agents[0].status, 'interrupted'); assert.equal(restarted.hasActiveWork(), false);
     const result = await restarted.dispatch('followup_task', { target: agent.id, message: 'EXPLICIT NEW TASK' });
     assert.equal(result.status, 'running'); assert.equal(result.turn_id, 'turn-11');
     assert.deepEqual(restartedClient.calls[0], { method: 'thread/read', params: { threadId: 'thread-1', includeTurns: false } });
@@ -875,9 +893,12 @@ test('unknown close reconciles idle ownership while insufficient metadata never 
 });
 
 test('persisted unknown active work restores subscription and steers without starting a turn', async (t) => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-agents-'));
+  let controller, restarted;
+  t.after(async () => { await restarted?.close(); await controller?.close(); await rm(dir, { recursive: true, force: true }); });
   const statePath = path.join(dir, 'state.json');
-  const { client, controller, spawn } = await setup(t, { statePath }); const agent = await spawn(); client.complete();
+  const setupResult = await setup(t, { statePath }); controller = setupResult.controller;
+  const { client, spawn } = setupResult; const agent = await spawn(); client.complete();
   client.handler = (method) => { if (method === 'turn/start') throw Object.assign(new Error('lost reply'), { code: 'ETIMEDOUT' }); };
   await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'original' })); await controller.close();
   const restartedClient = new MockClient();
@@ -885,10 +906,10 @@ test('persisted unknown active work restores subscription and steers without sta
     if (method === 'thread/read' || method === 'thread/resume') return { thread: { id: 'thread-1', status: { type: 'active', activeFlags: [] } } };
     if (method === 'thread/turns/list') return { data: [{ id: 'native-running', status: 'inProgress', items: [], itemsView: 'notLoaded' }] };
   };
-  const restarted = new AgentController({ client: restartedClient, statePath }); await restarted.init(); t.after(() => restarted.close());
+  restarted = new AgentController({ client: restartedClient, statePath }); await restarted.init();
   await restarted.dispatch('followup_task', { target: agent.id, message: 'steer existing work' });
   assert.deepEqual(restartedClient.calls.map((call) => call.method), ['thread/read', 'thread/resume', 'thread/turns/list', 'turn/steer']);
-  assert.deepEqual(restartedClient.calls[1].params, { threadId: 'thread-1', excludeTurns: true });
+  assert.deepEqual(restartedClient.calls[1].params, { threadId: 'thread-1', excludeTurns: true, approvalPolicy: 'never', sandbox: 'danger-full-access' });
   assert.equal(restarted.find(agent.id).loaded, true);
   restartedClient.complete('thread-1', 'native-running');
   assert.equal(restarted.snapshot().agents[0].status, 'completed');

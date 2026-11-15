@@ -1,18 +1,21 @@
 // A Claude Code mod. No model requests or per-task tool definitions.
 import { WAIT_TOOL, EVENT_PREFIX, messageDeliveries, scanRetainedDeliveries, retainedSequences, filterClosed } from './delivery.js';
+import { registerUI, observeUI, closeUI } from './ui.js';
+import { registerRows } from './rows.js';
+import { configureBridge, requestBridge } from './bridge.js';
 const OBJECT = { type: 'object' };
 const STR = { type: 'string' };
 const TARGET = { type: 'string', description: 'Agent ID from spawn_agent.' };
 const TOOLS = [
-  { name: 'spawn_agent', description: 'Start a persistent Codex agent for a task.', inputSchema: { ...OBJECT, properties: { message: STR, cwd: { ...STR, description: 'Absolute working directory; default: this session.' }, name: STR, context_mode: { type: 'string', enum: ['available', 'none'], default: 'available', description: 'available: inherit host-exported current context, up to 4096 API messages; older content may be summarized or omitted. none: task only.' }, model: { ...STR, description: 'ID from list_models; default: configured Codex model.' }, reasoning_effort: { ...STR, description: 'Optional effort from list_models.' } }, required: ['message'], additionalProperties: false } },
+  { name: 'spawn_agent', description: 'Delegate to Codex. The default role provides quick lookup, extraction and factual checks.', inputSchema: { ...OBJECT, properties: { message: STR, cwd: { ...STR, description: 'Absolute working directory; default: this session.' }, name: STR, role: { ...STR, enum: ['default'], description: 'One-shot read-only scout; preset model/effort and task-only context. Omit for a regular agent.' }, context_mode: { type: 'string', enum: ['available', 'none'], description: 'available: current host context, up to 4096 API messages; older content may be summarized or omitted. none: task only. Default: available; default role: none.' }, model: { ...STR, description: 'ID from list_models; omit for configured Codex model or role preset.' }, reasoning_effort: { ...STR, description: 'Supported effort from list_models; omit to use the default or role preset.' } }, required: ['message'], additionalProperties: false } },
   { name: 'send_message', description: 'Steer a running agent; append to an idle agent’s history without starting it.', inputSchema: { ...OBJECT, properties: { target: TARGET, message: STR }, required: ['target', 'message'], additionalProperties: false } },
-  { name: 'followup_task', description: 'Send a task and run the same agent with its history. Steer if already running.', inputSchema: { ...OBJECT, properties: { target: TARGET, message: STR }, required: ['target', 'message'], additionalProperties: false } },
+  { name: 'followup_task', description: 'Continue a Codex conversation with its history. Steer an owned running agent; adopt an idle external thread.', inputSchema: { ...OBJECT, properties: { target: { ...STR, description: 'Agent ID, native thread ID, or codex://threads/<id>.' }, message: STR }, required: ['target', 'message'], additionalProperties: false } },
   { name: 'wait_agent', description: 'Wait for queued or new events from any agent.', inputSchema: { ...OBJECT, properties: { timeout_ms: { type: 'integer', minimum: 0, maximum: 3600000, description: 'Limit this wait only; agents keep running. Omit to wait for an event.' } }, additionalProperties: false } },
   { name: 'list_agents', description: 'List this session’s agent IDs and brief status.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
   { name: 'interrupt_agent', description: 'Stop the current turn; keep history and file changes. Resume with followup_task.', inputSchema: { ...OBJECT, properties: { target: TARGET }, required: ['target'], additionalProperties: false } },
-  { name: 'close_agent', description: 'Remove an inactive agent from this session; preserve its Codex history.', inputSchema: { ...OBJECT, properties: { target: TARGET }, required: ['target'], additionalProperties: false } },
+  { name: 'close_agent', description: 'Close inactive agents; keep Codex history. Use all with except to retain selected agents. Active agents are skipped.', inputSchema: { ...OBJECT, properties: { targets: { anyOf: [{ type: 'array', items: TARGET, minItems: 1 }, { type: 'string', enum: ['all'] }] }, except: { type: 'array', items: TARGET, description: 'IDs to keep; only with targets: all.' } }, required: ['targets'], additionalProperties: false } },
   { name: 'answer_agent', description: 'Answer a pending request using its request_id and reply_format.', inputSchema: { ...OBJECT, properties: { target: TARGET, request_id: STR, answer: { ...OBJECT, description: 'Object matching the event’s reply_format.' } }, required: ['target', 'request_id', 'answer'], additionalProperties: false } },
-  { name: 'list_models', description: 'Read Codex’s configured model catalog: IDs, defaults and reasoning efforts.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
+  { name: 'list_models', description: 'Read available model IDs, descriptions, selection notes and supported reasoning efforts.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
 ];
 
 let active = false;
@@ -20,28 +23,13 @@ let waiters = 0;
 let observing = false;
 let notificationPending;
 let recoveryEvidence;
-let lastStatus = '';
 const busyTurns = new Set();
 const deliveries = new Map();
 const closedAgents = new Set();
 
 async function bridge($, operation, args = {}, extras = {}) {
-  const owner = await $.session.id();
-  const cwd = await $.session.cwd();
-  const node = await $.env.get('CODEX_SUBAGENTS_NODE_COMMAND') || 'node';
-  const stateDir = await $.env.get('CODEX_SUBAGENTS_STATE_DIR');
-  const codex = await $.env.get('CODEX_SUBAGENTS_CODEX_COMMAND');
-  const env = {};
-  if (stateDir) env.CODEX_SUBAGENTS_STATE_DIR = stateDir;
-  if (codex) env.CODEX_SUBAGENTS_CODEX_COMMAND = codex;
   const restore = operation !== 'shutdown' ? recoveryEvidence : undefined;
-  const result = await $.process.run([node, `${$.plugin.root}/runtime/bridge.mjs`], {
-    cwd, env, timeoutMs: operation === 'wait' ? 45000 : 240000,
-    stdin: JSON.stringify({ owner, cwd, operation, args, ...(restore ? { restore } : {}), ...extras }),
-  });
-  let value;
-  try { value = JSON.parse(result.stdout); }
-  catch { throw new Error(`Codex bridge returned no valid response (exit ${result.exitCode}).`); }
+  const value = await requestBridge($, operation, args, { ...(restore ? { restore } : {}), ...extras });
   if (restore && recoveryEvidence === restore && value && !value.offline && !value.error) {
     recoveryEvidence = undefined;
     for (const observation of restore.observations) {
@@ -110,9 +98,13 @@ async function capture($, e) {
 }
 
 function toolArgs(e, operation) {
-  if (operation === 'spawn_agent') return { message: e.message, cwd: e.cwd, name: e.name, model: e.model, reasoning_effort: e.reasoning_effort, context_mode: e.context_mode || 'available' };
+  if (operation === 'spawn_agent') {
+    if (e.role === 'default' && e.context_mode !== undefined && e.context_mode !== 'none') throw new Error('The default role uses task-only context; omit context_mode or use none.');
+    return { message: e.message, cwd: e.cwd, name: e.name, role: e.role, model: e.model, reasoning_effort: e.reasoning_effort, context_mode: e.context_mode ?? (e.role === 'default' ? 'none' : 'available') };
+  }
   if (operation === 'send_message' || operation === 'followup_task') return { target: e.target, message: e.message };
-  if (operation === 'interrupt_agent' || operation === 'close_agent') return { target: e.target };
+  if (operation === 'interrupt_agent') return { target: e.target };
+  if (operation === 'close_agent') return e.targets === undefined ? { target: e.target } : { targets: e.targets, ...(e.except === undefined ? {} : { except: e.except }) };
   if (operation === 'answer_agent') return { target: e.target, request_id: e.request_id, answer: e.answer };
   return {};
 }
@@ -144,7 +136,12 @@ async function handle($, e, next, operation) {
     const context = operation === 'spawn_agent' && args.context_mode === 'available' ? await capture($, e) : undefined;
     if (operation === 'spawn_agent' && !args.cwd) args.cwd = await $.session.cwd();
     const result = await bridge($, operation, args, { requestId: e.tool_use_id, ...(context ? { context } : {}) });
-    if (operation === 'close_agent' && !result.error && typeof result.agent_id === 'string') closedAgents.add(result.agent_id);
+    if (operation === 'close_agent' && !result.error) {
+      if (typeof result.agent_id === 'string') closedAgents.add(result.agent_id);
+      for (const id of result.closed_ids || []) closedAgents.add(id);
+      const { closed_ids, ...visible } = result;
+      return { result: JSON.stringify(visible) };
+    }
     return { result: JSON.stringify(result) };
   } catch (error) { return { result: JSON.stringify({ error: { code: 'plugin_error', message: String(error.message || error) } }) }; }
 }
@@ -161,8 +158,7 @@ async function observe($) {
     const result = await bridge($, 'observe', { deliver, ...(pendingDelivery ? { lease_id: pendingDelivery } : {}) });
     if (result.offline) { active = false; return; }
     if (result.error) return;
-    const text = (result.agents || []).map(a => `${a.name || a.agent_id}: ${a.status}${a.activity ? ' · ' + a.activity : ''}`).join(' | ');
-    if (text !== lastStatus) { lastStatus = text; await $.ui.status(text || 'Codex: idle'); }
+    await observeUI($, result);
     if (result.events?.length && result.delivery_id) {
       // Recheck after the async bridge: a tool wait may have started meanwhile.
       if (waiters || busyTurns.size || notificationPending) { await release($, result.delivery_id); return; }
@@ -177,7 +173,10 @@ async function observe($) {
   } finally { observing = false; }
 }
 
-export function register(on) {
+export function register(on, options = {}) {
+  configureBridge(options);
+  registerUI(on);
+  registerRows(on);
   on('session.start', async ($, e, next) => {
     active = true; // Observe an existing session helper once; observation never starts one.
     for (const tool of TOOLS) await $.tool.register(tool); // ToolSearch controls deferral.
@@ -188,6 +187,8 @@ export function register(on) {
       await bridge($, 'confirm', retained).catch(() => {});
     }
     $.clock.every(10000, () => observe($).catch(() => {}));
+    try { await $.command.register({ name: 'codex-agents', description: 'Browse Codex agents', immediate: true }); }
+    catch { /* A conflicting command does not prevent tool and clickable-row use. */ }
     return next(e);
   });
   on('session.append', async ($, e, next) => {
@@ -217,6 +218,7 @@ export function register(on) {
     return next(e);
   });
   on('session.end', async ($, e, next) => {
+    closeUI();
     if (active) await bridge($, 'shutdown').catch(() => {});
     active = false;
     return next(e);

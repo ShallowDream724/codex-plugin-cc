@@ -12,7 +12,7 @@ const validId = (id) => typeof id === 'string' || (typeof id === 'number' && Num
 
 // npm's Windows .cmd shim cannot be spawned without a shell. Invoke its known
 // JavaScript entry point instead, keeping every argument separate from shell code.
-function resolveCommand(command, env, cwd) {
+export function resolveCommand(command, env, cwd) {
   if (/\.[cm]?js$/i.test(command)) return { command: process.execPath, prefix: [path.resolve(cwd ?? process.cwd(), command)] };
   if (process.platform !== 'win32') return { command, prefix: [] };
   const envPath = Object.entries(env).find(([key]) => key.toLowerCase() === 'path')?.[1] ?? '';
@@ -114,7 +114,7 @@ export class AppServerClient extends EventEmitter {
         this.#resolveExit();
       });
       const result = await this.request('initialize', {
-        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.1.2' },
+        clientInfo: { name: 'codex-subagents', title: 'Claude Code Codex Subagents', version: '0.2.0-rc.1' },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       await this.#send({ method: 'initialized', params: {} });

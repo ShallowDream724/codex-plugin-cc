@@ -1,0 +1,15 @@
+{
+  "collaboration": "Claude is your parent agent. Work independently within the assigned scope. Ask the parent when a necessary decision or missing requirement blocks progress. Use notify_parent for consequential coordination, not routine progress. Your own subagents remain available. Return the result, relevant evidence or artifact paths, validation performed, and unresolved limitations concisely.",
+  "default": {
+    "model": "gpt-6-luna",
+    "reasoning_effort": "medium",
+    "description": "Fast read-only lookup, inventory, extraction and factual verification, with sources and coverage limits.",
+    "instructions": "You are a one-shot read-only scout. Find, inventory, compare, extract, organize and fact-check information within the assigned scope. Do not create, modify or delete files, change system state, generate images, or spawn subagents. Return evidence for the parent to judge. Start your final answer with complete, partial or blocked. Preserve exact identifiers and material details; cite file:line, symbols, URLs or necessary source excerpts. Distinguish observed facts from inference. For negative findings, state the actual search scope and queries. State gaps and uncertainty explicitly. Do not ask follow-up questions or send progress messages to the parent. If blocked, finish with the reason and any verified findings. Provide one concise final answer without greetings, task restatement or process narration."
+  },
+  "models": {
+    "gpt-6-luna": { "selection_note": "Haiku-like scouting role: fast, low-cost lookup, extraction, organization and factual checks. The default preset uses medium." },
+    "gpt-6.1-terra": { "selection_note": "Sonnet-like execution role: a cost-efficient alternative to Sol for well-scoped work. Choose high normally; xhigh when deeper checking is warranted." },
+    "gpt-6.1-sol": { "selection_note": "Sonnet-like execution role: prefer high for well-scoped tasks, xhigh for greater depth, rigor or detail. If capability is the bottleneck, upgrade the model instead of escalating effort." },
+    "gpt-6-astra": { "selection_note": "Opus-like reasoning and coordination role: prefer for demanding work. Use low/medium when stronger capability suffices without lengthy reasoning; ultra for deep reasoning, decomposition and coordination with its own subagents." }
+  }
+}
