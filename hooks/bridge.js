@@ -10,12 +10,15 @@ export function configureBridge(options = {}) {
 
 // Transport only: UI reads do not participate in model-event acknowledgements.
 export async function requestBridge($, operation, args = {}, extras = {}) {
-  const owner = await $.session.id();
-  const cwd = await $.session.cwd();
-  const node = await $.env.get('CODEX_SUBAGENTS_NODE_COMMAND') || 'node';
-  const stateDir = await $.env.get('CODEX_SUBAGENTS_STATE_DIR');
-  const codex = await $.env.get('CODEX_SUBAGENTS_CODEX_COMMAND');
-  const settingsOverride = await $.env.get('CODEX_SUBAGENTS_SETTINGS');
+  const [owner, cwd, nodeCommand, stateDir, codex, settingsOverride] = await Promise.all([
+    $.session.id(),
+    $.session.cwd(),
+    $.env.get('CODEX_SUBAGENTS_NODE_COMMAND'),
+    $.env.get('CODEX_SUBAGENTS_STATE_DIR'),
+    $.env.get('CODEX_SUBAGENTS_CODEX_COMMAND'),
+    $.env.get('CODEX_SUBAGENTS_SETTINGS'),
+  ]);
+  const node = nodeCommand || 'node';
   const env = {};
   if (stateDir) env.CODEX_SUBAGENTS_STATE_DIR = stateDir;
   if (codex) env.CODEX_SUBAGENTS_CODEX_COMMAND = codex;

@@ -1,6 +1,7 @@
 // Read-only presentation of the controller's own root threads. The controller's
 // delivery queue is deliberately independent of this bounded live cache.
 import { toolOutputText } from '../shared/tool-output.mjs';
+import { orderWaits } from '../shared/activity-order.mjs';
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
@@ -36,7 +37,7 @@ const delegationFields = (item) => {
   const agents = ids.map(id => ({ id, name: item.displayAgentNames?.[id] ?? item.agentsStates?.[id]?.name ?? item.agentsStates?.[id]?.nickname, status: item.agentsStates?.[id]?.status }));
   return { id: item.id, type: item.type, tool: item.tool, status: item.status, receiverThreadIds: ids, agents, names: agents.map(a => a.name ?? a.id), name: item.name ?? item.agentName };
 };
-const subagentFields = (item) => ({ id: item.id, type: item.type, kind: item.kind, agentThreadId: item.agentThreadId, agentPath: item.agentPath, name: item.name, model: item.model, reasoningEffort: item.reasoningEffort });
+const subagentFields = (item) => ({ id: item.id, type: item.type, kind: item.kind, agentThreadId: item.agentThreadId, agentPath: item.agentPath, name: item.name, display_name: item.display_name, model: item.model, reasoningEffort: item.reasoningEffort });
 const fileSummary = (item) => (item.changes ?? []).map((change) => {
   const summary = { path: change.path };
   if (typeof change.diff === 'string') {
@@ -86,9 +87,9 @@ export function formatItem(item) {
   }
 }
 const visible = (item) => item && item.type !== 'reasoning';
-const simplify = (item, turnId, deferred = false, stage) => {
+const simplify = (item, turnId, deferred = false, stage, startedAtMs) => {
   const data = clean({ ...(stage ? { stage } : {}), ...project(item) }, PREVIEW_BUDGET / 2);
-  return { id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred };
+  return { id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
@@ -165,7 +166,11 @@ export class ActivityStore {
   }
   decorate(item) {
     if (['collabAgentToolCall', 'collabToolCall'].includes(item.type)) return { ...item, displayAgentNames: Object.fromEntries([...(item.receiverThreadIds ?? []), ...Object.keys(item.agentsStates ?? {})].filter(id => this.agentNames.has(id)).map(id => [id, this.agentNames.get(id)])) };
-    if (item.type === 'subAgentActivity') return { ...item, name: this.agentNames.get(item.agentThreadId) ?? item.name ?? item.agentPath };
+    if (item.type === 'subAgentActivity') {
+      const name = this.agentNames.get(item.agentThreadId) ?? item.name;
+      const pathName = typeof item.agentPath === 'string' ? item.agentPath.split('/').filter(Boolean).at(-1) : undefined;
+      return { ...item, name: name ?? item.agentPath, display_name: name ?? pathName };
+    }
     return item;
   }
   remember(map, key, value) { map.delete(key); map.set(key, value); if (map.size > 256) map.delete(map.keys().next().value); }
@@ -183,7 +188,11 @@ export class ActivityStore {
     // Never follow descendant IDs, even when they are tracked by the controller.
     if (!agent || agent.threadId !== p.threadId) return;
     if (message.method === 'item/started' || message.method === 'item/completed') {
-      if (visible(p.item)) this.put(agent, simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started'));
+      if (visible(p.item)) {
+        const previous = this.bucket(agent.id).entries.find(entry => entry.turn_id === p.turnId && entry.id === p.item.id);
+        const startedAtMs = p.item.startedAtMs ?? (message.method === 'item/started' ? p.startedAtMs : undefined) ?? previous?.started_at_ms;
+        this.put(agent, simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started', startedAtMs));
+      }
       return;
     }
     if (message.method === 'turn/completed' && p.turn?.id) this.remember(this.turnStates, `${p.threadId}:${p.turn.id}`, p.turn.status);
@@ -203,7 +212,7 @@ export class ActivityStore {
   }
   revision({ target, revision } = {}) {
     const agent = this.find(target), bucket = this.bucket(agent.id);
-    return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: bucket.entries }) };
+    return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: orderWaits(bucket.entries) }) };
   }
   async history({ target, cursor, limit = 30 } = {}) {
     const agent = this.find(target);
@@ -241,14 +250,14 @@ export class ActivityStore {
       requests++;
       if ((page.data?.length ?? 0) > limit - entries.length) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
-      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry))));
+      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry), entry.startedAtMs ?? entry.item.startedAtMs)));
       if (!itemsCursor) {
         turnId = null; seenItems = new Set();
         if (!turnsCursor) done = true;
       }
     }
     const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
-    return { agent: this.summary(agent), entries: entries.reverse(), next_cursor };
+    return { agent: this.summary(agent), entries: orderWaits(entries.reverse()), next_cursor };
   }
   async detail({ target, turn_id, item_id, offset = 0, file_path, view } = {}) {
     const agent = this.find(target);

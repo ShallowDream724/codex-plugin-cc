@@ -32,6 +32,17 @@ test('local transport requires a session secret', async t => {
   assert.equal(response.status, 403); assert.equal(controller.calls.length, 0);
 });
 
+test('wait returns queryable private-agent status without awaiting its private work', async t => {
+  const { post, controller } = await setup(t);
+  controller.hasParentWork = () => false;
+  controller.hasActiveWork = () => true;
+  controller.dispatch = async operation => ({ agents: [{ agent_id: 'a', status: 'running', turn_origin: 'user' }] });
+  const waited = await post({ operation: 'wait' });
+  assert.equal(waited.body.idle, true); assert.deepEqual(waited.body.events, []);
+  assert.equal(waited.body.agents[0].turn_origin, 'user');
+  assert.equal((await post({ operation: 'idle_shutdown' })).body.reason, 'active');
+});
+
 test('UI reads never claim or confirm Claude events, even with extraneous restore evidence', async t => {
   const { post, controller } = await setup(t, { activity: { list: () => ({ agents: [{ agent_id: 'a' }] }) } });
   controller.publish();
@@ -89,6 +100,16 @@ test('a crash receipt fails explicitly rather than replaying work', async t => {
   const { post, controller } = await setup(t, { receipts: { call1: { operation: 'spawn_agent', status: 'inflight' } } });
   const result = await post({ operation: 'spawn_agent', requestId: 'call1', args: { context_mode: 'none' } });
   assert.equal(result.body.error.code, 'ambiguous_action'); assert.equal(controller.calls.length, 0);
+});
+
+test('private-turn followup rejection is a retryable-on-new-call preflight failure rather than ambiguous submission', async t => {
+  const { post, controller } = await setup(t);
+  controller.dispatch = async () => { throw Object.assign(new Error('Private turn remains active; task was not sent.'), { code: 'private_turn_active', agent_id: 'a', thread_id: 'thread-a', status: 'running', recovery: 'Retry this same agent after its user turn completes.' }); };
+  const request = { operation: 'followup_task', requestId: 'private-active', args: { target: 'a', message: 'Parent task' } };
+  const first = await post(request), repeated = await post(request);
+  assert.equal(first.body.error.code, 'private_turn_active');
+  assert.deepEqual(repeated.body, first.body);
+  assert.equal(first.body.error.thread_id, 'thread-a'); assert.match(first.body.error.recovery, /same agent/);
 });
 
 test('simultaneous copies of one tool call never dispatch twice', async t => {

@@ -100,7 +100,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
             if (signal.aborted) { if (batch.delivery_id) await delivery.release(batch.delivery_id); break; }
             if (batch.events?.length) return batch;
             const listed = await controller.dispatch('list_agents', {});
-            const active = controller.hasActiveWork ? controller.hasActiveWork()
+            const active = controller.hasParentWork ? controller.hasParentWork() : controller.hasActiveWork ? controller.hasActiveWork()
               : listed.agents?.some(agent => activeStatuses.has(agent.status) || agent.pending_requests?.length);
             if (!batch.busy && !active) return { idle: true, events: [], agents: listed.agents || [] };
             if (Date.now() >= deadline) return { pending: true };
@@ -137,9 +137,9 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       let result;
       try { result = await controller.dispatch(operation, args); }
       catch (error) {
-        // This validation fails before any wire response. Other errors may have
+        // These validations fail before any wire response. Other errors may have
         // ambiguous side effects, so retain their inflight receipt and never retry.
-        if (error.code === 'invalid_answer') await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
+        if (['invalid_answer', 'private_turn_active'].includes(error.code)) await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
         throw error;
       }
       await journal.put(requestId, { operation, fingerprint, status: 'done', result });

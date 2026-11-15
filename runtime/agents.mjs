@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 import { prepareAttachments, directUserInput } from './attachments.mjs';
+import { AUTOMATIC_TURN_EVENTS, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const ACTIVE = new Set(['starting', 'running', 'waiting', 'compacting']);
@@ -63,14 +64,19 @@ export class AgentController extends EventEmitter {
     catch (error) { if (error.code === 'ENOENT') return this; throw error; }
     if (data.version !== 1 || !Array.isArray(data.agents) || !Array.isArray(data.pendingEvents)) throw new Error('Invalid agent state.');
     // Wire requests cannot be recovered by a new app-server connection.
-    this.pendingEvents = data.pendingEvents.filter((event) => !['question', 'approval'].includes(event.kind));
+    this.pendingEvents = parentDeliveryEvents(data.pendingEvents).filter((event) => !['question', 'approval'].includes(event.kind));
     this.retiredThreads = new Set(data.retiredThreads ?? []);
     this.pausedThreads = new Set(data.pausedThreads ?? []);
     this.unlinkedThreads = new Map(data.unlinkedThreads ?? []);
     this.unlinkedTurns = new Map(data.unlinkedTurns ?? []);
     this.nextSeq = data.pendingEvents.reduce((next, event) => Math.max(next, event.seq + 1), data.nextSeq ?? 1);
     for (const saved of data.agents) {
-      const a = { ...saved, lastTurnId: saved.turnId, pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
+      const privateTurnIds = data.pendingEvents.filter(event => event.agent_id === saved.id && isUserSend(event) && event.phase === 'delivered').map(event => event.turn_id).filter(Boolean);
+      const a = { ...saved, lastTurnId: saved.turnId ?? saved.lastTurnId, turnOrigin: saved.turnOrigin ?? (privateTurnIds.includes(saved.turnId ?? saved.lastTurnId) ? 'user' : 'parent'), pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
+      // A crashed steer has no confirmed acceptance. Restore the original parent
+      // task's deferred facts; never infer successful takeover from an inflight RPC.
+      this.pendingEvents.push(...(saved.pendingUserSteer?.events ?? []));
+      a.pendingUserSteer = null;
       if (a.threadId && this.pausedThreads.has(a.threadId)) a.userPaused = true;
       if (a.userPaused) a.interrupted = true;
       if (a.userPaused && a.threadId) this.pausedThreads.add(a.threadId);
@@ -87,7 +93,7 @@ export class AgentController extends EventEmitter {
     }
     this.descendantTurns = new Map((data.descendantTurns ?? []).filter(([id]) => this.descendants.has(id)));
     this.linkDescendants();
-    this.pendingEvents = this.pendingEvents.filter((event) => this.agents.has(event.agent_id));
+    this.pendingEvents = this.pendingEvents.filter((event) => this.agents.has(event.agent_id)).sort((a, b) => a.seq - b.seq);
     // A restarted controller cannot assume an active turn stopped. Reconcile
     // native state now so confirmed idle threads release capacity automatically.
     await Promise.allSettled([...this.agents.values()].filter((a) => a.status === 'unknown' && a.threadId).map((a) => this.reconcileUnknown(a)));
@@ -102,7 +108,8 @@ export class AgentController extends EventEmitter {
   view(a, metrics = false) {
     const result = { id: a.id, agent_id: a.id, thread_id: a.threadId, name: a.name, cwd: a.cwd,
       model: a.model, reasoning_effort: a.effort, status: a.status, activity: a.activity,
-      turn_id: a.turnId, error: a.error ?? null,
+      turn_id: a.turnId, error: a.turnOrigin === 'user' && !metrics ? null : a.error ?? null,
+      turn_origin: a.turnOrigin ?? 'parent',
       user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null,
       pending_requests: a.pending.map(({ id, method, params }) => ({ method, ...copy(params), request_id: id,
         reply_format: replyFormat(method, params), ...(params.threadId !== a.threadId ? { source_thread_id: params.threadId } : {}) })) };
@@ -116,6 +123,9 @@ export class AgentController extends EventEmitter {
   snapshot() { return { agents: [...this.agents.values()].map((a) => this.view(a, true)), pendingEvents: copy(this.pendingEvents), nextSeq: this.nextSeq }; }
   hasActiveWork() {
     return this.descendantTurns.size > 0 || [...this.agents.values()].some((a) => ACTIVE.has(a.status) || a.status === 'unknown' || a.turnId || a.pending.length > 0);
+  }
+  hasParentWork() {
+    return [...this.agents.values()].some(a => a.pending.length > 0 || a.turnOrigin !== 'user' && this.occupies(a));
   }
   eventsAfter(cursor = 0, targets = []) {
     if (!Number.isSafeInteger(cursor) || cursor < 0 || !Array.isArray(targets)) throw new TypeError('Invalid event cursor or targets.');
@@ -259,11 +269,11 @@ export class AgentController extends EventEmitter {
     for (const entry of matching) entry.request ? this.onRequest(entry.message) : this.observe(entry.message);
   }
 
-  async startTurn(a, text, newTask = false) {
+  async startTurn(a, text, newTask = false, origin = 'parent') {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
     if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
     const previousTaskTurns = newTask ? new Set(a.completedTurns) : null;
-    if (newTask) { a.recoveryUsed = false; a.interrupted = false; a.error = null; a.terminalEmitted = false; }
+    if (newTask) { a.recoveryUsed = false; a.interrupted = false; a.error = null; a.terminalEmitted = false; a.turnOrigin = origin; }
     a.compactItems.clear();
     a.result = null;
     a.unclassifiedResult = null;
@@ -272,6 +282,9 @@ export class AgentController extends EventEmitter {
     a.startEvents = [];
     let response;
     try {
+      // Record the recipient before native work can emit a result or survive a
+      // controller restart. The same native thread/history remains in use.
+      await this.persist();
       response = await this.rpc('turn/start', { threadId: a.threadId, input: Array.isArray(text) ? text : input(text),
         ...(a.effort ? { effort: a.effort } : {}), serviceTierForTurn: 'default' });
       if (!nonempty(response?.turn?.id)) throw new Error('turn/start returned no turn id; start outcome is unknown.');
@@ -433,13 +446,32 @@ export class AgentController extends EventEmitter {
     if (a.removing) throw new Error('Agent is closing.');
     if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
     if (ACTIVE.has(a.status)) {
+      if (followup && origin !== 'user' && a.turnOrigin === 'user') {
+        // A steer and an already-generated private final can cross in transit.
+        // There is no native boundary that can attribute that final to the new
+        // parent task safely. Start a fresh turn on this same thread once idle.
+        const recovery = `Wait for this user turn to finish, inspect list_agents, then retry followup_task with the same agent ${a.id}. Its native thread and history are retained.`;
+        throw Object.assign(new Error(`Agent ${a.id} is handling a direct user turn. The parent task was not sent. ${recovery}`), {
+          code: 'private_turn_active', agent_id: a.id, thread_id: a.threadId, status: a.status, recovery,
+        });
+      }
       if (!a.turnId || a.status === 'compacting') throw new Error('Agent turn is not steerable yet.');
       const turnId = a.turnId;
+      if (origin === 'user' && a.turnOrigin !== 'user') a.pendingUserSteer = { turnId, events: [] };
       a.sending = (a.sending ?? 0) + 1;
       try {
+        if (a.pendingUserSteer) await this.persist();
         const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: wireInput });
+        if (origin === 'user') { a.turnOrigin = 'user'; a.pendingUserSteer = null; await this.persist(); this.emit('state'); }
         this.action('send', a, message, origin, attachments);
         return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
+      } catch (error) {
+        if (a.pendingUserSteer) {
+          const deferred = a.pendingUserSteer.events; a.pendingUserSteer = null;
+          this.pendingEvents.push(...deferred); this.pendingEvents.sort((a, b) => a.seq - b.seq); await this.persist();
+          for (const event of deferred) this.emit('event', copy(event));
+        }
+        throw error;
       } finally { a.sending--; if (a.interrupted) this.stopTree(a).catch(() => {}); }
     }
     if (a.resuming) throw new Error('Agent followup is already starting.');
@@ -467,7 +499,7 @@ export class AgentController extends EventEmitter {
         this.action('send', a, message, origin, attachments);
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
-      await this.startTurn(a, wireInput, true);
+      await this.startTurn(a, wireInput, true, origin === 'user' ? 'user' : 'parent');
       this.action('send', a, message, origin, attachments);
       return this.view(a);
     } finally { a.resuming = false; if (a.interrupted) this.stopTree(a).catch(() => {}); }
@@ -638,7 +670,6 @@ export class AgentController extends EventEmitter {
         if (wasPaused) await this.persist();
         const result = await this.send(a, message, true, undefined, 'user', resumeToken, files);
         if (wasPaused && !a.userPaused && a.threadId) this.pausedThreads.delete(a.threadId);
-        this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'delivered', message, ...(files.length ? { attachments: files } : {}), delivery_status: result.status === 'steered' ? 'steered' : 'started' });
         await this.persist();
         return { ...result, delivery: result.status === 'steered' ? 'steered' : 'started', user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
       } catch (error) {
@@ -647,7 +678,6 @@ export class AgentController extends EventEmitter {
           if (a.threadId) this.pausedThreads.add(a.threadId);
           a.userControlStatus = this.treeBusy(a) ? 'unconfirmed' : 'stopped';
         }
-        this.publish(a, 'message', { origin: 'user', action: 'send', phase: 'failed', message, ...(files.length ? { attachments: files } : {}), delivery_status: 'unconfirmed', error: error.message });
         a.pauseDurable = this.persist();
         await a.pauseDurable;
         if (a.userPaused && this.treeBusy(a)) await this.stopTree(a);
@@ -839,12 +869,15 @@ export class AgentController extends EventEmitter {
             this.publish(a, 'compacting', { item_id: item.id, ...(a.overflow || a.recovery ? { reason: 'contextWindowExceeded' } : {}) });
           }
           if (a.recovery && message.method === 'item/completed') a.recovery.compacted = true;
-          a.activity = 'compacting context';
+          a.activity = message.method === 'item/started' ? 'compacting context' : a.pending.length ? 'waiting for parent' : 'working';
         } else if (item.type === 'collabAgentToolCall' || item.type === 'subAgentActivity') a.activity = 'delegated to subagent';
         else if (item.type !== 'agentMessage' && item.type !== 'reasoning' && item.type !== 'userMessage') a.activity = item.type ?? 'working';
         break;
       }
-      case 'thread/compacted': if (a.recovery) a.recovery.compacted = true; break;
+      case 'thread/compacted':
+        if (a.recovery) a.recovery.compacted = true;
+        if (a.activity === 'compacting context') a.activity = a.pending.length ? 'waiting for parent' : 'working';
+        break;
       case 'serverRequest/resolved':
         a.pending = a.pending.filter((r) => r.wireId !== p.requestId);
         this.pruneRequestEvents(a);
@@ -1003,7 +1036,12 @@ export class AgentController extends EventEmitter {
   }
 
   publish(a, kind, details) {
+    if (isUserSend({ kind, ...details })) return;
+    if (AUTOMATIC_TURN_EVENTS.has(kind) && a.turnOrigin === 'user') { this.persist().then(() => this.emit('state')).catch(() => {}); return; }
     const event = { seq: this.nextSeq++, agent_id: a.id, name: a.name ?? null, turn_id: details.turnId ?? a.turnId ?? a.lastTurnId ?? null, kind, ...details };
+    if (AUTOMATIC_TURN_EVENTS.has(kind) && a.pendingUserSteer?.turnId === event.turn_id) {
+      a.pendingUserSteer.events.push(event); this.persist().catch(() => {}); return;
+    }
     this.pendingEvents.push(event);
     // Keep every important event until a future explicit retention policy exists.
     // No tool output, thinking, or input prompt enters this durable journal.
@@ -1021,7 +1059,7 @@ export class AgentController extends EventEmitter {
       this.persistScheduled = null;
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
       id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
-      activity: a.activity, turnId: a.turnId, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
+      activity: a.activity, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
       snapshot: a.snapshot, injected: a.injected, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus,
     })) };
       return (async () => {

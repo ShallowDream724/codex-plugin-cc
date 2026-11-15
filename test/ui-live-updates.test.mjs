@@ -9,7 +9,7 @@ async function setup(handler) {
   const hooks = [], timers = [], afters = [], scrolls = [], calls = [];
   const $ = {
     ui: {
-      resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])),
+      resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map((type) => [type, (props) => ({ type, props })])),
       invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { scrolls.push(args); },
     },
     clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn, cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
@@ -25,11 +25,11 @@ async function setup(handler) {
   closeUI();
   registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) }));
   await openAgent($, 'a');
-  const draw = () => hooks.find((hook) => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  const draw = (options = {}) => hooks.find((hook) => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', ...options }, () => null);
   const item = async (key) => nodes(await draw()).find((node) => node.props.key?.startsWith(key));
   const scroll = (by = -1, offset = 0) => hooks.find((hook) => hook.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by, offset }, async (e) => e);
   const scrollEvent = (event) => hooks.find((hook) => hook.event === 'ui.scroll').fn($, event, async (e) => e);
-  return { draw, item, tick: () => timers[0](), scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e) };
+  return { draw, item, tick: () => timers[0](), scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e), message: (e) => hooks.find((hook) => hook.event === 'ui.message').fn($, e, async () => ({})) };
 }
 
 test('first open starts at the end and reopening restores the saved reading position', async (t) => {
@@ -59,6 +59,7 @@ test('live messages continue while an MCP group and cached tool output remain ex
   await group.props.onPress();
   assert.deepEqual(ui.scrolls.at(-1), { in: 'codex_subagent_activity', to: { key: `row_${group.props.key}` }, block: 'nearest' });
   await (await ui.item('item_a:turn:tool')).props.onPress();
+  for (const timer of ui.afters.splice(0)) if (!timer.cancelled) await timer.fn();
   assert.deepEqual(ui.scrolls.at(-1), { in: 'codex_subagent_activity', to: { key: 'row_item_a:turn:tool' }, block: 'nearest' });
   assert.match(JSON.stringify(await ui.draw()), /cached tool output/);
   const scrollCount = ui.scrolls.length;
@@ -123,100 +124,113 @@ test('a send during an in-flight poll triggers a follow-up refresh', async (t) =
   assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: 'end' }]);
 });
 
-test('top scrolling deduplicates an in-flight cursor and anchors the old first group', async (t) => {
+const flushTimers = async (ui) => {
+  while (ui.afters.length) {
+    const timers = ui.afters.splice(0);
+    for (const timer of timers) if (!timer.cancelled) await timer.fn();
+  }
+};
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const messages = async (ui) => nodes(await ui.draw()).filter(node => node.type === 'Markdown').map(node => node.props.text);
+
+test('desktop jump control follows viewport metrics and returns to the latest message', async (t) => {
   t.after(closeUI);
-  let release;
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('saved', 'agentMessage', 'saved')], next_cursor: null } : { revision: 1, entries: [] });
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 30, contentRows: 100, bodyRows: 10 });
+  const drawAt = offset => ui.draw({ surface: 'desktop', props: { scroll: { offset, bodyRows: 10 } } });
+  let tree = nodes(await drawAt(30));
+  assert.equal(tree.find(node => node.props.key === 'codex_jump_position_a').props.top, 37);
+  assert.equal(tree.find(node => node.props.key === 'codex_jump_a').type, 'Client');
+  tree = nodes(await drawAt(45));
+  assert.equal(tree.find(node => node.props.key === 'codex_jump_position_a').props.top, 52);
+  const before = ui.scrolls.length;
+  await ui.message({ element: 'codex_jump_a', data: { action: 'activate', expanded: false } });
+  await flushTimers(ui);
+  assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: 'end' }]);
+  assert.equal(nodes(await drawAt(45)).find(node => node.props.key === 'codex_jump_a'), undefined);
+});
+
+test('prefetch leaves the view and scroll unchanged until the reader reaches the edge', async (t) => {
+  t.after(closeUI);
   const ui = await setup(async (op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
     if (op === 'ui_revision') return { revision: 1, entries: [entry('live', 'agentMessage', 'live')] };
-    if (op === 'ui_history' && !args.cursor) return { entries: [entry('recent', 'agentMessage', 'recent')], next_cursor: { turns_cursor: 'older' } };
-    if (op === 'ui_history' && args.cursor.turns_cursor === 'older') return new Promise((resolve) => { release = resolve; });
-    if (op === 'ui_history') return { entries: [entry('oldest', 'agentMessage', 'oldest')], next_cursor: null };
-  });
-  const first = ui.scroll();
-  while (!release) await new Promise((resolve) => setImmediate(resolve));
-  const second = ui.scroll();
-  release({ entries: [entry('older', 'agentMessage', 'older')], next_cursor: { turns_cursor: 'oldest' } });
-  await Promise.all([first, second]);
-  assert.equal(ui.calls.filter((call) => call.operation === 'ui_history' && call.args.cursor).length, 1);
-  assert.deepEqual(nodes(await ui.draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text), ['older', 'recent', 'live']);
-  for (const timer of ui.afters.splice(0)) if (!timer.cancelled) await timer.fn();
-  await ui.scroll();
-  const before = ui.scrolls.length;
-  for (const timer of ui.afters) if (!timer.cancelled) await timer.fn();
-  assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: { key: 'activity_group_a:turn:older' }, block: 'start' }]);
-});
-
-test('late history cannot move a reader who scrolled or switched agents', async (t) => {
-  t.after(closeUI);
-  let release;
-  const ui = await setup(async (op, args) => {
-    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }] };
-    if (op === 'ui_revision') return { revision: 1, entries: [] };
-    if (op === 'ui_history' && args.cursor) return new Promise((resolve) => { release = resolve; });
-    if (op === 'ui_history') return { entries: [entry(args.target, 'agentMessage', `${args.target} recent`)], next_cursor: args.target === 'a' ? { turns_cursor: 'older' } : null };
-  });
-  let loading = ui.scroll();
-  while (!release) await new Promise((resolve) => setImmediate(resolve));
-  await ui.scroll(1, 5);
-  release({ entries: [entry('old', 'agentMessage', 'a old')], next_cursor: { turns_cursor: 'older2' } });
-  await loading;
-  let before = ui.scrolls.length;
-  for (const timer of ui.afters.splice(0)) if (!timer.cancelled) await timer.fn();
-  assert.equal(ui.scrolls.length, before);
-  assert.match(JSON.stringify(await ui.draw()), /a old/);
-  release = undefined; loading = ui.scroll();
-  while (!release) await new Promise((resolve) => setImmediate(resolve));
-  await ui.open('b'); before = ui.scrolls.length;
-  release({ entries: [entry('late', 'agentMessage', 'a late')], next_cursor: null });
-  await loading;
-  for (const timer of ui.afters.splice(0)) if (!timer.cancelled) await timer.fn();
-  assert.equal(ui.scrolls.length, before);
-  assert.match(JSON.stringify(await ui.draw()), /b recent/);
-  assert.doesNotMatch(JSON.stringify(await ui.draw()), /a late/);
-});
-
-test('long conversations keep loaded messages across a moving scroll window', async (t) => {
-  t.after(closeUI);
-  let revision = 1, live = [];
-  const saved = Array.from({ length: 1200 }, (_, i) => entry(`m${i}`, 'agentMessage', `message ${i}`));
-  const ui = await setup(async (op, args) => {
-    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
-    if (op === 'ui_revision') return { revision, entries: live };
     if (op === 'ui_history') return args.cursor
-      ? { entries: [entry('oldest', 'agentMessage', 'earliest saved')], next_cursor: null }
-      : { entries: saved, next_cursor: { turns_cursor: 'earlier' } };
+      ? { entries: [entry('older', 'agentMessage', 'older')], next_cursor: null }
+      : { entries: [entry('recent', 'agentMessage', 'recent')], next_cursor: { turns_cursor: 'older' } };
+  });
+  const before = await messages(ui), scrollCount = ui.scrolls.length;
+  await flushTimers(ui); await settle();
+  assert.deepEqual(await messages(ui), before);
+  assert.equal(ui.scrolls.length, scrollCount);
+  assert.equal(ui.calls.filter(call => call.operation === 'ui_history').length, 2);
+  await ui.scroll(); await flushTimers(ui);
+  assert.deepEqual(await messages(ui), ['older', 'recent', 'live']);
+  assert.equal(ui.calls.filter(call => call.operation === 'ui_history').length, 2);
+  await ui.scroll(1, 1); await ui.scroll(); await flushTimers(ui);
+  assert.equal(ui.calls.filter(call => call.operation === 'ui_history').length, 2);
+});
+
+test('scroll returns while history is slow, and switch or close discards late results', async (t) => {
+  t.after(closeUI);
+  for (const action of ['switch', 'close']) {
+    let release;
+    const ui = await setup(async (op, args) => {
+      if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }] };
+      if (op === 'ui_revision') return { revision: 1, entries: [] };
+      if (op === 'ui_history' && args.cursor) return new Promise(resolve => { release = resolve; });
+      if (op === 'ui_history') return { entries: [entry(args.target, 'agentMessage', `${args.target} recent`)], next_cursor: args.target === 'a' ? { turns_cursor: 'older' } : null };
+    });
+    await ui.scroll();
+    await settle();
+    assert.equal(typeof release, 'function');
+    const pendingTimers = ui.afters.splice(0).filter(timer => !timer.cancelled).map(timer => timer.fn());
+    await settle();
+    if (action === 'switch') await ui.open('b'); else await ui.close();
+    const scrollCount = ui.scrolls.length;
+    release({ entries: [entry('late', 'agentMessage', 'a late')], next_cursor: null });
+    await Promise.all(pendingTimers); await flushTimers(ui);
+    assert.equal(ui.scrolls.length, scrollCount);
+    if (action === 'switch') {
+      assert.match(JSON.stringify(await ui.draw()), /b recent/);
+      assert.doesNotMatch(JSON.stringify(await ui.draw()), /a late/);
+    } else {
+      await ui.open('b');
+      assert.doesNotMatch(JSON.stringify(await ui.draw()), /a late/);
+    }
+  }
+});
+
+test('10,000 cached records remain reachable while moving through render windows', async (t) => {
+  t.after(closeUI);
+  const saved = Array.from({ length: 10000 }, (_, i) => entry(`m${i}`, 'agentMessage', `message ${i}`));
+  const ui = await setup(async op => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [] };
+    if (op === 'ui_history') return { entries: saved, next_cursor: null };
   });
   const seen = new Set();
-  const messages = async () => {
-    const tree = await ui.draw();
-    assert.equal(nodes(tree).find((node) => ['codex_older', 'codex_latest'].includes(node.props.key)), undefined);
-    const items = nodes(tree).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
-    assert.ok(items.length <= 500);
-    items.forEach((item) => seen.add(item));
-    return items;
+  const read = async () => {
+    const visible = await messages(ui);
+    assert.ok(visible.length > 0 && visible.length <= 500);
+    visible.forEach(value => seen.add(value));
+    return visible;
   };
-  const flushAnchor = async (id, block) => {
-    const before = ui.scrolls.length;
-    for (const timer of ui.afters.splice(0)) if (!timer.cancelled) await timer.fn();
-    assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: { key: `activity_group_a:turn:${id}` }, block }]);
-  };
-  let visible = await messages();
-  assert.equal(visible[0], 'message 700'); assert.equal(visible.at(-1), 'message 1199');
-  for (const oldFirst of ['m700', 'm450', 'm200']) {
-    await ui.scroll(); await flushAnchor(oldFirst, 'start'); visible = await messages();
+  let visible = await read();
+  assert.equal(visible.at(-1), 'message 9999');
+  for (let i = 0; visible[0] !== 'message 0' && i < 200; i++) {
+    const previous = visible[0];
+    await ui.scroll(); await flushTimers(ui); visible = await read();
+    assert.notEqual(visible[0], previous, 'scrolling up must advance the window');
   }
   assert.equal(visible[0], 'message 0');
-  assert.equal(ui.calls.filter((call) => call.operation === 'ui_history').length, 1);
-  live = [entry('new', 'agentMessage', 'new live message')]; revision++;
-  await ui.tick(); assert.deepEqual(await messages(), visible);
-  await ui.scroll(); await flushAnchor('m0', 'start'); visible = await messages();
-  assert.equal(visible[0], 'earliest saved');
-  assert.equal(ui.calls.filter((call) => call.operation === 'ui_history').length, 2);
-  for (const oldLast of ['m498', 'm748', 'm998']) {
+  for (let i = 0; visible.at(-1) !== 'message 9999' && i < 200; i++) {
+    const previous = visible.at(-1);
     await ui.scrollEvent({ origin: { kind: 'person' }, by: 1, offset: 90, contentRows: 100, bodyRows: 10 });
-    await flushAnchor(oldLast, 'end'); visible = await messages();
+    await flushTimers(ui); visible = await read();
+    assert.notEqual(visible.at(-1), previous, 'scrolling down must advance the window');
   }
-  assert.equal(visible.at(-1), 'new live message');
-  for (let i = 0; i < 1200; i++) assert.ok(seen.has(`message ${i}`), `message ${i} remains reachable`);
+  assert.equal(visible.at(-1), 'message 9999');
+  for (let i = 0; i < saved.length; i++) assert.ok(seen.has(`message ${i}`), `message ${i} remains reachable`);
+  assert.equal(ui.calls.filter(call => call.operation === 'ui_history').length, 1);
 });

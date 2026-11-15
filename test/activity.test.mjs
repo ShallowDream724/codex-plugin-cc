@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { ActivityStore } from '../runtime/activity.mjs';
+import { orderWaits } from '../shared/activity-order.mjs';
 import { toolSections } from '../hooks/tool-presentation.js';
 
 function fixture() {
@@ -236,6 +237,44 @@ test('root lifecycle rows distinguish compaction stages and keep only child iden
   assert.equal(entries[1].data.name, 'Scout');
   assert.ok(!JSON.stringify(entries).includes('private'));
   assert.deepEqual(controller.pendingEvents, [{ seq: 1 }]);
+});
+
+test('waits use recorded start times without inventing targets or discarding messages', async () => {
+  const { client, store } = fixture();
+  const child = { id: 'child-done', type: 'subAgentActivity', kind: 'completed', agentThreadId: 'child', agentPath: '/root/nested_file_edit' };
+  const wait = { id: 'wait', type: 'collabAgentToolCall', tool: 'wait', receiverThreadIds: [], agentsStates: {}, status: 'completed' };
+  client.request = async method => method === 'thread/turns/list' ? { data: [{ id: 'turn' }], nextCursor: null } : {
+    data: [
+      { item: wait, startedAtMs: 100 },
+      { item: child, startedAtMs: 200 },
+      { item: { id: 'message', type: 'agentMessage', text: 'Real message' }, startedAtMs: 150 },
+    ], nextCursor: null,
+  };
+  const entries = (await store.history({ target: 'a' })).entries;
+  assert.deepEqual(entries.map(e => e.id), ['wait', 'message', 'child-done']);
+  assert.equal(entries[2].data.display_name, 'nested_file_edit');
+  assert.deepEqual(entries[0].data.agents, []);
+  const emit = (method, item, time) => client.emit('notification', { method, params: { threadId: 'root', turnId: 'turn', item, ...(time == null ? {} : { startedAtMs: time }) } });
+  emit('item/started', wait, 100);
+  emit('item/completed', child, 200);
+  emit('item/completed', wait);
+  const live = store.revision({ target: 'a' }).entries;
+  assert.deepEqual(live.map(e => e.id), ['wait', 'child-done']);
+  assert.equal(live[0].started_at_ms, 100);
+});
+
+test('wait ordering preserves untimed entries and turn boundaries across a long transcript', () => {
+  const entries = Array.from({ length: 700 }, (_, i) => ({ id: String(i), turn_id: 't', type: 'agentMessage', started_at_ms: i + 100 }));
+  entries.push({ id: 'wait-a', turn_id: 't', type: 'collabAgentToolCall', data: { tool: 'wait' }, started_at_ms: 350 });
+  entries.push({ id: 'wait-b', turn_id: 't', type: 'collabAgentToolCall', data: { tool: 'wait' }, started_at_ms: 200 });
+  entries.push({ id: 'unknown', turn_id: 't', type: 'collabAgentToolCall', data: { tool: 'wait' } });
+  entries.push({ id: 'other-turn', turn_id: 'other', type: 'collabAgentToolCall', data: { tool: 'wait' }, started_at_ms: 1 });
+  const ordered = orderWaits(entries);
+  assert.equal(ordered.length, entries.length);
+  assert.ok(ordered.findIndex(e => e.id === 'wait-a') < ordered.findIndex(e => e.id === '251'));
+  assert.ok(ordered.findIndex(e => e.id === 'wait-b') < ordered.findIndex(e => e.id === '101'));
+  assert.deepEqual(ordered.slice(-2).map(e => e.id), ['unknown', 'other-turn']);
+  assert.deepEqual(ordered.filter(e => e.type === 'agentMessage').map(e => e.id), entries.slice(0, 700).map(e => e.id));
 });
 
 test('native user attachments and long text remain readable after history projection', () => {

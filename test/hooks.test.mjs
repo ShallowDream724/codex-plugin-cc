@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { WAIT_TOOL, EVENT_PREFIX, messageDeliveries, scanRetainedDeliveries, filterClosed } from '../hooks/delivery.js';
-import { formatDeliveryEvent } from '../runtime/delivery.mjs';
+import { DeliveryStore, formatDeliveryEvent } from '../runtime/delivery.mjs';
 
 const event = (seq = 11, agent_id = 'agent') => ({ seq, agent_id, kind: 'completed' });
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -196,16 +196,38 @@ test('queued prompt owns delivery until final append, renews lease, and lets too
   await h.append({ role: 'user', content: h.prompts[0].text }, { door: 'prompt' }); assert.equal(h.calls.at(-1).operation, 'confirm');
 });
 
-test('direct user receipt prompts retain quoted action semantics and confirm exact events on append and recovery', async () => {
-  const receipt = formatDeliveryEvent({ seq: 3, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', message: 'OFFLINE_QUOTED_ACTION' });
-  const h = await setup(body => body.operation === 'observe' ? { events: [receipt], delivery_id: 'receipt' } : {});
+test('direct user sends never submit a parent prompt', async () => {
+  const send = { seq: 3, agent_id: 'a', turn_id: 'private', name: 'worker', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', message: 'PRIVATE_USER_ACTION' };
+  const controller = { events: [send], eventsAfter() { return structuredClone(this.events); },
+    async ackSequences(sequences) { this.events = this.events.filter(event => !sequences.includes(event.seq)); } };
+  const delivery = new DeliveryStore({ controller });
+  const h = await setup(body => body.operation === 'observe' ? delivery.claim({ channel: 'prompt' }) : {});
   await h.start(); await h.observe();
-  const content = h.prompts[0].text, value = JSON.parse(content.slice(EVENT_PREFIX.length));
-  assert.deepEqual(value.events, [receipt]); assert.equal(value.events[0].message, undefined);
-  assert.equal(value.events[0].quoted_user_message, 'OFFLINE_QUOTED_ACTION');
-  await h.append({ role: 'user', content }, { door: 'prompt' });
-  assert.deepEqual(h.calls.at(-1).args.observations, [{ delivery_id: 'receipt', sequences: [3], events: [receipt] }]);
-  assert.deepEqual(scanRetainedDeliveries([{ role: 'user', content }]).observations, [{ delivery_id: 'receipt', sequences: [3], events: [receipt] }]);
+  assert.equal(formatDeliveryEvent(send), null); assert.deepEqual(controller.events, []);
+  assert.deepEqual(h.prompts, []); assert.equal(h.calls.some(call => call.operation === 'confirm'), false);
+});
+
+test('user stop facts still prompt and confirm exact framed receipts on append and recovery', async () => {
+  const receipt = formatDeliveryEvent({ seq: 3, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'interrupt', phase: 'confirmed', message: 'User stop detail' });
+  for (const [head, tail] of [
+    ['The codex-subagents plugin sent a message:\n', "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."],
+    ['The codex-subagents plugin sent a message while you were working:\n', '\n\nThis is how Claude Code surfaces prompts a plugin submits mid-turn — within the running turn, often alongside the next tool result. Address the message above as you continue this turn.'],
+  ]) {
+    const h = await setup(body => body.operation === 'observe' ? { events: [receipt], delivery_id: 'receipt' } : {});
+    await h.start(); await h.observe();
+    const content = h.prompts[0].text, value = JSON.parse(content.slice(EVENT_PREFIX.length));
+    assert.deepEqual(value.events, [receipt]); assert.equal(value.events[0].message, undefined);
+    assert.equal(value.events[0].quoted_user_message, undefined); assert.equal(value.events[0].kind, 'user_action_receipt');
+    assert.match(value.events[0].summary, /已按用户要求停止/);
+    const retained = { role: 'user', content: [{ type: 'text', text: head + content + tail }] };
+    const observation = { delivery_id: 'receipt', sequences: [3], events: [receipt] };
+    await h.append(retained, { door: 'prompt' });
+    assert.deepEqual(h.calls.at(-1).args.observations, [observation]);
+    assert.deepEqual(scanRetainedDeliveries([retained]).observations, [observation]);
+    const reopened = await setup(() => ({}), [retained]); await reopened.start();
+    assert.equal(reopened.calls[0].operation, 'confirm');
+    assert.deepEqual(reopened.calls[0].args.observations, [observation]);
+  }
 });
 
 test('exact native plugin prompt frames acknowledge final retained events and recover on reopen', async () => {

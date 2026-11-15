@@ -1,9 +1,21 @@
+import { agentVisuals } from './agent-icons.js';
+
+// Labels stay small even when a remote field is unexpectedly large. Stored
+// names, model settings and the IDs used by actions remain unchanged.
+export function displayLabel(value, limit = 512) {
+  const text = String(value ?? '');
+  if (text.length <= limit) return text;
+  let end = limit;
+  if (/[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+  return text.slice(0, end) + '…';
+}
+
 // Slots are shared by the timeline and conversation, and bounded for long sessions.
-const icons = ['🌸', '🔷', '🟣', '🟢', '🟠', '🔵', '🟡', '✳️', '❄️', '☀️', '✴️', '💠', '🔶', '✿', '✦', '❖'];
+const icons = agentVisuals.map(visual => visual.glyph);
 const assigned = new Map();
 let activeIds = new Set();
 let next = 0;
-export function agentIcon(id) {
+function agentSlot(id) {
   const key = String(id || 'codex');
   if (!assigned.has(key)) {
     const used = new Set(assigned.values());
@@ -16,8 +28,10 @@ export function agentIcon(id) {
     assigned.set(key, slot);
     if (assigned.size > 256) assigned.delete(assigned.keys().next().value);
   }
-  return icons[assigned.get(key)];
+  return assigned.get(key);
 }
+export function agentIcon(id) { return icons[agentSlot(id)]; }
+export function agentVisual(id) { return agentVisuals[agentSlot(id)]; }
 export function retainIcons(ids, active = ids) {
   const keep = new Set(ids.map(String));
   for (const key of assigned.keys()) if (!keep.has(key)) assigned.delete(key);

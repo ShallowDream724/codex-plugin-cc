@@ -1,9 +1,9 @@
 import { messageDeliveries } from './delivery.js';
 import { openAgent } from './ui.js';
-import { agentIcon } from './presentation.js';
+import { agentIcon, agentVisual, displayLabel } from './presentation.js';
 
 const PREFIX = 'mcp__codex-subagents__';
-const EVENTS = { completed: '已完成', failed: '失败', interrupted: '本轮已停止', unknown: '需要关注', question: '有问题', approval: '需要批准', message: '发送了消息', compacting: '正在整理上下文' };
+const EVENTS = { completed: '已完成', failed: '失败', interrupted: '本轮已停止', unknown: '需要关注', question: '有问题', approval: '需要批准', message: '发送了消息', compacting: '正在压缩上下文' };
 function eventText(event) {
   if (event.origin === 'user' && event.action === 'interrupt') return ({ requested: '你已请求停止', stopping: '正在停止', confirmed: '已按你的要求停止', unconfirmed: '停止状态未确认' })[event.phase] || '停止状态已更新';
   if (event.origin === 'user' && event.action === 'send') return event.phase === 'delivered' ? '已收到你的消息' : '消息发送状态未确认';
@@ -44,7 +44,7 @@ export function describeCall(tool, input = {}, output, isRunning = false) {
     return [{ text: isRunning ? '正在等待 Codex' : value?.idle ? 'Codex 空闲' : value?.timed_out ? '等待结束，代理继续工作' : value?.cancelled ? '已取消等待，代理继续工作' : '等待 Codex 更新' }];
   }
   if (operation === 'spawn_agent' || operation === 'followup_task') return [{ id: value?.agent_id, name: value?.name || input?.name, text: isRunning ? '正在启动' : operation === 'spawn_agent' ? '开始工作' : '已收到任务' }];
-  if (operation === 'list_agents' && Array.isArray(value?.agents)) return value.agents.map(agent => ({ id: agent.agent_id || agent.id, name: agent.name, text: ({ running: '工作中', starting: '正在启动', waiting: '等待中', completed: '已完成', interrupted: '本轮已停止', failed: '失败', unknown: '状态未知', compacting: '正在整理上下文' })[agent.status] || '已保存' }));
+  if (operation === 'list_agents' && Array.isArray(value?.agents)) return value.agents.map(agent => ({ id: agent.agent_id || agent.id, name: agent.name, text: ({ running: '工作中', starting: '正在启动', waiting: '等待中', completed: '已完成', interrupted: '本轮已停止', failed: '失败', unknown: '状态未知', compacting: '正在压缩上下文' })[agent.status] || '已保存' }));
   if (operation === 'close_agent') return [{ text: isRunning ? '正在关闭代理' : value?.closed_count !== undefined ? `已关闭 ${value.closed_count} 个代理${value.skipped?.length ? `，保留 ${value.skipped.length} 个` : ''}` : '代理已关闭，历史已保留' }];
   if (operation === 'list_models' && Array.isArray(value?.models)) return [{ text: `${value.models.length} 个 Codex 模型可用` }];
   const action = { send_message: '已收到消息', answer_agent: '已收到答复', interrupt_agent: '已请求停止' }[operation];
@@ -52,7 +52,11 @@ export function describeCall(tool, input = {}, output, isRunning = false) {
 }
 
 function draw($, e, entries) {
-  const { Box, Text, Button } = $.ui.resolve(e);
+  const { Box, Text, Button, Svg } = $.ui.resolve(e);
+  const icon = id => {
+    const visual = agentVisual(id);
+    return e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key: `icon_${id}`, source: visual.source, alt: visual.alt, width: 16, height: 16 }) : Text({ key: `icon_${id}`, size: 'footnote', children: [agentIcon(id)] });
+  };
   const groups = [];
   for (const entry of entries) {
     const prior = groups.at(-1);
@@ -60,11 +64,11 @@ function draw($, e, entries) {
     else groups.push({ text: entry.text, kind: entry.kind, entries: [entry] });
   }
   return Box({ key: `codex_rows_${e.requestId || 'events'}`, flexDirection: 'column', gap: 'xs', children: groups.map((group, index) => {
-    const buttons = group.entries.filter(entry => entry.id).flatMap((entry, position) => [...(position ? [Text({ key: `join_${entry.id}`, size: 'footnote', dimColor: true, children: ['和'] })] : []), Text({ key: `icon_${entry.id}`, size: 'footnote', children: [agentIcon(entry.id)] }), Button({
+    const buttons = group.entries.filter(entry => entry.id).flatMap((entry, position) => [...(position ? [Text({ key: `join_${entry.id}`, size: 'footnote', dimColor: true, children: ['和'] })] : []), icon(entry.id), Button({
       key: `${e.requestId || 'codex'}:${index}:${position}:${entry.id}`,
-      label: safe(entry.name || entry.id || 'Codex'),
+      label: safe(displayLabel(entry.name || entry.id || 'Codex')),
       plain: true,
-      children: [Text({ size: 'footnote', weight: 'medium', children: [safe(entry.name || entry.id || 'Codex')] })],
+      children: [Text({ size: 'footnote', weight: 'medium', children: [safe(displayLabel(entry.name || entry.id || 'Codex'))] })],
       onPress: () => openAgent($, entry.id),
     })]);
     if (!buttons.length) return Text({ key: `codex_row_${index}`, size: 'footnote', dimColor: group.kind !== 'error', children: [short(group.text, 600)] });

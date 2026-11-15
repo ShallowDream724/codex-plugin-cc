@@ -14,19 +14,15 @@ function controller(count = 3) {
 }
 async function temp(t) { const dir = await mkdtemp(join(tmpdir(), 'codex-delivery-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
 
-test('direct user sends are quoted Codex action receipts and ordinary agent messages stay unchanged', () => {
+test('direct user sends have no parent delivery representation', () => {
   const original = { seq: 3, agent_id: 'a', name: 'terra-nested-test', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', delivery_status: 'started', message: 'Add another line; do not delegate.' };
-  const receipt = formatDeliveryEvent(original);
-  assert.equal(receipt.kind, 'user_action_receipt');
-  assert.equal(receipt.summary, '用户已向 Codex 子代理 terra-nested-test 发送消息，由该代理处理。');
-  assert.equal(receipt.quoted_user_message, original.message);
-  assert.equal(receipt.message, undefined);
-  assert.equal(original.kind, 'message'); assert.equal(original.message, receipt.quoted_user_message);
+  assert.equal(formatDeliveryEvent(original), null);
+  assert.equal(original.kind, 'message'); assert.equal(original.message, 'Add another line; do not delegate.');
   for (const event of [{ ...original, origin: 'codex' }, { seq: 4, agent_id: 'a', kind: 'message', message: 'Agent update' }, { ...original, action: 'answer' }]) {
     assert.equal(formatDeliveryEvent(event), event);
   }
-  const failed = formatDeliveryEvent({ ...original, phase: 'failed', delivery_status: 'unconfirmed' });
-  assert.match(failed.summary, /投递未确认/); assert.doesNotMatch(failed.summary, /已向/);
+  assert.equal(formatDeliveryEvent({ ...original, phase: 'failed', delivery_status: 'unconfirmed' }), null);
+  assert.equal(formatDeliveryEvent({ ...original, kind: 'user_action_receipt', quoted_user_message: original.message }), null);
 });
 
 test('stop receipts distinguish requested, stopped, and unconfirmed without a new task message', () => {
@@ -40,20 +36,18 @@ test('stop receipts distinguish requested, stopped, and unconfirmed without a ne
   }
 });
 
-test('formatted user receipts confirm only exact retained wire events and replay unconfirmed events', async () => {
+test('legacy send receipts and their exact-turn automatic results are retired before delivery', async () => {
   const c = controller(0);
-  const raw = { seq: 3, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', message: 'Add another line.' };
-  c.events = [raw]; let now = 0;
-  const store = new DeliveryStore({ controller: c, leaseMs: 10, now: () => now });
+  const raw = { seq: 3, agent_id: 'a', turn_id: 'private', name: 'worker', kind: 'message', origin: 'user', action: 'send', phase: 'delivered', message: 'Add another line.' };
+  const safe = { seq: 4, agent_id: 'a', turn_id: 'public', kind: 'completed', result: 'parent result' };
+  c.events = [{ seq: 1, agent_id: 'a', turn_id: 'private', kind: 'completed', result: 'private result' }, raw,
+    { ...raw, seq: 2, kind: 'user_action_receipt', quoted_user_message: raw.message }, safe,
+    { seq: 5, agent_id: 'a', turn_id: 'private', kind: 'message', message: 'explicit notify_parent' }];
+  const store = new DeliveryStore({ controller: c });
   const first = await store.claim({ channel: 'prompt' });
-  assert.equal(first.events[0].kind, 'user_action_receipt'); assert.deepEqual(c.events, [raw]);
-  now = 11;
-  const replay = await store.claim({ channel: 'prompt' });
-  assert.notEqual(replay.delivery_id, first.delivery_id); assert.deepEqual(replay.events, first.events);
-  const rejected = await store.confirm({ observations: [{ delivery_id: first.delivery_id, sequences: [3], events: [raw] }] });
-  assert.deepEqual(rejected.rejected, [{ delivery_id: first.delivery_id, sequences: [3] }]);
-  assert.equal(c.events.length, 1);
-  await store.confirm({ observations: [{ delivery_id: replay.delivery_id, sequences: [3], events: replay.events }] });
+  assert.deepEqual(first.events.map(e => e.seq), [4, 5]);
+  assert.deepEqual(c.events.map(e => e.seq), [4, 5]);
+  await store.confirm({ delivery_ids: [first.delivery_id] });
   assert.deepEqual(c.events, []);
 });
 
