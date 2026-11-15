@@ -634,7 +634,8 @@ function renderPane($, e, next) {
         itemRows.push(Box({ key: `tool_entry_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.5 : 'sm', children: itemRows.splice(toolStart) }));
       }
       if (group.integration) {
-        const line = e.surface === 'desktop' ? Box({ key: `integration_line_${groupKey}`, position: 'absolute', top: 0, bottom: 0, left: 0, width: '1px', backgroundColor: 'rgba(128,128,128,0.18)', children: [] }) : null;
+        // Native Box dimensions use cells or percentages, not CSS unit strings.
+        const line = e.surface === 'desktop' ? Box({ key: `integration_line_${groupKey}`, position: 'absolute', top: 0, bottom: 0, left: 0, width: 0.125, backgroundColor: 'rgba(128,128,128,0.18)', children: [] }) : null;
         groupRows.push(Box({ key: `integration_${groupKey}`, position: 'relative', flexDirection: 'column', rowGap, paddingLeft: 1, children: [...(line ? [line] : []), ...itemRows] }));
       } else groupRows.push(...itemRows);
       rows.push(groupBox(groupRows));

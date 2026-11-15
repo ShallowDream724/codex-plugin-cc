@@ -3,6 +3,17 @@ import assert from 'node:assert/strict';
 import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hooks/ui.js';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
+// Native Box dimensions accept cells or percentages, not CSS unit strings.
+function assertNativeDimensions(tree) {
+  for (const node of nodes(tree).filter(node => node.type === 'Box')) {
+    for (const prop of ['width', 'height', 'minWidth', 'minHeight']) {
+      const value = node.props[prop];
+      if (value === undefined) continue;
+      assert.ok(typeof value === 'number' ? Number.isFinite(value) && value >= 0 && value <= 10000 : typeof value === 'string' && /^\d{1,3}%$/.test(value), `${node.props.key}.${prop}: unsupported native dimension ${value}`);
+    }
+  }
+}
+
 function connect($, handler) {
   $.clock.after ??= () => ({ cancel() {} });
   $.state ??= { get: async () => ({ value: undefined, version: 0 }), set: async () => { $.ui.invalidate(); return { isSet: true }; } };
@@ -326,6 +337,41 @@ test('expanded local PNG uses native image; other paths never load as files', as
   assert.equal(images.length, 1); assert.deepEqual(images[0].props.source, { file: 'C:\\images\\plot.png', format: 'png' });
   assert.ok(nodes(await draw()).some((node) => node.props.key?.startsWith('copy_a:t:jpg')));
   closeUI();
+});
+
+test('desktop tool expansion keeps the pane valid through output and raw-call disclosure', async (t) => {
+  const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const entries = [
+    { id: 'task', turn_id: 't', type: 'parentMessage', data: { text: '创建并核对文件' } },
+    ...['run', 'inspect_local_file'].map(tool => ({ id: tool, turn_id: 't', type: 'mcpToolCall', deferred: true, data: { server: 'fastctx', tool, arguments: tool === 'run' ? { command: 'printf test' } : { file_path: 'C:/work/test.txt' } } })),
+    { id: 'answer', turn_id: 't', type: 'agentMessage', data: { text: '已完成。' } },
+  ];
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', name: 'terra-test', status: 'completed', model: 'gpt-6.1-terra', reasoning_effort: 'high', permissions_mode: 'full-access', context_used_tokens: 7, context_limit_tokens: 100 }] };
+    if (op === 'ui_revision') return { revision: 1, entries };
+    if (op === 'ui_detail') return { text: `output: ${args.item_id}`, offset: 0, next_offset: null, format: 'source' };
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI(on); await openAgent($, 'a');
+  const draw = async () => {
+    const tree = await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 40 } } }, () => null);
+    assertNativeDimensions(tree);
+    assert.ok(nodes(tree).some(node => node.type === 'Input'), 'the composer remains mounted');
+    assert.ok(nodes(tree).some(node => node.props.key === 'message_a:t:answer'), 'the answer remains in the conversation');
+    return tree;
+  };
+  const click = async key => (nodes(await draw()).find(node => node.props.key === key).props.onPress());
+  const groupKey = nodes(await draw()).find(node => node.props.key?.startsWith('group_')).props.key;
+  await click(groupKey);
+  for (const tool of ['run', 'inspect_local_file']) {
+    await click(`item_a:t:${tool}`);
+    assert.ok(nodes(await draw()).some(node => node.type === 'Code' && node.props.source === `output: ${tool}`));
+    await click(`tool_raw_a:t:${tool}`);
+    await draw();
+  }
+  await click(groupKey); await draw();
+  await click(groupKey); await draw();
 });
 
 test('only adjacent same-type calls within a turn group and retain items', () => {

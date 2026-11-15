@@ -2,5 +2,5 @@
   "name": "codex-subagents",
   "metadata": { "description": "A minimal Claude Code and Codex collaboration plugin." },
   "owner": { "name": "ShallowDream724" },
-  "plugins": [{ "name": "codex-subagents", "source": "./", "description": "Persistent Codex subagents for Claude Code", "version": "0.2.0-rc.8" }]
+  "plugins": [{ "name": "codex-subagents", "source": "./", "description": "Persistent Codex subagents for Claude Code", "version": "0.2.0-rc.9" }]
 }

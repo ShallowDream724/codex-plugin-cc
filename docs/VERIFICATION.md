@@ -1,10 +1,10 @@
 # 验证记录
 
-2026-11-15，插件 **0.2.0-rc.8**，Windows / Node.js 24.22.2。新增接口与权限字段按 Codex CLI 0.169.0 的生成 schema 核对。真实宿主离线测试使用本机原有 `@cometix/claude-code 2.1.303`；没有修改宿主安装。
+2026-11-15，插件 **0.2.0-rc.9**，Windows / Node.js 24.22.2。新增接口与权限字段按 Codex CLI 0.169.0 的生成 schema 核对。真实宿主离线测试使用本机原有 `@cometix/claude-code 2.1.303`；没有修改宿主安装。
 
 ## 自动检查
 
-- `npm test`：276 项通过，2 项跳过：需显式指定宿主的集成测试，以及 Linux 专用 FIFO 测试（当前为 Windows）。
+- `npm test`：277 项通过，2 项跳过：需显式指定宿主的集成测试，以及 Linux 专用 FIFO 测试（当前为 Windows）。
 - `npm run check`：元数据、JavaScript 语法、指引源与生成文件一致性检查通过。
 - `claude plugin validate .`：通过，无警告。
 - 显式运行 `test/host-integration.test.mjs`：三个场景及父测试全部通过。
@@ -63,6 +63,8 @@ rc.8 从 Desktop 实际 renderer 的 `qh → wm/bm` 链确认 Client 中间 hold
 rc.8 用户直接发送/停止以简短 `user_action_receipt` 交付，发送正文是 `quoted_user_message`，普通 Codex 消息不改。现场记录证明同一 seq 未获确认后重投；安装源码的 `VOt → proceeds.text → prompt row → API history` 链表明固定宿主包装会进入保留内容，旧裸前缀解析遗漏了它。回归覆盖两种精确包装的 append 确认、启动恢复、关闭过滤与通知绘制，并拒绝他插件、引用前缀、额外尾字和被改写事件。无法确认的事件仍可靠重投，不凭 submit 已返回就确认。临时宿主探针未成功注册测试工具，未触发提交，不计作验证通过；本轮通知验证依据安装源码与上述离线回归，没有真实模型请求。
 
 rc.8 增加独立 `/codex-stop` 即时命令。测试覆盖多根及后代并发中断、所有暂停屏障先落盘、单树失败隔离、迟到启动/跨事务 adoption、批量操作幂等且不确认旧事件、离线不启动 helper、不可达或不兼容时不伪报成功；重启保留登记与暂停且不发 `turn/start`。命令测试验证 immediate 注册、模型工具仍为九个、不发模型 prompt、并发调用合并及准确区分停止状态。用户确认 Claude 本轮停止按钮不联动全部 Codex。
+
+rc.9 定位用户报告的“展开工具后 Nothing to show yet”：`ui.js` 仅在集成分组展开时创建 `width:'1px'` 的 Box。已安装 npm 宿主 `chunk-nw686kdq.js` 的属性验证器 `xan` 拒绝该值，只接受数字或百分比；`chunk-dn8rakwm.js` 的树验证调用该规则。Desktop renderer 的 `ap → Rf` 将数字宽度转成 `ch`，因此改用 `0.125` 保留细线。新增 Desktop 点击路径回归在修复前准确失败于竖线宽度，修复后覆盖分组/输出/原始调用多次展开、收起与输入框保留。本机从原安装源码提取的 Box 规则也通过相同组件树；该探针在工作目录、不随插件打包，不改宿主文件。此前 mock 构造器未检查原生属性合法性，插件静态 validator 也不执行展开路径；这次补足了对应回归，未宣称实际 GUI 已验收。
 
 0.1.2 增加最终历史确认、部分/改写结果不误确认、离线补确认、并发 wait 与提示互斥、取消在途、不兼容 helper、并发启动锁、初始化掉线、暂停后续租、审批允许列表、unknown 状态的有限读取恢复、代理间故障隔离及持久化错误测试。回执迁移与 300 个连续独立动作验证旧回执不被全量重写；当前轮次去重测试验证旧任务迟到事件不接管新任务。
 
