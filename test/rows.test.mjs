@@ -26,10 +26,12 @@ function setup() {
 test('five long bilingual agent names retain five independent clickable entries without changing output', async () => {
   const h = setup();
   const events = Array.from({ length: 5 }, (_, i) => ({ agent_id: `id-${i}`, name: '长名字Long name '.repeat(30), kind: 'completed', result: 'private result' }));
+  events[0].name = 'terra-test';
   const output = { result: JSON.stringify({ events }) }, original = structuredClone(output);
   const tree = h.render('ToolUse', { tool: full('wait_agent'), output });
   const buttons = nodes(tree).filter(node => node.type === 'Button');
   assert.equal(buttons.length, 5);
+  assert.equal(buttons[0].props.label, 'Terra-test');
   for (const button of buttons) await button.props.onPress();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(h.opened, events.map(event => event.agent_id));

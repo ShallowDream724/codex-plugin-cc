@@ -1,5 +1,5 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
-import { agentIcon, agentVisual, retainIcons, clearIcons, displayLabel } from './presentation.js';
+import { agentIcon, agentVisual, retainIcons, clearIcons, displayLabel, agentDisplayName } from './presentation.js';
 import { toolSections } from './tool-presentation.js';
 import { activityIcon, contextIndicator, disclosureIcon, copyIcon, jumpIcon } from './tool-icons.js';
 import { normalizeDisplayMath } from './math-markdown.js';
@@ -61,7 +61,7 @@ function planText(data) {
   return '';
 }
 function delegationDescription(data) {
-  const name = [data.name, ...(Array.isArray(data.names) ? data.names : [])].filter(Boolean).join('、') || '子代理';
+  const name = [data.name, ...(Array.isArray(data.names) ? data.names : [])].filter(Boolean).map(agentDisplayName).join('、') || '子代理';
   const statuses = Array.isArray(data.agents) ? data.agents.map((agent) => agent?.status) : Array.isArray(data.agent_statuses) ? data.agent_statuses : typeof data.agent_status === 'string' ? [data.agent_status] : [];
   if (statuses.length && statuses.every((status) => status === 'completed')) return `${name}已完成`;
   if (data.tool === 'spawnAgent' || data.tool === 'followupTask' || data.tool === 'resumeAgent') return `${name}${data.stage === 'started' ? '正在启动' : '开始工作'}`;
@@ -119,7 +119,7 @@ const description = (entry) => {
     const rawName = d.display_name || d.name || d.agentPath || '子代理';
     const pathName = typeof d.agentPath === 'string' ? d.agentPath.split('/').at(-1) : null;
     const name = rawName.startsWith('/root/') || rawName === pathName ? rawName.split('/').at(-1).replace(/_/g, ' ') : rawName;
-    return `${name} ${({ started: '开始工作', interacted: '已互动', interrupted: '已停止', completed: '已完成' })[d.kind] || '已更新'}`;
+    return `${agentDisplayName(name)} ${({ started: '开始工作', interacted: '已互动', interrupted: '已停止', completed: '已完成' })[d.kind] || '已更新'}`;
   }
   if (entry.type === 'plan') return '计划';
   if (entry.type === 'functionCallOutput') return `工具返回${d.name ? `：${d.name}` : ''}`;
@@ -559,10 +559,10 @@ function renderPane($, e, next, attempt = {}) {
       const visual = agentVisual(agentId);
       return e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key, source: visual.source, alt: visual.alt, width: 16, height: 16 }) : caption(key, agentIcon(agentId));
     };
-    const iconButton = (key, { source, label, onPress, action = 'activate', expanded = false, width = 2, height = 1, size = 12 }) => {
+    const iconButton = (key, { source, label, onPress, action = 'activate', expanded = false, width = 2, height = 1, size = 12, align = 'center' }) => {
       control.iconActions.set(key, { action, expanded, onPress });
       return Box({ key: `icon_region_${key}`, position: 'relative', width, height, flexShrink: 0, children: [
-        Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', children: [Svg({ key: `icon_${key}`, source, alt: label, width: size, height: size })] }),
+        Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', justifyContent: align, children: [Svg({ key: `icon_${key}`, source, alt: label, width: size, height: size })] }),
         Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key, module: './icon-control.js', width, height, props: { expanded, action, rows: height } })] }),
       ] });
     };
@@ -578,9 +578,10 @@ function renderPane($, e, next, attempt = {}) {
       const children = [button];
       if (vector) {
         const hitKey = `chevron_${key}`;
-        children.push(iconButton(hitKey, { source: disclosureIcon(expanded), label: expanded ? '收起' : '展开', onPress: activate, action: 'toggle', expanded }));
+        children.push(iconButton(hitKey, { source: disclosureIcon(expanded), label: expanded ? '收起' : '展开', onPress: activate, action: 'toggle', expanded, width: 1.5, align: 'flex-start' }));
       }
-      return entry ? Box({ key: `row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${key}`, activityIcon(entry, integration)), ...children] }) : button;
+      const title = vector ? Box({ key: `title_${key}`, flexDirection: 'row', alignItems: 'center', gap: 0, minWidth: 0, children }) : button;
+      return entry ? Box({ key: `row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${key}`, activityIcon(entry, integration)), title] }) : button;
     };
     const sourceCode = (key, source) => {
       const value = safe(source);
@@ -610,7 +611,7 @@ function renderPane($, e, next, attempt = {}) {
     const rawEffort = displayLabel(selected?.reasoning_effort, 64);
     const effort = rawEffort ? rawEffort[0].toUpperCase() + rawEffort.slice(1) : '';
     const model = [friendlyModel, effort].filter(Boolean).join(' · ');
-    navigation.push(Box({ key: `codex_title_row_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [agentMark(`codex_title_icon_${id}`, id), Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [safe(displayLabel(selected.name || 'Codex'))] })] }));
+    navigation.push(Box({ key: `codex_title_row_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [agentMark(`codex_title_icon_${id}`, id), Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [safe(agentDisplayName(selected.name || 'Codex'))] })] }));
     if (state.error) navigation.push(caption('codex_open_error', state.error));
     if (state.error || page.liveError || page.historyError) {
       if (page.liveError) navigation.push(caption('codex_update_error', page.liveError));
@@ -673,7 +674,7 @@ function renderPane($, e, next, attempt = {}) {
               const copyControl = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
                 ? hint(`diff_copy_hint_${fileKey}`, iconButton(`diff_copy_${fileKey}`, { source: copyIcon, label: '复制差异', size: 14, onPress: copy }), '复制差异', 12, -10)
                 : Button({ key: `diff_copy_${fileKey}`, plain: true, label: '⧉', onPress: copy });
-              const diffView = e.surface === 'desktop' && complete ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source, path: filePath, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
+              const diffView = e.surface === 'desktop' && complete ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
                 page.diffPages ??= new Map(); page.diffPages.set(fileKey, value);
                 if (page.diffPages.size > 64) page.diffPages.delete(page.diffPages.keys().next().value);
                 return invalidate($);

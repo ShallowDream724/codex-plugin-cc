@@ -45,21 +45,18 @@ export function parseDiff(source) {
   return hunks ? rows : null;
 }
 
-export function renderDiff({ Box, Text, Button }, { key, source, path, page = 0, onPage, onCopy, copyControl }) {
+export function renderDiff({ Box, Text, Button }, { key, source, page = 0, onPage, onCopy, copyControl }) {
   const rows = parseDiff(source);
   if (!rows) return null;
   const pages = Math.ceil(rows.length / PAGE_SIZE);
   const current = Number.isFinite(page) ? Math.max(0, Math.min(pages - 1, Math.trunc(page))) : 0;
-  const name = typeof path === 'string' ? path.split(/[\\/]/).filter(Boolean).at(-1) : '';
   const lineWidth = rows.reduce((width, row) => Math.max(width, String(row.old ?? '').length, String(row.new ?? '').length), 2);
-  const controls = [Text({ mono: true, weight: 'semibold', children: [name || '文件变更'] })];
-  if (copyControl) controls.push(copyControl);
-  else if (onCopy) controls.push(Button({ key: `${key}:copy`, plain: true, label: '⧉', onPress: () => onCopy(source) }));
-  const children = [Box({ key: `${key}:header`, flexDirection: 'row', justifyContent: 'space-between', children: controls })];
+  const copy = copyControl ?? (onCopy ? Button({ key: `${key}:copy`, plain: true, label: '⧉', onPress: () => onCopy(source) }) : null);
+  const children = [];
   const text = (value, props = {}) => Text({ mono: true, size: 'footnote', wrap: 'wrap', ...props, children: [value] });
   for (const [index, row] of rows.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE).entries()) {
     const backgroundColor = row.kind === 'added' ? 'rgba(46,160,67,0.16)' : row.kind === 'removed' ? 'rgba(248,81,73,0.16)' : undefined;
-    children.push(Box({ key: `${key}:row:${current * PAGE_SIZE + index}`, flexDirection: 'row', ...(backgroundColor ? { backgroundColor } : {}), children: [
+    children.push(Box({ key: `${key}:row:${current * PAGE_SIZE + index}`, flexDirection: 'row', ...(copy && index === 0 ? { paddingRight: 3 } : {}), ...(backgroundColor ? { backgroundColor } : {}), children: [
       Box({ width: lineWidth + 1, flexShrink: 0, children: [text(row.old == null ? '' : String(row.old), { dimColor: true, tabular: true })] }),
       Box({ width: lineWidth + 1, flexShrink: 0, children: [text(row.new == null ? '' : String(row.new), { dimColor: true, tabular: true })] }),
       Box({ flexGrow: 1, flexShrink: 1, minWidth: 0, children: [text(row.text, row.kind === 'hunk' || row.kind === 'marker' ? { dimColor: true } : {})] }),
@@ -72,5 +69,6 @@ export function renderDiff({ Box, Text, Button }, { key, source, path, page = 0,
     if (current + 1 < pages) navigation.push(Button({ key: `${key}:next`, label: '下一页', onPress: () => onPage?.(current + 1) }));
     children.push(Box({ key: `${key}:pages`, flexDirection: 'row', gap: 'sm', children: navigation }));
   }
-  return Box({ key, flexDirection: 'column', width: '100%', borderStyle: 'round', borderDimColor: true, children });
+  if (copy) children.push(Box({ key: `${key}:copy_position`, position: 'absolute', right: 0, top: 0, children: [copy] }));
+  return Box({ key, position: 'relative', flexDirection: 'column', width: '100%', borderStyle: 'round', borderDimColor: true, children });
 }

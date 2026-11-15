@@ -4,7 +4,7 @@
 
 这是从 `y-cruce/codex-plugin-cc` 精简出的独立插件。运行时只依赖 Node 和 Codex CLI；没有 ACP、Qoder、Antigravity、DSH、额外管理代理、固定模型清单或旧模型提示教程。
 
-当前源码为 **0.2.0-rc.10**。经验性文字集中在 [审阅稿](docs/GUIDANCE_REVIEW.md)。候选包不会自动替换已安装版本。
+当前源码为 **0.2.0-rc.11**。经验性文字集中在 [审阅稿](docs/GUIDANCE_REVIEW.md)。候选包不会自动替换已安装版本。
 
 ## 安装条件
 

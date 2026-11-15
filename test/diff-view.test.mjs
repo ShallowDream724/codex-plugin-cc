@@ -17,7 +17,7 @@ test('hunk lines carry correct old and new numbers across additions and removals
   assert.equal(boxes.length, 2);
   assert.match(boxes[0].props.backgroundColor, /248,81,73/);
   assert.match(boxes[1].props.backgroundColor, /46,160,67/);
-  assert.ok(nodes(tree).some(n => n.type === 'Text' && n.props.children.includes('example.js')));
+  assert.ok(!nodes(tree).some(n => n.type === 'Text' && n.props.children.includes('example.js')));
 });
 
 test('file headers, multiple hunks, empty ranges and no-newline markers remain readable', () => {

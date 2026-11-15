@@ -57,6 +57,36 @@ test('desktop Enter submits without a native button and the footer control route
   closeUI();
 });
 
+test('mixed rich text keeps native Markdown structure and fenced language labels intact', async (t) => {
+  const fence = String.fromCharCode(96).repeat(3);
+  const rich = [
+    '# Report', '', '**bold** _emphasis_ ~~deleted~~ and `inline code`', '',
+    '> A quotation', '', '- [x] Checked', '- Parent', '  - Child', '', '1. First', '2. Second', '',
+    '| Name | Value |', '| --- | ---: |', '| Example | 3 |', '',
+    '[link](https://example.com)', '![plot](https://example.com/plot.png)', '', '---', '',
+    fence + 'cpp', 'int main() { return 0; }', fence, '',
+    fence + 'md', '# Literal heading', '\\[literal delimiter inside code\\]', fence, '',
+    fence + 'txt', '<not markup>', fence, '',
+    fence + 'json', '{"key": true}', fence, '',
+    fence + 'mermaid', 'graph TD; A --> B', fence, '',
+    fence + 'future-language', 'preserve unfamiliar syntax', fence,
+  ].join('\n');
+  const hooks = [], calls = [];
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op) => {
+    calls.push(op);
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    return { revision: 1, entries: [{ id: 'rich', turn_id: 't', type: 'agentMessage', data: { text: rich } }], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = surface => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null);
+  for (const surface of ['desktop', 'terminal']) {
+    const blocks = nodes(await draw(surface)).filter(node => node.type === 'Markdown');
+    assert.deepEqual(blocks.map(node => node.props.text), [rich]);
+  }
+  assert.ok(!calls.includes('ui_detail'), 'ordinary rich text requires no per-format detail fetch');
+});
+
 test('keyboard command opens an agent without submitting a prompt or mutating work', async () => {
   const hooks = [], calls = [], notices = []; let agents = [];
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
@@ -449,7 +479,7 @@ test('merged lifecycle entries use recorded wait starts, short names and indepen
   const draw = surface => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null);
   const tree = await draw('desktop'), all = nodes(tree);
   assert.deepEqual(all.filter(node => node.props.key?.startsWith('activity_group_')).map(node => node.props.key), ['activity_group_a:t:start', 'activity_group_a:t:wait', 'activity_group_a:t:end', 'activity_group_a:t:math']);
-  assert.equal(all.find(node => node.props.key === 'activity_label_a:t:start').props.children[0], 'nested file edit 开始工作');
+  assert.equal(all.find(node => node.props.key === 'activity_label_a:t:start').props.children[0], 'Nested file edit 开始工作');
   assert.equal(all.find(node => node.props.key === 'activity_label_a:t:wait').props.children[0], '等待子代理');
   assert.equal(all.find(node => node.props.key === 'agent_icon_a:t:start').props.source, all.find(node => node.props.key === 'agent_icon_a:t:end').props.source);
   assert.equal(all.find(node => node.props.key === 'wait_icon_a:t:wait').props.alt, '等待');

@@ -161,6 +161,26 @@ test('previews bound deep data and image payloads while details format native it
   assert.equal(store.revision({ target: 'a' }).entries.find((e) => e.id === 'user').preview, 'Find the issue');
 });
 
+test('tool call titles survive live and deferred history projection without reading output titles', async () => {
+  const { client, store } = fixture();
+  const emit = item => client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item } });
+  emit({ id: 'cua', type: 'mcpToolCall', server: 'cua_repl', tool: 'js', arguments: { code: 'x'.repeat(10000), title: 'Finding reopened Claude window' } });
+  emit({ id: 'unrelated', type: 'mcpToolCall', server: 'search', tool: 'query', arguments: { title: 'Query title' }, result: { title: 'Result title' } });
+  emit({ id: 'malformed', type: 'dynamicToolCall', namespace: 'mcp__cua_repl', tool: 'js', arguments: 'not an object', appContext: null });
+  const live = store.revision({ target: 'a' }).entries;
+  assert.equal(live[0].data.display_title, 'Finding reopened Claude window');
+  assert.equal(live[1].data.display_title, undefined);
+  assert.equal(live[2].data.display_title, undefined);
+  client.request = async method => method === 'thread/turns/list' ? { data: [{ id: 'turn' }], nextCursor: null } : { data: [
+    { outputDeferred: true, item: { id: 'dynamic', type: 'dynamicToolCall', namespace: 'mcp__cua_repl', tool: 'js', arguments: { code: 'x'.repeat(10000), title: 'Checking the layout' } } },
+    { item: { id: 'action', type: 'mcpToolCall', server: 'service', tool: 'lookup', appContext: { actionName: 'Look up record' } } },
+  ], nextCursor: null };
+  const history = (await store.history({ target: 'a' })).entries;
+  assert.equal(history.find(entry => entry.id === 'dynamic').data.display_title, 'Checking the layout');
+  assert.equal(history.find(entry => entry.id === 'dynamic').deferred, true);
+  assert.equal(history.find(entry => entry.id === 'action').data.display_title, 'Look up record');
+});
+
 test('cold live caches are evicted without invalidating native history', async () => {
   const { store, controller } = fixture();
   for (let i = 0; i < 40; i++) store.bucket(`cold-${i}`);

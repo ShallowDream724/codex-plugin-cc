@@ -5,6 +5,15 @@ import { DiskReceipts, MemoryReceipts, requestFingerprint } from './receipts.mjs
 import { readJson, writeJson } from './storage.mjs';
 import { isUserSend, parentDeliveryEvents } from './event-routing.mjs';
 
+const INTERNAL_EVENT_FIELDS = new Set(['turn_id', 'turnId', 'thread_id', 'threadId', 'source_thread_id', 'item_id', 'itemId']);
+
+// Keep names, actionable IDs and all business content. Only remove top-level
+// native routing IDs: answer_agent routes through request_id, never these IDs.
+// Nested request payloads and future business fields retain their exact values.
+function projectDeliveryEvent(event) {
+  return Object.fromEntries(Object.entries(event).filter(([key]) => !INTERNAL_EVENT_FIELDS.has(key)));
+}
+
 // Only user stop facts are parent receipts. Direct conversations stay in Codex.
 export function formatDeliveryEvent(event) {
   if (isUserSend(event)) return null;
@@ -56,7 +65,7 @@ export class DeliveryStore extends EventEmitter {
       }
       if (!events.length) { this.lease = null; await this.saveLease(); return { events: [] }; }
       // Page whole events, never truncate their content or drop an unconfirmed result.
-      const selected = events.slice(0, 32).map(formatDeliveryEvent), id = randomUUID();
+      const selected = events.slice(0, 32).map(event => projectDeliveryEvent(formatDeliveryEvent(event))), id = randomUUID();
       await this.records.put(id, { status: 'issued', channel, toolUseId, sequences: selected.map(event => event.seq),
         hashes: Object.fromEntries(selected.map(event => [event.seq, requestFingerprint('event', event)])), acknowledged: [] });
       this.lease = { id, expiresAt: this.now() + this.leaseMs };

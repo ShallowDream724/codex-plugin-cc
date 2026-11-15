@@ -1,6 +1,6 @@
 import { messageDeliveries } from './delivery.js';
 import { openAgent } from './ui.js';
-import { agentIcon, agentVisual, displayLabel } from './presentation.js';
+import { agentIcon, agentVisual, agentDisplayName } from './presentation.js';
 
 const PREFIX = 'mcp__codex-subagents__';
 const EVENTS = { completed: '已完成', failed: '失败', interrupted: '本轮已停止', unknown: '需要关注', question: '有问题', approval: '需要批准', message: '发送了消息', compacting: '正在压缩上下文' };
@@ -66,9 +66,9 @@ function draw($, e, entries) {
   return Box({ key: `codex_rows_${e.requestId || 'events'}`, flexDirection: 'column', gap: 'xs', children: groups.map((group, index) => {
     const buttons = group.entries.filter(entry => entry.id).flatMap((entry, position) => [...(position ? [Text({ key: `join_${entry.id}`, size: 'footnote', dimColor: true, children: ['和'] })] : []), icon(entry.id), Button({
       key: `${e.requestId || 'codex'}:${index}:${position}:${entry.id}`,
-      label: safe(displayLabel(entry.name || entry.id || 'Codex')),
+      label: safe(agentDisplayName(entry.name || entry.id || 'Codex')),
       plain: true,
-      children: [Text({ size: 'footnote', weight: 'medium', children: [safe(displayLabel(entry.name || entry.id || 'Codex'))] })],
+      children: [Text({ size: 'footnote', weight: 'medium', children: [safe(agentDisplayName(entry.name || entry.id || 'Codex'))] })],
       onPress: () => openAgent($, entry.id),
     })]);
     if (!buttons.length) return Text({ key: `codex_row_${index}`, size: 'footnote', dimColor: group.kind !== 'error', children: [short(group.text, 600)] });

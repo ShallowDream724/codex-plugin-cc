@@ -10,6 +10,10 @@ export function displayLabel(value, limit = 512) {
   return text.slice(0, end) + '…';
 }
 
+export function agentDisplayName(value) {
+  return displayLabel(value).replace(/\p{L}/u, letter => letter.toUpperCase());
+}
+
 // Slots are shared by the timeline and conversation, and bounded for long sessions.
 const icons = agentVisuals.map(visual => visual.glyph);
 const assigned = new Map();

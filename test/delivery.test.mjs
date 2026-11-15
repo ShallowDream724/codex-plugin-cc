@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DeliveryStore, formatDeliveryEvent } from '../runtime/delivery.mjs';
-import { DiskReceipts } from '../runtime/receipts.mjs';
+import { DiskReceipts, MemoryReceipts, requestFingerprint } from '../runtime/receipts.mjs';
 import { writeJson } from '../runtime/storage.mjs';
 
 function controller(count = 3) {
@@ -34,6 +34,52 @@ test('stop receipts distinguish requested, stopped, and unconfirmed without a ne
     assert.equal(receipt.quoted_user_message, undefined);
     assert.doesNotMatch(receipt.summary, /followup|resume|重启|恢复/);
   }
+});
+
+test('parent wire omits native routing IDs while preserving names, business fields and original journal', async () => {
+  const c = controller(0);
+  const raw = { seq: 1, agent_id: 'agent', name: 'worker', kind: 'question', turn_id: 'turn', turnId: 'native-turn',
+    thread_id: 'thread', threadId: 'native-thread', source_thread_id: 'child-thread', item_id: 'item', itemId: 'native-item',
+    request_id: 'question-1', method: 'item/tool/requestUserInput',
+    questions: [{ id: 'choice', header: 'Choose', question: 'Which?', options: [{ label: 'Continue', description: 'Continue work.' }] }],
+    reply_format: { answers: { choice: { answers: ['<answer>'] } } },
+    future_business_field: { threadId: 'business value', content: 'Keep this whole value' }, status: null };
+  c.events = [raw];
+  const store = new DeliveryStore({ controller: c }); const batch = await store.claim();
+  const { turn_id, turnId, thread_id, threadId, source_thread_id, item_id, itemId, ...expected } = raw;
+  assert.deepEqual(batch.events, [expected]); assert.deepEqual(c.events, [raw]);
+  assert.equal(batch.events[0].name, 'worker'); assert.equal(batch.events[0].request_id, 'question-1');
+  const record = await store.records.get(batch.delivery_id);
+  assert.equal(record.hashes[1], requestFingerprint('event', expected));
+  assert.notEqual(record.hashes[1], requestFingerprint('event', raw));
+});
+
+test('projected wire confirms only exact retained business content and supports partial acknowledgements', async () => {
+  const c = controller(0);
+  c.events = [
+    { seq: 1, agent_id: 'agent', name: 'worker', turn_id: 'turn-1', kind: 'message', message: 'Coordination message' },
+    { seq: 2, agent_id: 'agent', name: 'worker', turn_id: 'turn-2', kind: 'completed', result: 'Complete business result' },
+  ];
+  const store = new DeliveryStore({ controller: c }); const batch = await store.claim();
+  const changed = { ...batch.events[0], message: 'Rewritten message' };
+  const first = await store.confirm({ observations: [{ delivery_id: batch.delivery_id, sequences: [1, 2], events: [changed, batch.events[1]] }] });
+  assert.deepEqual(first.rejected, [{ delivery_id: batch.delivery_id, sequences: [1] }]);
+  assert.deepEqual(c.events.map(event => event.seq), [1]); assert.equal(c.events[0].turn_id, 'turn-1');
+  await store.confirm({ observations: [{ delivery_id: batch.delivery_id, sequences: [1], events: [batch.events[0]] }] });
+  assert.deepEqual(c.events, []);
+});
+
+test('old full-event receipt hashes still require and confirm the exact old wire without migration', async () => {
+  const c = controller(0);
+  const old = { seq: 1, agent_id: 'agent', name: 'worker', turn_id: 'old-turn', kind: 'message', message: 'Old retained message' };
+  c.events = [old];
+  const records = new MemoryReceipts({ old: { status: 'issued', sequences: [1], hashes: { 1: requestFingerprint('event', old) }, acknowledged: [] } });
+  const store = new DeliveryStore({ controller: c, records });
+  const { turn_id, ...projected } = old;
+  const rejected = await store.confirm({ observations: [{ delivery_id: 'old', sequences: [1], events: [projected] }] });
+  assert.deepEqual(rejected.rejected, [{ delivery_id: 'old', sequences: [1] }]); assert.deepEqual(c.events, [old]);
+  await store.confirm({ observations: [{ delivery_id: 'old', sequences: [1], events: [old] }] });
+  assert.deepEqual(c.events, []);
 });
 
 test('legacy send receipts and their exact-turn automatic results are retired before delivery', async () => {

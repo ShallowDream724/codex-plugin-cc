@@ -50,7 +50,17 @@ const fileSummary = (item) => (item.changes ?? []).map((change) => {
   }
   return summary;
 });
-const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item.type === 'subAgentActivity' ? subagentFields(item) : item.type === 'fileChange' ? { fileSummary: fileSummary(item), ...item } : item.type === 'directUserMessage' ? { id: item.id, type: item.type, attachments: item.attachments, text: item.text } : item;
+const titleText = (value) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 256) : '';
+function toolFields(item) {
+  const server = typeof item.server === 'string' ? item.server : item.namespace;
+  const isCuaJs = (['cua_repl', 'mcp__cua_repl'].includes(server) && item.tool === 'js') || item.tool === 'mcp__cua_repl__js';
+  const args = item.arguments && typeof item.arguments === 'object' && !Array.isArray(item.arguments) ? item.arguments : null;
+  const title = titleText(item.display_title) || (isCuaJs ? titleText(args?.title) : '') || titleText(item.appContext?.actionName);
+  // Put the title first so a large code argument or output cannot consume the
+  // preview budget before the presentation metadata is projected.
+  return { ...(title ? { display_title: title } : {}), ...item, ...(title ? { display_title: title } : {}) };
+}
+const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item.type === 'subAgentActivity' ? subagentFields(item) : item.type === 'fileChange' ? { fileSummary: fileSummary(item), ...item } : item.type === 'directUserMessage' ? { id: item.id, type: item.type, attachments: item.attachments, text: item.text } : ['mcpToolCall', 'dynamicToolCall'].includes(item.type) ? toolFields(item) : item;
 const binaryString = (value) => typeof value === 'string' && /^data:[^,]*;base64,/i.test(value);
 const textValue = (value) => {
   if (binaryString(value)) return '[binary omitted]';

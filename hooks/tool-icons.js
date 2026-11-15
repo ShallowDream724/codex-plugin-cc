@@ -42,7 +42,7 @@ export function contextIndicator(used, limit) {
 }
 
 export function disclosureIcon(expanded) {
-  return svg(`<path d="${expanded ? 'm6 9 6 6 6-6' : 'm9 6 6 6-6 6'}"/>`);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#888888" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="${expanded ? 'm2 4 4 4 4-4' : 'm4 2 4 4-4 4'}"/></svg>`;
 }
 
 export const copyIcon = svg('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>');
