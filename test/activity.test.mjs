@@ -82,3 +82,18 @@ test('cold live caches are evicted without invalidating native history', async (
   assert.equal((await store.history({ target: 'a' })).entries[0].id, 'cmd');
   assert.equal(controller.pendingEvents, undefined);
 });
+
+test('ordinary data fields, long text and native dynamic text remain readable', async () => {
+  const { store, client } = fixture();
+  const plainText = 'x'.repeat(900);
+  const item = { id: 'data', type: 'mcpToolCall', tool: 'inspect', arguments: { data: { count: 7 }, text: plainText }, result: { content: [{ type: 'text', text: 'evidence' }], structuredContent: { data: { verified: true } } } };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
+  const preview = store.revision({ target: 'a' }).entries[0];
+  assert.deepEqual(preview.data.arguments.data, { count: 7 });
+  assert.equal(preview.data.arguments.text, plainText);
+  client.request = async () => ({ data: [{ item }] });
+  const detail = await store.detail({ target: 'a', turn_id: 't', item_id: 'data' });
+  assert.ok(detail.text.includes(plainText)); assert.match(detail.text, /"verified": true/);
+  client.request = async () => ({ data: [{ item: { id: 'dynamic', type: 'dynamicToolCall', tool: 'notify_parent', contentItems: [{ type: 'inputText', text: 'Delivered to parent.' }] } }] });
+  assert.match((await store.detail({ target: 'a', turn_id: 't', item_id: 'dynamic' })).text, /Delivered to parent\./);
+});

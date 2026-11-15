@@ -3,16 +3,16 @@
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
-const BINARY = /^(?:data|base64|blob|bytes|imageData|image_data|b64_json)$/i;
+const BINARY = /^(?:base64|imageData|image_data|b64_json)$/i;
 // This is a presentation projection only: it never changes the model's input or
 // native history. Account for keys, values, depth and element count together.
 function clean(value, limit = PREVIEW_BUDGET) {
   let remaining = limit, nodes = 0;
   function visit(v, depth, key = '') {
     if (++nodes > 256 || remaining <= 0) return '[truncated]';
-    if (BINARY.test(key)) return '[binary omitted]';
+    if (BINARY.test(key) && typeof v === 'string') return '[binary omitted]';
     if (typeof v === 'string') {
-      if (/^data:[^,]*;base64,/i.test(v) || v.length > 512 && /^[A-Za-z0-9+/]+={0,2}$/.test(v)) return '[binary omitted]';
+      if (/^data:[^,]*;base64,/i.test(v)) return '[binary omitted]';
       const n = Math.min(v.length, remaining); remaining -= n;
       return v.slice(0, n) + (n < v.length ? '…' : '');
     }
@@ -32,15 +32,19 @@ function clean(value, limit = PREVIEW_BUDGET) {
 const imageFields = (item) => Object.fromEntries(['id', 'type', 'status', 'generationId', 'generation_id', 'savedPath', 'saved_path', 'path', 'failure'].filter((key) => item[key] != null).map((key) => [key, item[key]]));
 const delegationFields = (item) => ({ id: item.id, type: item.type, tool: item.tool, status: item.status, names: Object.entries(item.agentsStates ?? {}).map(([id, a]) => a?.name ?? a?.nickname ?? id).slice(0, 20), name: item.name ?? item.agentName });
 const project = (item) => item.type === 'imageGeneration' || item.type === 'imageView' ? imageFields(item) : ['collabAgentToolCall', 'collabToolCall'].includes(item.type) ? delegationFields(item) : item;
-const binaryString = (value) => typeof value === 'string' && (/^data:[^,]*;base64,/i.test(value) || value.length > 512 && /^[A-Za-z0-9+/]+={0,2}$/.test(value));
+const binaryString = (value) => typeof value === 'string' && /^data:[^,]*;base64,/i.test(value);
 const textValue = (value) => {
   if (binaryString(value)) return '[binary omitted]';
   if (typeof value === 'string') return value;
-  return JSON.stringify(value, (key, v) => BINARY.test(key) || binaryString(v) ? '[binary omitted]' : v && typeof v === 'object' && /^(?:image|blob|audio)$/i.test(v.type ?? '') ? { type: v.type, path: v.path } : v, 2) ?? '';
+  return JSON.stringify(value, (key, v) => BINARY.test(key) && typeof v === 'string' || binaryString(v) ? '[binary omitted]' : v && typeof v === 'object' && /^(?:image|blob|audio)$/i.test(v.type ?? '') ? { type: v.type, path: v.path } : v, 2) ?? '';
 };
 const outputValue = (value) => {
   const content = Array.isArray(value) ? value : value?.content;
-  if (Array.isArray(content)) return content.map((part) => part?.type === 'text' && typeof part.text === 'string' ? textValue(part.text) : '[non-text content omitted]').join('\n');
+  if (Array.isArray(content)) {
+    const parts = content.map((part) => ['text', 'inputText', 'outputText', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string' ? textValue(part.text) : '[non-text content omitted]');
+    if (!Array.isArray(value) && value.structuredContent != null) parts.push(textValue(value.structuredContent));
+    return parts.join('\n');
+  }
   return textValue(value);
 };
 export function formatItem(item) {
