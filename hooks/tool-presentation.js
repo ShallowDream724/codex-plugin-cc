@@ -1,15 +1,7 @@
 // Keep protocol data separate from its shortened, human-readable preview.
+import { toolOutputText } from '../shared/tool-output.mjs';
 const text = (value) => typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '';
-const outputText = (value) => {
-  const content = Array.isArray(value) ? value : value?.content ?? value?.contentItems;
-  if (!Array.isArray(content)) return text(value);
-  const parts = content.map((part) => typeof part?.text === 'string' ? part.text : text(part));
-  if (!Array.isArray(value)) {
-    const extra = Object.fromEntries(Object.entries(value).filter(([key]) => !['content', 'contentItems'].includes(key)));
-    if (Object.keys(extra).length) parts.push(text(extra));
-  }
-  return parts.join('\n');
-};
+const outputText = toolOutputText;
 
 export function toolSections(entry) {
   const data = entry.data || {}, sections = [];

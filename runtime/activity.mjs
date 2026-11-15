@@ -1,5 +1,6 @@
 // Read-only presentation of the controller's own root threads. The controller's
 // delivery queue is deliberately independent of this bounded live cache.
+import { toolOutputText } from '../shared/tool-output.mjs';
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
@@ -55,15 +56,18 @@ const textValue = (value) => {
   if (typeof value === 'string') return value;
   return JSON.stringify(value, (key, v) => BINARY.test(key) && typeof v === 'string' || binaryString(v) ? '[binary omitted]' : v && typeof v === 'object' && /^(?:image|blob|audio)$/i.test(v.type ?? '') ? { type: v.type, path: v.path } : v, 2) ?? '';
 };
-const outputValue = (value) => {
-  const content = Array.isArray(value) ? value : value?.content;
-  if (Array.isArray(content)) {
-    const parts = content.map((part) => ['text', 'inputText', 'outputText', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string' ? textValue(part.text) : '[non-text content omitted]');
-    if (!Array.isArray(value) && value.structuredContent != null) parts.push(textValue(value.structuredContent));
-    return parts.join('\n');
+const outputValue = (value) => toolOutputText(value, { serialize: textValue, formatPart: (part) => ['text', 'inputText', 'outputText', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string' ? textValue(part.text) : '[non-text content omitted]' });
+const OUTPUT_TYPES = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'functionCallOutput']);
+export function formatItemOutput(item) {
+  let output;
+  switch (item.type) {
+    case 'commandExecution': output = item.aggregatedOutput == null ? '' : textValue(item.aggregatedOutput); break;
+    case 'mcpToolCall': case 'dynamicToolCall': output = [item.result, item.contentItems].filter(value => value != null).map(outputValue).filter(Boolean).join('\n'); break;
+    case 'functionCallOutput': output = item.output == null ? '' : outputValue(item.output); break;
+    default: return formatItem(item);
   }
-  return textValue(value);
-};
+  return [output, item.error != null && textValue(item.error)].filter(Boolean).join('\n');
+}
 export function formatItem(item) {
   const d = project(item);
   switch (d.type) {
@@ -219,18 +223,20 @@ export class ActivityStore {
     const next_cursor = page.nextCursor ? { turn_id: turnId, items_cursor: page.nextCursor, turns_cursor: turnsCursor } : turnsCursor ? { turns_cursor: turnsCursor } : null;
     return { agent: this.summary(agent), entries, next_cursor };
   }
-  async detail({ target, turn_id, item_id, offset = 0, file_path } = {}) {
+  async detail({ target, turn_id, item_id, offset = 0, file_path, view } = {}) {
     const agent = this.find(target);
     if (typeof turn_id !== 'string' || !turn_id || typeof item_id !== 'string' || !item_id) throw new TypeError('turn_id and item_id are required.');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid detail offset.');
     if (file_path !== undefined && (typeof file_path !== 'string' || !file_path)) throw new TypeError('Invalid file path.');
+    if (view !== undefined && view !== 'output') throw new TypeError('Invalid detail view.');
     const page = await this.client.request('thread/items/read', { threadId: agent.threadId, turnId: turn_id, itemIds: [item_id] });
     const item = page.data?.[0]?.item;
     if (!visible(item)) return { text: '', next_offset: null };
     const change = file_path !== undefined && item.type === 'fileChange' ? item.changes?.find(change => change.path === file_path) : null;
     if (file_path !== undefined && !change) throw new Error('File is not part of this recorded change.');
-    const text = change ? change.diff ?? '' : formatItem(removeGuidance(item, this.controller.guidance));
+    const outputOnly = view === 'output' && OUTPUT_TYPES.has(item.type);
+    const text = change ? change.diff ?? '' : (outputOnly ? formatItemOutput : formatItem)(removeGuidance(item, this.controller.guidance));
     const next_offset = offset + 16000 < text.length ? offset + 16000 : null;
-    return { text: text.slice(offset, offset + 16000), next_offset, ...(change ? { file_path, format: offset === 0 && next_offset === null && /^@@ -\d+(?:,\d+)? \+\d+/m.test(text) ? 'diff' : 'source' } : {}) };
+    return { text: text.slice(offset, offset + 16000), next_offset, ...(change ? { file_path, format: offset === 0 && next_offset === null && /^@@ -\d+(?:,\d+)? \+\d+/m.test(text) ? 'diff' : 'source' } : outputOnly ? { format: 'source' } : {}) };
   }
 }

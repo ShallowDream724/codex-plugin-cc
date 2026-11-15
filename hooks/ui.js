@@ -7,11 +7,29 @@ const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
 let paneRevision = 0;
 const MAX_PAGES = 50;
+const MAX_LIVE_ENTRIES = 200;
+const MAX_DETAILS = 16;
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
-const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), name: agent.name, model: agent.model, reasoning_effort: agent.reasoning_effort, permissions_mode: agent.permissions_mode, context_used_tokens: agent.context_used_tokens, context_limit_tokens: agent.context_limit_tokens, status: agent.status, user_paused: agent.user_paused, user_control_status: agent.user_control_status }));
+const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
+const detailKey = (entry, filePath) => JSON.stringify([entryKey(entry), filePath ?? null]);
+const detailFor = (page, entry, filePath) => page.details.get(detailKey(entry, filePath));
+function cacheDetail(page, key, value) {
+  page.details.delete(key); page.details.set(key, value);
+  while (page.details.size > MAX_DETAILS) page.details.delete(page.details.keys().next().value);
+}
 const groupable = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch']);
+const outputTypes = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'functionCallOutput']);
+function attachmentName(path, index) {
+  const name = path.split(/[\\/]/).at(-1) || path, ext = /\.[^.]{1,10}$/.exec(name)?.[0] || '';
+  if (/\.(?:png|jpe?g|gif|webp|bmp)$/i.test(ext) && /(?:[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}|[\da-f]{24,})/i.test(name)) return `图片 ${index + 1}${ext}`;
+  const width = (text) => [...text].reduce((sum, char) => sum + (char.charCodeAt(0) > 255 ? 2 : 1), 0);
+  if (width(name) <= 26) return name;
+  let prefix = '', used = 0;
+  for (const char of name.slice(0, ext ? -ext.length : undefined)) { const cells = char.charCodeAt(0) > 255 ? 2 : 1; if (used + cells > 24 - width(ext)) break; prefix += char; used += cells; }
+  return `${prefix}…${ext}`;
+}
 const integrationOf = (entry) => {
   if (!['mcpToolCall', 'dynamicToolCall'].includes(entry.type)) return '';
   const d = entry.data || {}, source = d.server || d.namespace || (/^mcp__([^_]+)__/.exec(d.tool || '')?.[1]) || '';
@@ -131,7 +149,17 @@ export function groupEntries(entries) {
 
 // The caller feeds its existing low-frequency observe result to observeUI.
 // There are no session hooks, model calls, or delivery acknowledgements here.
-const state = { agents: [], selected: null, opened: false, timer: null, pages: new Map(), controls: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
+const state = { agents: [], selected: null, requested: null, error: '', opened: false, timer: null, pages: new Map(), controls: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
+const mergeSummaries = (agents) => summaries(agents).map((agent) => ({ ...state.agents.find((previous) => idOf(previous) === idOf(agent)), ...agent }));
+const failureText = (error) => safe(error?.message || error?.error?.message || error?.error || (typeof error === 'string' ? error : JSON.stringify(error)) || '连接未返回有效响应').slice(0, 400);
+function mergeLive(page, entries, prepend = false) {
+  const values = new Map((prepend ? [...entries, ...page.live] : [...page.live, ...entries]).map((entry) => [entryKey(entry), entry]));
+  const merged = [...values.values()];
+  if (merged.length > MAX_LIVE_ENTRIES) page.liveOverflow = true;
+  const next = merged.slice(-MAX_LIVE_ENTRIES), changed = JSON.stringify(next) !== JSON.stringify(page.live);
+  if (changed) page.live = next;
+  return changed;
+}
 let actionSequence = 0;
 const actionId = () => `ui-${Date.now().toString(36)}-${++actionSequence}-${Math.random().toString(36).slice(2)}`;
 const controlFor = (id) => {
@@ -164,7 +192,7 @@ async function stopAgent($, id) {
 async function sendAgent($, id) {
   const control = controlFor(id), message = control.draft, attachments = [...control.attachments], attachmentVersion = control.attachmentVersion, stopEpoch = control.stopEpoch;
   const selected = state.agents.find((agent) => idOf(agent) === id);
-  if (control.sending || control.stopping || selected?.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
+  if (!selected || control.sending || control.stopping || selected.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
   control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; await invalidate($);
   try {
     const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
@@ -204,7 +232,7 @@ async function chooseAttachments($, id, source = 'file') {
   finally { control.picking = false; if (state.opened && state.selected === id) await invalidate($); }
 }
   const pageFor = (id) => {
-    if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, restoreAttempted: false, restoredHistory: false, latestCursor: null, busy: false, historyGeneration: 0, detailGeneration: 0, detail: null });
+    if (!state.pages.has(id)) state.pages.set(id, { mode: 'live', entries: [], live: [], revision: undefined, cursor: null, cursorStack: [], stackTruncated: false, loaded: false, historyChecked: false, liveOverflow: false, latestCursor: null, liveError: '', historyError: '', busy: false, historyLoading: false, historyGeneration: 0, detailSequence: 0, details: new Map(), detailRequests: new Map() });
     const page = state.pages.get(id); state.pages.delete(id); state.pages.set(id, page);
     while (state.pages.size > 16) {
       const old = state.pages.keys().next().value; state.pages.delete(old); state.scroll.delete(old);
@@ -222,6 +250,24 @@ async function chooseAttachments($, id, source = 'file') {
     // Event-wide invalidation also rebuilds the host conversation's tool rows.
     return $.state.set(PANE_REVISION, ++paneRevision).catch(() => {});
   }
+  async function latestHistory($, id) {
+    const page = pageFor(id), gen = state.generation, historyGen = page.historyGeneration;
+    if (page.historyChecked) return;
+    page.historyChecked = true;
+    try {
+      const result = await bridge($, 'ui_history', { target: id });
+      if (!state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen) return;
+      if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
+      const changed = mergeLive(page, result.entries, true), cursorChanged = JSON.stringify(page.latestCursor) !== JSON.stringify(result.next_cursor ?? null);
+      const hadError = page.historyError;
+      page.latestCursor = result.next_cursor ?? null; page.historyError = '';
+      if (changed || cursorChanged || hadError) await invalidate($);
+    } catch (error) {
+      if (state.opened && state.selected === id && state.generation === gen) {
+        page.historyError = `无法读取已保存的对话：${failureText(error)}。请重试。`; await invalidate($);
+      }
+    }
+  }
   async function poll($) {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
@@ -230,71 +276,84 @@ async function chooseAttachments($, id, source = 'file') {
     page.busy = true;
     try {
       const result = await bridge($, 'ui_revision', { target: id, revision: page.revision });
-      if (!state.opened || state.selected !== id || state.generation !== gen || result.error || result.offline) return;
+      if (!state.opened || state.selected !== id || state.generation !== gen) return;
+      if (result.error || result.offline) throw new Error(failureText(result));
       const changed = result.agent && control.mutationEpoch === mutationEpoch && !control.stopping && !control.sending && updateAgent(id, result.agent);
-      const selected = state.agents.find((agent) => idOf(agent) === id);
-      if (page.mode === 'live' && Array.isArray(result.entries) && !result.entries.length && !page.restoreAttempted && !page.loaded && selected?.status !== 'starting') {
-        page.restoreAttempted = true;
-        const saved = await bridge($, 'ui_history', { target: id }).catch(() => ({ error: true }));
-        if (!state.opened || state.selected !== id || state.generation !== gen) return;
-        if (!saved.error && !saved.offline && saved.entries?.length) {
-          page.live = saved.entries; page.revision = result.revision; page.latestCursor = saved.next_cursor;
-          page.loaded = true; page.restoredHistory = true; await invalidate($); return;
-        }
-      }
+      let dirty = changed || Boolean(page.liveError);
+      page.liveError = '';
       if (result.entries && result.revision !== page.revision && (page.mode !== 'live' || !reading(id, page))) {
-        if (page.mode !== 'live') page.hasNew = true;
+        const entriesChanged = mergeLive(page, result.entries);
+        if (page.mode !== 'live' && entriesChanged) page.hasNew = true;
         page.revision = result.revision;
-        if (!page.restoredHistory || result.entries.length) { page.live = result.entries; page.restoredHistory = false; }
-        await invalidate($);
-      } else if (changed) await invalidate($);
+        dirty ||= entriesChanged;
+      }
+      if (dirty) await invalidate($);
+      const selected = state.agents.find((agent) => idOf(agent) === id);
+      if (selected && selected.status !== 'starting' && !page.historyChecked) await latestHistory($, id);
+    } catch (error) {
+      if (state.opened && state.selected === id && state.generation === gen) {
+        const message = `无法更新对话：${failureText(error)}。请重试。`;
+        if (page.liveError !== message) { page.liveError = message; await invalidate($); }
+      }
     } finally { page.busy = false; }
   }
   async function history($, id, direction = 'latest') {
     const page = pageFor(id), gen = state.generation, request = ++page.historyGeneration;
-    if (page.mode === 'live') { page.mode = 'history'; page.entries = []; page.cursor = direction === 'older' ? page.latestCursor : null; page.cursorStack = []; page.stackTruncated = false; page.loaded = false; await invalidate($); }
-    let stack = direction === 'older' ? [...page.cursorStack, page.cursor] : direction === 'newer' ? page.cursorStack.slice(0, -1) : [];
+    page.detailRequests.clear();
+    const fromLive = page.mode === 'live', olderCursor = fromLive ? page.latestCursor : page.cursor;
+    if (direction === 'older' && !olderCursor) return;
+    let stack = direction === 'older' ? [...(fromLive ? [] : page.cursorStack), olderCursor] : direction === 'newer' ? page.cursorStack.slice(0, -1) : [];
     let truncated = direction === 'latest' ? false : page.stackTruncated;
-    if (direction === 'older' && !page.cursor) return;
     if (stack.length > MAX_PAGES) { stack = stack.slice(-MAX_PAGES); truncated = true; }
     const cursor = stack.at(-1);
+    page.historyLoading = true; await invalidate($);
     try {
       const result = await bridge($, 'ui_history', { target: id, ...(cursor ? { cursor } : {}) });
       if (!state.opened || state.selected !== id || state.generation !== gen || request !== page.historyGeneration) return;
-      if (result.error || result.offline) throw new Error('无法获取历史记录');
-      page.mode = 'history'; page.entries = result.entries || []; page.cursorStack = stack; page.stackTruncated = truncated; page.detail = null;
-      page.cursor = result.next_cursor; page.loaded = true; page.error = null; await invalidate($);
-    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) { page.error = String(error.message || error); await invalidate($); } }
+      if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
+      page.mode = 'history'; page.entries = result.entries || []; page.cursorStack = stack; page.stackTruncated = truncated; page.details.clear();
+      page.cursor = result.next_cursor; page.loaded = true; page.historyError = '';
+    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) page.historyError = `无法读取更早消息：${failureText(error)}。请重试。`; }
+    finally { page.historyLoading = false; if (state.opened && state.selected === id && state.generation === gen && request === page.historyGeneration) await invalidate($); }
   }
   async function select($, id) {
     state.selected = id; state.generation++; state.restore = true;
     const page = pageFor(id);
-    if (page.mode === 'live') await poll($).catch(() => {});
+    page.detailRequests.clear();
+    if (page.mode === 'live') await poll($);
     else if (!page.loaded) await history($, id);
     await invalidate($);
   }
   export async function openAgent($, id) {
-    state.opened = true; const gen = ++state.generation;
+    state.opened = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
     try {
       const list = await bridge($, 'ui_list', {});
       if (!state.opened || state.generation !== gen) return;
-      if (Array.isArray(list.agents)) state.agents = summaries(list.agents);
-    } catch { /* The selected agent's history can still be opened. */ }
+      if (list.error || list.offline || !Array.isArray(list.agents)) throw new Error(failureText(list));
+      state.agents = mergeSummaries(list.agents);
+    } catch (error) { state.error = `无法读取代理列表：${failureText(error)}。请重试。`; }
     if (!state.opened || state.generation !== gen) return;
-    await select($, id);
+    const selected = id ? state.agents.find((agent) => idOf(agent) === id) : [...state.agents].reverse().find(active) || state.agents.at(-1);
+    if (selected) await select($, idOf(selected));
+    else { state.selected = null; if (!state.error) state.error = id ? '未找到此代理。请重新读取代理列表。' : '当前会话没有可打开的 Codex 代理。'; await invalidate($); }
     const selectedGen = state.generation;
-    const result = await $.ui.open({ id: PANE, title: 'Codex 代理', focus: true, closeOnEscape: true, rows: 24 });
+    const result = await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
     if (state.restore) await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
     if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath) {
-    const page = pageFor(id), key = entryKey(entry), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailGeneration;
-    const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset, ...(filePath !== undefined ? { file_path: filePath } : {}) });
-    if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || request !== page.detailGeneration || !state.folds.has(foldKey)) return;
-    if (result.error || result.offline) page.detail = { key, filePath, text: '无法获取完整内容', error: true, next_offset: null, offset };
-    else page.detail = { key, filePath, text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line };
+    const page = pageFor(id), key = detailKey(entry, filePath), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailSequence;
+    page.detailRequests.set(key, request);
+    while (page.detailRequests.size > MAX_DETAILS) page.detailRequests.delete(page.detailRequests.keys().next().value);
+    await invalidate($);
+    const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset, ...(filePath !== undefined ? { file_path: filePath } : outputTypes.has(entry.type) ? { view: 'output' } : {}) }).catch((error) => ({ error: { message: failureText(error) } }));
+    if (request !== page.detailRequests.get(key)) return;
+    page.detailRequests.delete(key);
+    if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
+    if (result.error || result.offline) cacheDetail(page, key, { text: `无法读取内容：${failureText(result)}`, error: true, next_offset: null, offset });
+    else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
     await invalidate($);
   }
 export function registerUI(on) {
@@ -304,7 +363,7 @@ export function registerUI(on) {
       if (result.error || result.offline) { $.ui.toast('无法获取 Codex 代理。'); return {}; }
       const agents = Array.isArray(result.agents) ? result.agents : [];
       if (!agents.length) { $.ui.toast('当前会话没有 Codex 代理。'); return {}; }
-      state.agents = summaries(agents);
+      state.agents = mergeSummaries(agents);
       const selected = agents.find((agent) => idOf(agent) === state.selected)
         || [...agents].reverse().find((agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent.status))
         || agents.at(-1);
@@ -329,7 +388,10 @@ export function registerUI(on) {
 }
 function renderPane($, e, next) {
     if (e.requestId !== PANE) return next(e);
-    const { Box, Text, Button, Input, Markdown, Image, Code, Svg } = $.ui.resolve(e), id = state.selected, page = pageFor(id), control = controlFor(id);
+    const { Box, Text, Button, Input, Markdown, Image, Code, Svg } = $.ui.resolve(e), id = state.selected;
+    const selected = state.agents.find((agent) => idOf(agent) === id);
+    if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
+    const page = pageFor(id), control = controlFor(id);
     const all = page.mode === 'history' ? page.entries : page.live;
     // The action gives immediate feedback while native history catches up. Once
     // the same message is persisted, retain the native copy for pagination.
@@ -344,7 +406,6 @@ function renderPane($, e, next) {
       return entry ? Box({ key: `row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${key}`, activityIcon(entry, integration)), button] }) : button;
     };
     const sourceCode = (key, source) => typeof Code === 'function' ? Code({ key, source: safe(source), format: 'source', wrap: 'wrap' }) : Text({ key, mono: true, size: 'caption', children: [safe(source)] });
-    const selected = state.agents.find((a) => idOf(a) === id);
     const stopStatus = selected?.user_control_status;
     // Keep handler identity stable across activity updates. Typing updates the
     // draft without invalidating the pane or the host conversation.
@@ -362,9 +423,14 @@ function renderPane($, e, next) {
     const friendlyModel = (selected?.model || '').replace(/^gpt-([\d.]+)-(.+)$/, (_all, version, name) => `GPT-${version} ${name.split('-').map((word) => word[0].toUpperCase() + word.slice(1)).join(' ')}`);
     const effort = selected?.reasoning_effort ? selected.reasoning_effort[0].toUpperCase() + selected.reasoning_effort.slice(1) : '';
     const model = [friendlyModel, effort].filter(Boolean).join(' · ');
-    navigation.push(Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [`${agentIcon(id)} ${safe(selected?.name || id || 'Codex')}`] }));
-    if ((page.mode === 'live' && (!page.restoredHistory || page.latestCursor)) || (page.mode !== 'live' && page.cursor)) navigation.push(disclosure('codex_older', '更早消息', () => history($, id, page.mode === 'live' && !page.latestCursor ? 'latest' : 'older')));
-    if (page.error) navigation.push(caption('codex_history_error', page.error));
+    navigation.push(Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [`${agentIcon(id)} ${safe(selected.name || 'Codex')}`] }));
+    if ((page.mode === 'live' && (page.liveOverflow || page.latestCursor)) || (page.mode !== 'live' && page.cursor)) navigation.push(disclosure('codex_older', page.historyLoading ? '正在读取…' : '更早消息', () => history($, id, page.mode === 'live' && (page.liveOverflow || !page.latestCursor) ? 'latest' : 'older')));
+    if (state.error) navigation.push(caption('codex_open_error', state.error));
+    if (state.error || page.liveError || page.historyError) {
+      if (page.liveError) navigation.push(caption('codex_update_error', page.liveError));
+      if (page.historyError) navigation.push(caption('codex_history_error', page.historyError));
+      navigation.push(disclosure('codex_retry_conversation', '重新读取', async () => { if (state.error) return openAgent($, id); page.historyChecked = false; await poll($); }));
+    }
     for (const group of groupEntries(entries)) {
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
       if (group.items.length > 1 || group.integration) {
@@ -382,7 +448,7 @@ function renderPane($, e, next) {
         if (entry.type === 'contextCompaction') { itemRows.push(Box({ key: `activity_${id}:${entryKey(entry)}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${id}:${entryKey(entry)}`, activityIcon(entry)), caption(`activity_label_${id}:${entryKey(entry)}`, description(entry))] })); continue; }
         const key = `${id}:${entryKey(entry)}`, expanded = state.folds.has(key);
         if (['agentMessage', 'userMessage', 'parentMessage', 'directUserMessage', 'plan'].includes(entry.type)) {
-          const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
+          const loaded = detailFor(page, entry);
           const message = [];
           if (['userMessage', 'parentMessage'].includes(entry.type)) message.push(caption(`author_${key}`, 'Claude'));
           const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
@@ -400,11 +466,11 @@ function renderPane($, e, next) {
         if (entry.type === 'fileChange' && Array.isArray(fileList) && fileList.length) {
           fileList.forEach((change, index) => {
             const fileKey = `${key}:file:${index}`, open = state.folds.has(fileKey);
-            itemRows.push(disclosure(`file_${fileKey}`, `${changeLabel(change)} ${open ? '▾' : '▸'}`, () => { toggle(fileKey); return invalidate($); }, entry));
+            itemRows.push(disclosure(`file_${fileKey}`, `${changeLabel(change)} ${open ? '▾' : '▸'}`, () => { toggle(fileKey); if (open) page.detailRequests.delete(detailKey(entry, typeof change.path === 'string' ? change.path : '')); return invalidate($); }, entry));
             const diff = entry.data?.changes?.find((item) => item.path === change.path)?.diff ?? change.diff;
             if (open) {
               const filePath = typeof change.path === 'string' ? change.path : '';
-              const loaded = page.detail?.key === entryKey(entry) && page.detail.filePath === filePath ? page.detail : null;
+              const loaded = detailFor(page, entry, filePath);
               const source = safe((loaded && !loaded.error ? loaded.text : diff) ?? '请查看完整内容');
               const complete = !loaded || loaded.error || (loaded.offset === 0 && loaded.next_offset == null && loaded.format !== 'source');
               itemRows.push(typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: complete && isUnifiedDiff(source) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] }));
@@ -418,14 +484,18 @@ function renderPane($, e, next) {
           });
           continue;
         }
-        itemRows.push(disclosure(`item_${key}`, `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, () => { toggle(key); if (expanded) page.detailGeneration++; return invalidate($); }, entry));
+        itemRows.push(disclosure(`item_${key}`, `${safe(description(entry)).slice(0, 120)} ${expanded ? '▾' : '▸'}`, async () => {
+          toggle(key); if (expanded) page.detailRequests.delete(detailKey(entry));
+          await invalidate($);
+          if (!expanded && entry.deferred && outputTypes.has(entry.type) && !detailFor(page, entry)) await detail($, id, entry);
+        }, entry));
         if (expanded) {
-          const loaded = page.detail?.key === entryKey(entry) ? page.detail : null;
-          const sections = loaded ? [{ label: '输出', source: loaded.text }] : toolSections(entry);
-          const output = sections.filter((section) => ['输出', '错误'].includes(section.label));
+          const loaded = detailFor(page, entry), loading = page.detailRequests.has(detailKey(entry));
+          const sections = toolSections(entry);
+          const output = loaded && !loaded.error ? [{ label: '输出', source: loaded.text }] : sections.filter((section) => ['输出', '错误'].includes(section.label));
           const raw = sections.filter((section) => !['输出', '错误'].includes(section.label));
-          const contents = output.map((section, index) => sourceCode(`tool_source_${key}:${index}`, section.source));
-          if (!contents.length) contents.push(sections.length ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
+          const contents = loading ? [caption(`tool_loading_${key}`, '正在读取输出…')] : loaded?.error ? [caption(`tool_error_${key}`, loaded.text)] : output.filter((section) => section.source).map((section, index) => sourceCode(`tool_source_${key}:${index}`, section.source));
+          if (!contents.length) contents.push(sections.length || loaded ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
           if (raw.length) {
             const rawKey = `${key}:raw`;
             contents.push(disclosure(`tool_raw_${key}`, `‹/› 原始调用 ${state.folds.has(rawKey) ? '▾' : '▸'}`, () => { toggle(rawKey); return invalidate($); }));
@@ -439,35 +509,35 @@ function renderPane($, e, next) {
             itemRows.push(disclosure(`copy_${key}`, '复制图片路径', press => $.ui.copy({ text: imagePath, surface: press.surface })));
           }
           if (loaded?.offset > 0) itemRows.push(disclosure(`detail_prev_${key}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
-          const truncated = entry.deferred || (entry.preview?.length ?? 0) >= 4096 || JSON.stringify(entry.data || {}).includes('[truncated]');
-          if (!String(entry.id).startsWith('action:') && ((!loaded && truncated) || loaded?.next_offset != null)) itemRows.push(disclosure(`detail_${key}`, loaded ? '下一页输出' : '获取更多', () => detail($, id, entry, loaded?.next_offset ?? 0)));
+          const truncated = entry.deferred || (entry.preview?.length ?? 0) >= 4096 || entry.preview?.includes('[truncated]') || JSON.stringify(entry.data || {}).includes('[truncated]');
+          if (!String(entry.id).startsWith('action:') && !loading && ((!loaded && truncated) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`detail_${key}`, loaded?.error ? '重试' : loaded ? '更多输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0)));
         }
       }
       if (group.integration) rows.push(Box({ key: `integration_${groupKey}`, flexDirection: 'column', gap: 'sm', paddingX: 1, children: itemRows }));
       else rows.push(...itemRows);
     }
-    if (page.mode !== 'live' && (page.hasNew || page.cursorStack.length)) rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: async () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.detail = null; await poll($).catch(() => {}); await invalidate($); await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
-    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => disclosure(`attachment_${id}_${index}`, `${safe(path.split(/[\\/]/).at(-1) || path)} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); })) }));
+    if (page.mode !== 'live' && (page.hasNew || page.cursorStack.length)) rows.push(Button({ key: 'codex_latest', variant: 'secondary', label: '↓', onPress: async () => { page.mode = 'live'; page.hasNew = false; page.historyGeneration++; page.details.clear(); page.detailRequests.clear(); await poll($).catch(() => {}); await invalidate($); await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); } }));
+    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => Box({ key: `attachment_hover_${id}_${index}`, position: 'relative', children: [disclosure(`attachment_${id}_${index}`, `${safe(attachmentName(path, index))} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); }), Box({ position: 'absolute', top: -2, left: 0, width: 40, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [safe(path.split(/[\\/]/).at(-1) || path)] })] })] })) }));
     if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; return invalidate($); } }));
     if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
     composer.push(Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, submitLabel: control.sending ? '…' : control.stopping || stopStatus === 'stopping' ? '…' : canStop && !control.draft.trim() && !control.attachments.length ? '■' : '↑', onInput: control.actions.input, onSubmit: control.actions.submit }));
     const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
     const used = selected?.context_used_tokens, limit = selected?.context_limit_tokens;
     const context = contextIndicator(used, limit);
-    const paste = Box({ key: `codex_paste_hover_${id}`, position: 'relative', children: [Button({ key: `codex_paste_${id}`, plain: true, dimColor: true, label: '📋', onPress: control.actions.paste }), Box({ position: 'absolute', top: -2, left: 0, width: 20, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: ['粘贴图片或文件'] })] })] });
+    const paste = Box({ key: `codex_paste_hover_${id}`, position: 'relative', children: [Button({ key: `codex_paste_${id}`, plain: true, dimColor: true, label: '📎︎', onPress: control.actions.paste }), Box({ position: 'absolute', top: -2, left: 0, width: 20, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: ['粘贴图片或文件'] })] })] });
     const left = [Button({ key: `codex_attach_${id}`, plain: true, dimColor: true, label: control.picking ? '…' : '+', onPress: control.actions.attach }), paste, ...(permission ? [caption(`codex_permissions_${id}`, permission)] : [])];
-    const right = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16, isInteractive: true }) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
+    const right = [...(context ? [e.surface === 'desktop' && typeof Svg === 'function' ? Box({ key: `codex_context_hover_${id}`, position: 'relative', children: [Svg({ key: `codex_context_${id}`, source: context.source, alt: context.alt, width: 16, height: 16 }), Box({ position: 'absolute', top: -2, right: 0, width: 44, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [context.alt] })] })] }) : caption(`codex_context_${id}`, context.glyph)] : []), ...(model ? [caption(`codex_model_${id}`, model)] : [])];
     composer.push(Box({ key: `codex_composer_footer_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', justifyContent: 'space-between', alignItems: 'center', children: [Box({ key: `codex_composer_left_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: left }), Box({ key: `codex_composer_right_${id}`, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: right })] }));
     if (control.stopping || stopStatus === 'stopping' || stopStatus === 'stopped') composer.push(caption(`codex_stop_status_${id}`, control.stopping || stopStatus === 'stopping' ? '正在停止…' : '已停止'));
     if (stopStatus === 'unconfirmed') composer.push(caption(`codex_stop_notice_${id}`, '停止状态未确认，工作可能仍在进行。'));
     if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));
-    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', gap: 'sm', ...(e.surface === 'desktop' ? { paddingY: 1 } : { borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
+    return Box({ key: 'codex_conversation', flexDirection: 'column', gap: 'lg', children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), Box({ key: `codex_timeline_${id}`, flexDirection: 'column', gap: 'md', minWidth: 0, children: rows }), Box({ key: `codex_composer_${id}`, flexDirection: 'column', ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
 }
-export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; clearIcons(); }
+export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
 export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);
-    state.agents = summaries(result.agents);
+    state.agents = mergeSummaries(result.agents);
     const ids = new Set(state.agents.map(idOf));
     retainIcons([...ids], state.agents.filter((agent) => active(agent) || agent.status === 'unknown').map(idOf));
     for (const id of state.controls.keys()) if (!ids.has(id)) state.controls.delete(id);

@@ -16,7 +16,7 @@ async function check(dir) {
     }
   }
 }
-for (const folder of ['runtime', 'hooks', 'scripts', 'test']) await check(resolve(root, folder));
+for (const folder of ['runtime', 'hooks', 'shared', 'scripts', 'test']) await check(resolve(root, folder));
 const guidance = spawnSync(process.execPath, [resolve(root, 'scripts/guidance.mjs'), '--check'], { windowsHide: true, stdio: 'inherit' });
 if (guidance.status !== 0) throw new Error('Guidance and its generated review/default role disagree.');
 console.log('Metadata and JavaScript syntax checks passed.');

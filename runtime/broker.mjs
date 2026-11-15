@@ -25,7 +25,20 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
   const delivery = deliveryStore ?? new DeliveryStore({ controller });
   const actions = new Set();
   const requests = new Set(), aborters = new Set();
-  let waiting = false;
+  let waiting = false, stopping = false;
+
+  const stopIfIdle = () => {
+    if (stopping) return { stopped: true };
+    const active = controller.hasActiveWork ? controller.hasActiveWork()
+      : [...(controller.agents?.values() || [])].some(agent => activeStatuses.has(agent.status) || agent.pending_requests?.length);
+    if (active) return { stopped: false, reason: 'active' };
+    if (actions.size || requests.size > 1) return { stopped: false, reason: 'busy' };
+    // No await separates the idle check from sealing admission. Mutation
+    // dispatch and this check therefore share one atomic admission boundary.
+    stopping = true;
+    setImmediate(onShutdown);
+    return { stopped: true };
+  };
 
   const waitForChange = (signal, timeout) => new Promise(resolve => {
     let done = false;
@@ -43,11 +56,14 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
 
   const dispatch = async (body, signal) => {
     const { operation, args = {}, requestId } = body;
-    if (operation === 'health') return getHealth ? await getHealth() : { ready: !controller.closed && !controller.closing };
+    if (operation === 'health') return { ...(getHealth ? await getHealth() : { ready: !controller.closed && !controller.closing }),
+      ...(stopping ? { ready: false } : {}), capabilities: ['idle_shutdown'] };
     if (operation === 'shutdown') { setImmediate(onShutdown); return { stopped: true }; }
     if (requiredProtocol !== undefined && body.protocolVersion !== requiredProtocol) {
       throw Object.assign(new Error('Restart Claude Code to load the current Codex plugin bridge.'), { code: 'bridge_version_mismatch' });
     }
+    if (operation === 'idle_shutdown') return stopIfIdle();
+    if (stopping) throw Object.assign(new Error('The idle session helper is restarting. Retry the request.'), { code: 'helper_restarting' });
     if (['ui_list', 'ui_history', 'ui_detail', 'ui_revision'].includes(operation)) {
       if (!activity) throw new Error('Activity view is unavailable.');
       const method = { ui_list: 'list', ui_history: 'history', ui_detail: 'detail', ui_revision: 'revision' }[operation];

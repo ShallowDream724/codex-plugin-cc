@@ -1,5 +1,5 @@
 const drawings = {
-  integration: ['集成', '⋮⋮', '<circle cx="7" cy="7" r="3"/><circle cx="17" cy="7" r="3"/><circle cx="7" cy="17" r="3"/><circle cx="17" cy="17" r="3"/>'],
+  integration: ['集成', '⋮⋮', '<circle cx="7" cy="7" r="3"/><circle cx="17" cy="7" r="3"/><circle cx="7" cy="17" r="3"/><circle cx="17" cy="17" r="3"/><path d="m14.9 9.1-5.8 5.8"/>'],
   edit: ['编辑文件', '✎', '<path d="m15 4 5 5M4 20l5-1L20 8a2 2 0 0 0-5-5L4 14z"/>'],
   terminal: ['命令', '›_', '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/>'],
   search: ['搜索', '⌕', '<circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/>'],

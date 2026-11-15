@@ -306,10 +306,10 @@ test('history stays reachable after live rollover and past fifty pages; closed o
   await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   live = 'live-200'; timers[0].fn(); await new Promise((r) => setImmediate(r));
-  let tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200')); assert.ok(!JSON.stringify(tree).includes('live-100'));
+  let tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200')); assert.ok(JSON.stringify(tree).includes('live-100'));
   await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
   for (let i = 0; i < 56; i++) { tree = await draw(); await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress(); }
-  tree = await draw(); assert.ok(JSON.stringify(tree).includes('history-56')); assert.ok(nodes(tree).some((x) => x.props.key === 'codex_older'));
+  tree = await draw(); assert.ok(JSON.stringify(tree).includes('history-57')); assert.ok(nodes(tree).some((x) => x.props.key === 'codex_older'));
   assert.ok(nodes(tree).some((x) => x.props.key === 'codex_latest'));
   await nodes(tree).find((x) => x.props.key === 'codex_latest').props.onPress();
   tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200'));
@@ -333,8 +333,6 @@ test('older pages stay visible during live updates and newer returns to latest',
   let tree = await draw();
   assert.ok(JSON.stringify(tree).includes('The full agent name'));
   await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
-  tree = await draw();
-  await nodes(tree).find((x) => x.props.key === 'codex_older').props.onPress();
   tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old')));
   timers[0].fn(); await new Promise((r) => setImmediate(r));
   tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old'))); assert.ok(!nodes(tree).some((x) => x.props.key?.includes('t:live')));
@@ -355,8 +353,8 @@ test('late details from a previous selection are discarded', async () => {
   closeUI(); connect($, bridge); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = await draw();
-  tree = await draw(); nodes(tree).find((x) => x.props.key === 'item_a:t:a').props.onPress();
-  tree = await draw(); const pending = nodes(tree).find((x) => x.props.label === '获取更多').props.onPress();
+  tree = await draw(); const pending = nodes(tree).find((x) => x.props.key === 'item_a:t:a').props.onPress();
+  await new Promise((r) => setImmediate(r));
   await openAgent($, 'b'); await new Promise((r) => setImmediate(r));
   deferred.resolve({ text: 'old response', next_offset: null }); await pending;
   tree = await draw(); assert.ok(!JSON.stringify(tree).includes('old response'));
@@ -375,9 +373,8 @@ test('large detail pages can be navigated in both directions', async () => {
   closeUI(); connect($, bridge); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = await draw();
-  tree = await draw(); nodes(tree).find((x) => x.props.key === 'item_a:t:cmd').props.onPress();
-  tree = await draw(); await nodes(tree).find((x) => x.props.label === '获取更多').props.onPress();
-  tree = await draw(); await nodes(tree).find((x) => x.props.label === '下一页输出').props.onPress();
+  tree = await draw(); await nodes(tree).find((x) => x.props.key === 'item_a:t:cmd').props.onPress();
+  tree = await draw(); await nodes(tree).find((x) => x.props.label === '更多输出').props.onPress();
   tree = await draw(); assert.ok(JSON.stringify(tree).includes('Page 16000'));
   await nodes(tree).find((x) => x.props.label === '上一页输出').props.onPress();
   assert.deepEqual(offsets, [0, 16000, 0]);
@@ -412,7 +409,7 @@ test('agents have independent entries and polling ends when pane closes', async 
 test('tool details separate protocol commands and output into wrapped source panels', async () => {
   const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
-  const entries = [{ id: 'run', turn_id: 't', type: 'mcpToolCall', deferred: true, preview: 'Tool: fastctx/run Input: shortened preview', data: { server: 'fastctx', tool: 'run', arguments: { command: 'printf "one\\ntwo"', cwd: 'C:/work', timeout_ms: 1000 }, result: { content: [{ type: 'text', text: 'one\ntwo\n<html>literal</html>' }], structuredContent: { exit_code: 0 } } } }];
+  const entries = [{ id: 'run', turn_id: 't', type: 'mcpToolCall', preview: 'Tool: fastctx/run Input: shortened preview [truncated]', data: { server: 'fastctx', tool: 'run', arguments: { command: 'printf "one\\ntwo"', cwd: 'C:/work', timeout_ms: 1000 }, result: { content: [{ type: 'text', text: 'one\ntwo\n<html>literal</html>' }], structuredContent: { exit_code: 0 } } } }];
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_detail' ? { text: 'full raw page\nnext line', next_offset: null } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
@@ -430,7 +427,7 @@ test('tool details separate protocol commands and output into wrapped source pan
   assert.equal(nodes(await draw()).filter((node) => node.props.key?.startsWith('codex_stop_')).length, 0);
   await nodes(await draw()).find((node) => node.props.key === 'detail_a:t:run').props.onPress();
   panels = nodes(await draw()).filter((node) => node.type === 'Code');
-  assert.deepEqual(panels.map((node) => node.props.source), ['full raw page\nnext line']);
+  assert.deepEqual(panels.map((node) => node.props.source), ['full raw page\nnext line', 'printf "one\\ntwo"', 'C:/work', '{\n  "timeout_ms": 1000\n}']);
   closeUI();
 });
 
@@ -439,7 +436,8 @@ test('unchanged completed polling and observations never refresh; changes target
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { state: { get: async (ref) => { reads.push(ref); return { value: 0, version: 0 }; }, set: async (ref, value) => { writes.push({ ref, value }); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { globalRefresh++; }, open: async () => ({ isPlaced: true }), scroll: async (args) => { scrolls.push(args); return {}; } }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
   const agents = [{ agent_id: 'a', status: 'completed', model: 'model' }];
-  connect($, async (_$, op) => op === 'ui_list' ? { agents } : { revision, entries: [], agent: agents[0] });
+  const uiAgent = { ...agents[0], permissions_mode: 'full-access', context_used_tokens: 500, context_limit_tokens: 1000 };
+  connect($, async (_$, op) => op === 'ui_list' ? { agents } : { revision, entries: revision > 1 ? [{ id: 'new', turn_id: 't', type: 'agentMessage', data: { text: 'new activity' } }] : [], agent: uiAgent });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const render = hooks.find((h) => h.event === 'ui.render');
   assert.deepEqual(render.matcher, { component: 'Pane', requestId: 'codex_subagent_activity' });
@@ -451,8 +449,11 @@ test('unchanged completed polling and observations never refresh; changes target
   writes.length = 0;
   for (let i = 0; i < 12; i++) { timers[0](); observeUI($, { agents }); await new Promise((r) => setImmediate(r)); }
   assert.equal(writes.length, 0); assert.equal(globalRefresh, 0);
+  assert.match(JSON.stringify(await draw()), /◔ 50%/); assert.match(JSON.stringify(await draw()), /完全访问/);
   revision = 2; timers[0](); await new Promise((r) => setImmediate(r));
   assert.equal(writes.length, 1); assert.deepEqual(writes[0].ref, reads[0]); assert.equal(globalRefresh, 0);
+  await observeUI($, { agents: [{ ...agents[0], context_used_tokens: null }] });
+  assert.ok(!JSON.stringify(await draw()).includes('◔ 50%'));
   closeUI();
 });
 
@@ -486,6 +487,7 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
     if (op === 'ui_revision') return { revision: 1, entries };
+    if (op === 'ui_history') return { entries: [], next_cursor: null };
     requests.push({ op, args });
     return op === 'ui_interrupt' ? { agent_id: 'a', user_control_status: 'stopped', user_paused: true } : { agent_id: 'a', status: 'steered' };
   });
@@ -538,7 +540,7 @@ test('an empty live cache restores saved latest history once and skips a newly s
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   assert.match(JSON.stringify(await draw()), /recent saved message/);
   assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_attach_saved').props.label, '+');
-  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_paste_saved').props.label, '📋');
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_paste_saved').props.label, '📎︎');
   writes.length = 0;
   for (let i = 0; i < 3; i++) { await timers[0](); await observeUI($, { agents }); }
   assert.equal(historyCalls.length, 1); assert.equal(writes.length, 0);
@@ -556,7 +558,7 @@ test('history actions, input boundaries and polling await the asynchronous pane 
   const hooks = [], timers = [], pending = []; let delay = false, revision = 1;
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
   const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async () => { if (delay) await new Promise((resolve) => pending.push(resolve)); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
-  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : { revision, entries: [{ id: 'm', turn_id: 't', type: 'agentMessage', data: { text: op === 'ui_history' ? 'saved history' : 'live message' } }], next_cursor: null });
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : { revision, entries: [{ id: 'm', turn_id: 't', type: 'agentMessage', data: { text: op === 'ui_history' ? 'saved history' : `live message ${revision}` } }], next_cursor: { turns_cursor: 'older' } });
   closeUI(); registerUI(on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   delay = true; let completed = false;
@@ -571,4 +573,132 @@ test('history actions, input boundaries and polling await the asynchronous pane 
   const tick = timers[0]().then(() => { completed = true; });
   await new Promise((r) => setImmediate(r)); assert.equal(completed, false); pending.shift()(); await tick;
   closeUI();
+});
+
+test('cold history merges with live deltas, updates duplicates and keeps a bounded conversation', async () => {
+  const hooks = [], timers = []; let revision = 1, recent = [];
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
+  const entry = (id, text = id) => ({ id, type: 'agentMessage', turn_id: 't', data: { text } });
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('cold-one'), entry('cold-two')], next_cursor: null } : { revision, entries: recent });
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_older'), undefined);
+  recent = [entry('new-one')]; revision++; await timers[0]();
+  let messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
+  assert.deepEqual(messages, ['cold-one', 'cold-two', 'new-one']);
+  recent = [entry('new-one', 'new-one updated')]; revision++; await timers[0]();
+  messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
+  assert.deepEqual(messages, ['cold-one', 'cold-two', 'new-one updated']);
+  recent = Array.from({ length: 260 }, (_, i) => entry(`new-${i + 2}`)); revision++; await timers[0]();
+  messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
+  assert.equal(messages.length, 200); assert.equal(messages.at(-1), 'new-261');
+  assert.ok(nodes(await draw()).find((node) => node.props.key === 'codex_older'));
+  closeUI();
+});
+
+test('failed discovery has a recovery action without an untargeted composer and read failures keep visible messages', async () => {
+  const hooks = [], timers = [], panes = []; let discoveryFails = true, historyFails = true, pollFails = false;
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async (options) => { panes.push(options); return { isPlaced: true }; }, scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
+  const entry = (id) => ({ id, type: 'agentMessage', turn_id: 't', data: { text: id } });
+  connect($, async (_$, op) => {
+    if (op === 'ui_list') return discoveryFails ? { error: { message: 'helper version mismatch' } } : { agents: [{ agent_id: 'a', name: 'Saved agent', status: 'completed' }] };
+    if (op === 'ui_revision') return pollFails ? { error: { message: 'broker offline' } } : { revision: 1, entries: [entry('live reply')] };
+    return historyFails ? { error: { message: 'saved history unavailable' } } : { entries: [entry('saved reply')], next_cursor: { turns_cursor: 'older' } };
+  });
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
+  let tree = await draw(); assert.equal(panes[0].title, 'Codex'); assert.match(JSON.stringify(tree), /helper version mismatch/);
+  assert.equal(nodes(tree).find((node) => node.type === 'Input'), undefined); assert.equal(nodes(tree).find((node) => node.props.key === 'codex_older'), undefined);
+  discoveryFails = false; await nodes(tree).find((node) => node.props.key === 'codex_retry').props.onPress();
+  tree = await draw(); assert.match(JSON.stringify(tree), /saved history unavailable/); assert.match(JSON.stringify(tree), /live reply/);
+  assert.equal(nodes(tree).find((node) => node.props.key === 'codex_older'), undefined);
+  const composer = nodes(tree).find((node) => node.props.key === 'codex_composer_a');
+  assert.equal(composer.props.borderStyle, undefined); assert.equal(composer.props.gap, 0);
+  historyFails = false; await nodes(tree).find((node) => node.props.key === 'codex_retry_conversation').props.onPress();
+  tree = await draw(); assert.match(JSON.stringify(tree), /saved reply/); assert.match(JSON.stringify(tree), /live reply/);
+  assert.ok(nodes(tree).find((node) => node.props.key === 'codex_older'));
+  historyFails = true; await nodes(tree).find((node) => node.props.key === 'codex_older').props.onPress();
+  tree = await draw(); assert.match(JSON.stringify(tree), /无法读取更早消息/); assert.match(JSON.stringify(tree), /saved reply/);
+  pollFails = true; await timers[0](); tree = await draw(); assert.match(JSON.stringify(tree), /broker offline/); assert.match(JSON.stringify(tree), /live reply/);
+  closeUI();
+});
+
+test('deferred tools load output automatically, retain raw inputs and expose a readable retry', async () => {
+  const hooks = [], details = []; let fails = true;
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const entry = { id: 'tool', turn_id: 't', type: 'mcpToolCall', deferred: true, data: { server: 'fastctx', tool: 'run', arguments: { command: 'read-file' }, result: { content: null, structuredContent: null, isError: null } } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_detail') { details.push(args); return fails ? { error: { message: 'connection lost' } } : { text: `output page ${args.offset}`, next_offset: args.offset ? null : 16000, format: 'source' }; }
+    return { revision: 1, entries: [entry], next_cursor: null };
+  });
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  await nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+  await nodes(await draw()).find((node) => node.props.key === 'item_a:t:tool').props.onPress();
+  assert.equal(details.length, 1); assert.equal(details[0].view, 'output');
+  let tree = await draw(); assert.match(JSON.stringify(tree), /connection lost/); assert.equal(nodes(tree).filter((node) => node.type === 'Code').length, 0);
+  await nodes(tree).find((node) => node.props.key === 'tool_raw_a:t:tool').props.onPress();
+  assert.deepEqual(nodes(await draw()).filter((node) => node.type === 'Code').map((node) => node.props.source), ['read-file']);
+  fails = false; await nodes(await draw()).find((node) => node.props.label === '重试').props.onPress();
+  tree = await draw(); assert.deepEqual(nodes(tree).filter((node) => node.type === 'Code').map((node) => node.props.source), ['output page 0', 'read-file']);
+  await nodes(tree).find((node) => node.props.label === '更多输出').props.onPress();
+  assert.deepEqual(details.map((args) => args.offset), [0, 0, 16000]);
+  assert.ok(details.every((args) => args.view === 'output'));
+  closeUI();
+});
+
+test('attachment chips shorten UUID images and long names while preserving full names and send paths', async () => {
+  const hooks = [], sends = [];
+  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+  const paths = ['C:/tmp/codex-clipboard-12345678-1234-1234-1234-123456789abc.png', 'C:/docs/这是一个很长的中文文件名称用于布局检查和后缀保留.docx'];
+  connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] }; if (op === 'ui_send') { sends.push(args); return { agent_id: 'a', status: 'steered' }; } return { revision: 1, entries: [], next_cursor: null }; });
+  const run = $.process.run;
+  $.process.run = async (argv, options) => argv.includes('--clipboard') ? { stdout: JSON.stringify({ paths }), exitCode: 0 } : run(argv, options);
+  closeUI(); registerUI(on); await openAgent($, 'a');
+  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+  await nodes(await draw()).find((node) => node.props.key === 'codex_paste_a').props.onPress();
+  const tree = await draw(), chips = nodes(tree).filter((node) => node.type === 'Button' && node.props.key?.startsWith('attachment_'));
+  assert.equal(chips[0].props.label, '图片 1.png ×'); assert.match(chips[1].props.label, /…\.docx ×$/);
+  assert.ok(chips[1].props.label.length < paths[1].split('/').at(-1).length);
+  assert.ok(nodes(tree).some((node) => node.type === 'Text' && node.props.children.includes(paths[1].split('/').at(-1))));
+  assert.equal(nodes(tree).find((node) => node.props.key === 'codex_attachments_a').props.flexWrap, 'wrap');
+  await nodes(tree).find((node) => node.type === 'Input').props.onSubmit('');
+  assert.deepEqual(sends[0].attachments, paths.map((path) => ({ path })));
+  closeUI();
+});
+
+test('independent deferred tool details retain both results in either completion order and reuse cached pages', async () => {
+  for (const order of [['run', 'inspect'], ['inspect', 'run']]) {
+    const hooks = [], requests = [], pending = new Map();
+    const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+    const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
+    const entries = ['run', 'inspect'].map((id) => ({ id, turn_id: 't', type: 'mcpToolCall', deferred: true, data: { server: 'fastctx', tool: id === 'run' ? 'run' : 'inspect_local_file', arguments: id === 'run' ? { command: 'test' } : { file_path: '/tmp/result.txt' } } }));
+    connect($, async (_$, op, args) => {
+      if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+      if (op === 'ui_detail') { requests.push(args); return new Promise((resolve) => pending.set(args.item_id, resolve)); }
+      return { revision: 1, entries, next_cursor: null };
+    });
+    closeUI(); registerUI(on); await openAgent($, 'a');
+    const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
+    const press = async (key) => nodes(await draw()).find((node) => node.props.key === key).props.onPress();
+    await nodes(await draw()).find((node) => node.props.key?.startsWith('group_')).props.onPress();
+    const first = press('item_a:t:run'), second = press('item_a:t:inspect');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(requests.length, 2);
+    pending.get(order[0])({ text: `${order[0]} output`, next_offset: null, format: 'source' });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(nodes(await draw()).filter((node) => node.type === 'Code').map((node) => node.props.source), [`${order[0]} output`]);
+    pending.get(order[1])({ text: `${order[1]} output`, next_offset: null, format: 'source' });
+    await Promise.all([first, second]);
+    assert.deepEqual(nodes(await draw()).filter((node) => node.type === 'Code').map((node) => node.props.source), ['run output', 'inspect output']);
+    for (const id of ['run', 'inspect']) { await press(`item_a:t:${id}`); await press(`item_a:t:${id}`); }
+    assert.equal(requests.length, 2);
+    assert.deepEqual(nodes(await draw()).filter((node) => node.type === 'Code').map((node) => node.props.source), ['run output', 'inspect output']);
+    closeUI();
+  }
 });

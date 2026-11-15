@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
+import { request } from 'node:http';
 import { createBroker } from '../runtime/broker.mjs';
 
 class FakeController extends EventEmitter {
@@ -212,4 +213,70 @@ test('shutdown releases local waiters but drains accepted disconnected mutations
   const drain = server.drain().then(() => { drained = true; });
   await new Promise(resolve => setImmediate(resolve)); assert.equal(drained, false);
   release(); await action; await drain; assert.equal(drained, true);
+});
+
+test('idle upgrade refuses an in-flight mutation and rechecks active work after it completes', async t => {
+  let stopped = 0, release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const { post, controller } = await setup(t, { onShutdown: () => { stopped++; } });
+  let active = false;
+  controller.hasActiveWork = () => active;
+  controller.dispatch = async () => { entered(); await new Promise(resolve => { release = resolve; }); active = true; return { accepted: true }; };
+  const mutation = post({ operation: 'spawn_agent', requestId: 'racing-upgrade', args: { context_mode: 'none' } });
+  await started;
+  assert.deepEqual((await post({ operation: 'idle_shutdown' })).body, { stopped: false, reason: 'busy' });
+  assert.equal(stopped, 0);
+  release(); await mutation;
+  assert.deepEqual((await post({ operation: 'idle_shutdown' })).body, { stopped: false, reason: 'active' });
+  assert.equal(stopped, 0);
+  active = false;
+  assert.deepEqual((await post({ operation: 'idle_shutdown' })).body, { stopped: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopped, 1);
+});
+
+test('an accepted idle upgrade seals mutation admission and parallel upgrades schedule shutdown once', async t => {
+  let stopped = 0;
+  const { post, controller } = await setup(t, { onShutdown: () => { stopped++; } });
+  controller.hasActiveWork = () => false;
+  const first = await post({ operation: 'idle_shutdown' });
+  assert.deepEqual(first.body, { stopped: true });
+  const results = await Promise.all([
+    post({ operation: 'idle_shutdown' }),
+    post({ operation: 'send_message', requestId: 'too-late', args: {} }),
+  ]);
+  assert.deepEqual(results[0].body, { stopped: true });
+  assert.equal(results[1].body.error.code, 'helper_restarting');
+  assert.equal(controller.calls.length, 0);
+  assert.equal(stopped, 1);
+  assert.equal((await post({ operation: 'health' })).body.ready, false);
+});
+
+test('idle upgrade requires the negotiated protocol before making shutdown decisions', async t => {
+  let stopped = false;
+  const { post } = await setup(t, { requiredProtocol: 2, onShutdown: () => { stopped = true; } });
+  const result = await post({ operation: 'idle_shutdown', protocolVersion: 1 });
+  assert.equal(result.body.error.code, 'bridge_version_mismatch');
+  assert.equal(stopped, false);
+});
+
+test('idle upgrade treats a partially received request as in flight before mutation dispatch', async t => {
+  let stopped = 0;
+  const { post, controller, server, url } = await setup(t, { onShutdown: () => { stopped++; } });
+  controller.hasActiveWork = () => false;
+  let finish;
+  const response = new Promise(resolve => { finish = resolve; });
+  const admitted = once(server, 'request');
+  const incoming = request(url, { method: 'POST', headers: { authorization: 'Bearer test-auth' } }, res => {
+    res.resume(); res.on('end', finish);
+  });
+  t.after(() => incoming.destroy());
+  incoming.write('{"operation":"send_message",');
+  await admitted;
+  assert.equal(controller.calls.length, 0);
+  assert.deepEqual((await post({ operation: 'idle_shutdown' })).body, { stopped: false, reason: 'busy' });
+  assert.equal(stopped, 0);
+  incoming.end('"requestId":"incoming","args":{}}');
+  await response;
+  assert.equal(controller.calls.length, 1);
 });

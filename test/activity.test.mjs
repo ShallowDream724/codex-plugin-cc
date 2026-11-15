@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { ActivityStore } from '../runtime/activity.mjs';
+import { toolSections } from '../hooks/tool-presentation.js';
 
 function fixture() {
   const client = new EventEmitter(), controller = new EventEmitter(), requests = [];
@@ -187,4 +188,80 @@ test('file detail selects only the recorded file and preserves truthful page for
   const page = await store.detail({ target: 'a', turn_id: 't', item_id: 'edits', file_path: 'b.js' });
   assert.equal(page.format, 'source'); assert.equal(page.next_offset, 16000);
   await assert.rejects(store.detail({ target: 'a', turn_id: 't', item_id: 'edits', file_path: 'foreign.js' }), /not part/);
+});
+
+test('deferred MCP skeletons show no output until native detail resolves the actual content', async () => {
+  const { store, client } = fixture();
+  const deferred = { id: 'lookup', type: 'mcpToolCall', server: 'github', tool: 'search', arguments: { query: 'source' }, result: { structuredContent: null, _meta: null } };
+  const resolved = { ...deferred, result: { content: [{ type: 'text', text: 'Found the requested source.' }], structuredContent: null, _meta: null } };
+  client.request = async method => method === 'thread/turns/list'
+    ? { data: [{ id: 'turn' }], nextCursor: null }
+    : method === 'thread/items/list' ? { data: [{ turnId: 'turn', outputDeferred: true, item: deferred }], nextCursor: null }
+    : { data: [{ item: resolved }] };
+  const entry = (await store.history({ target: 'a' })).entries[0];
+  assert.equal(entry.deferred, true);
+  assert.ok(!toolSections(entry).some(section => section.label === '输出'));
+  const result = await store.detail({ target: 'a', turn_id: 'turn', item_id: entry.id, view: 'output' });
+  assert.deepEqual(result, { text: 'Found the requested source.', next_offset: null, format: 'source' });
+  assert.equal(toolSections({ ...entry, data: resolved }).find(section => section.label === '输出').source, result.text);
+  const full = await store.detail({ target: 'a', turn_id: 'turn', item_id: entry.id });
+  assert.match(full.text, /Tool: github\/search\nInput:/);
+  assert.match(full.text, /Output:\nFound the requested source\./);
+});
+
+test('tool output keeps structured results, real fields and errors while dropping null protocol metadata', async () => {
+  const { store, client } = fixture();
+  const item = { id: 'lookup', type: 'mcpToolCall', tool: 'inspect', arguments: { query: 'do not repeat' }, result: { content: [{ type: 'text', text: 'partial answer' }], structuredContent: { rows: [{ count: 7 }] }, _meta: null, status: 'partial', businessField: null }, error: { message: 'Request timed out' } };
+  client.request = async () => ({ data: [{ item }] });
+  const detail = await store.detail({ target: 'a', turn_id: 't', item_id: item.id, view: 'output' });
+  assert.match(detail.text, /^partial answer\n/);
+  assert.match(detail.text, /"count": 7/);
+  assert.match(detail.text, /"status": "partial"/);
+  assert.match(detail.text, /"businessField": null/);
+  assert.match(detail.text, /Request timed out/);
+  assert.doesNotMatch(detail.text, /Tool:|Input:|Output:|_meta|do not repeat/);
+  const sections = toolSections({ type: item.type, data: item });
+  const output = sections.find(section => section.label === '输出').source;
+  assert.match(output, /"count": 7/); assert.match(output, /"businessField": null/); assert.doesNotMatch(output, /_meta/);
+  assert.match(sections.find(section => section.label === '错误').source, /Request timed out/);
+  const empty = { ...item, result: { content: null, structuredContent: null, _meta: null }, error: 'No result returned' };
+  client.request = async () => ({ data: [{ item: empty }] });
+  assert.equal((await store.detail({ target: 'a', turn_id: 't', item_id: empty.id, view: 'output' })).text, 'No result returned');
+});
+
+test('output-only detail paginates command, dynamic and function output without call headers', async () => {
+  const { store, client } = fixture();
+  const output = 'long result line\n'.repeat(2200);
+  const items = [
+    { id: 'command', type: 'commandExecution', command: 'private-input', cwd: 'C:/work', aggregatedOutput: output },
+    { id: 'dynamic', type: 'dynamicToolCall', tool: 'private-input', contentItems: [{ type: 'inputText', text: output }] },
+    { id: 'function', type: 'functionCallOutput', output: { content: [{ type: 'text', text: output }], structuredContent: null, _meta: null } },
+  ];
+  for (const item of items) {
+    client.request = async () => ({ data: [{ item }] });
+    let combined = '', offset = 0, pages = 0;
+    do {
+      const page = await store.detail({ target: 'a', turn_id: 't', item_id: item.id, view: 'output', offset });
+      assert.equal(page.format, 'source');
+      assert.ok(page.text.length <= 16000);
+      assert.doesNotMatch(page.text, /private-input|Command:|Tool:|Input:|Output:/);
+      combined += page.text; pages++;
+      offset = page.next_offset;
+    } while (offset !== null);
+    assert.equal(combined, output); assert.ok(pages > 1);
+  }
+});
+
+test('output-only detail preserves safe binary omission and existing non-tool views', async () => {
+  const { store, client, requests } = fixture();
+  await assert.rejects(store.detail({ target: 'a', turn_id: 't', item_id: 'cmd', view: 'unknown' }), /Invalid detail view/);
+  assert.equal(requests.length, 0);
+  const payload = 'A'.repeat(20000);
+  client.request = async () => ({ data: [{ item: { id: 'tool', type: 'dynamicToolCall', result: { contentItems: [{ type: 'image', data: payload }], structuredContent: { base64: payload } } } }] });
+  const result = await store.detail({ target: 'a', turn_id: 't', item_id: 'tool', view: 'output' });
+  assert.match(result.text, /non-text content omitted/); assert.match(result.text, /binary omitted/); assert.ok(!result.text.includes(payload));
+  client.request = async () => ({ data: [{ item: { id: 'message', type: 'agentMessage', text: 'Ordinary message' } }] });
+  assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'message', view: 'output' }), { text: 'Ordinary message', next_offset: null });
+  client.request = async () => ({ data: [{ item: { id: 'files', type: 'fileChange', changes: [{ path: 'a.js', diff: '@@ -1 +1 @@\n-old\n+new' }] } }] });
+  assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'files', view: 'output', file_path: 'a.js' }), { text: '@@ -1 +1 @@\n-old\n+new', next_offset: null, file_path: 'a.js', format: 'diff' });
 });

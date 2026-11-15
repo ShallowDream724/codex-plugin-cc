@@ -23,8 +23,11 @@ export function runtimeSignature() {
     const runtime = dirname(entry);
     const pkg = JSON.parse(await readFile(join(runtime, '..', 'package.json'), 'utf8'));
     const hash = createHash('sha256');
-    for (const name of (await readdir(runtime)).filter(name => name.endsWith('.mjs')).sort()) {
-      hash.update(name).update(await readFile(join(runtime, name)));
+    for (const folder of ['runtime', 'shared']) {
+      const directory = join(runtime, '..', folder);
+      for (const name of (await readdir(directory)).filter(name => name.endsWith('.mjs')).sort()) {
+        hash.update(`${folder}/${name}`).update(await readFile(join(directory, name)));
+      }
     }
     hash.update(await readFile(join(runtime, '..', 'config', 'guidance.json')));
     hash.update(await readFile(join(runtime, '..', 'config', 'default-agent.toml')));
@@ -53,12 +56,35 @@ async function probe(path) {
 function compatible(probed, signature) {
   if (!probed) return null;
   const metadata = probed.health;
-  if (metadata.protocol !== signature.protocol || metadata.version !== signature.version || metadata.build !== signature.build) {
-    const error = new Error('This session has a helper from a different plugin build. Let its active tasks finish, then shut down or restart the session helper before retrying.');
-    error.code = 'helper_restart_required';
-    throw error;
-  }
+  if (metadata.protocol !== signature.protocol || metadata.version !== signature.version || metadata.build !== signature.build) return null;
   return metadata.ready ? probed.endpoint : null;
+}
+
+const restartRequired = message => Object.assign(new Error(message), { code: 'helper_restart_required' });
+
+async function retireIdleBroker(probed, signature, { directory, deadline, pollMs }) {
+  if (probed.health.protocol !== signature.protocol || !probed.health.capabilities?.includes('idle_shutdown')) {
+    throw restartRequired('This session has an older helper that cannot safely upgrade itself. Let its active tasks finish, then shut down the session helper and retry.');
+  }
+  let stopped = false;
+  while (performance.now() < deadline) {
+    if (!stopped) {
+      const result = await call(probed.endpoint, { operation: 'idle_shutdown' });
+      if (result.reason === 'active') throw restartRequired('This session helper is running active tasks. Let them finish, then retry to upgrade the helper automatically.');
+      if (!result.stopped && result.reason !== 'busy') throw restartRequired('The session helper refused an idle upgrade. Let its active tasks finish, then shut down the session helper and retry.');
+      stopped = result.stopped;
+    } else {
+      // Endpoint deletion alone is insufficient: the old helper may still be
+      // draining a handler. Wait for its independently owned service lock too.
+      const endpoint = await readJson(join(directory, 'endpoint.json'), null);
+      if (endpoint?.token !== probed.endpoint.token) {
+        const released = await acquireOwnedLock(join(directory, 'service'));
+        if (released) { await released.release(); return; }
+      }
+    }
+    await sleep(pollMs);
+  }
+  throw restartRequired('The session helper is still busy or shutting down. Retry after its work finishes.');
 }
 
 export async function ensureBroker(owner, cwd, { directory = ownerDirectory(owner), signature, spawnHelper, timeoutMs = 40000, pollMs = 150 } = {}) {
@@ -76,8 +102,17 @@ export async function ensureBroker(owner, cwd, { directory = ownerDirectory(owne
       // independently prevents duplicate Codex processes if a starter crashes.
       starter ||= await acquireOwnedLock(join(directory, 'starting'));
       if (starter) {
-        const rechecked = compatible(await probe(endpointPath), signature);
+        const probed = await probe(endpointPath);
+        const rechecked = compatible(probed, signature);
         if (rechecked) return rechecked;
+        if (probed && (probed.health.protocol !== signature.protocol || probed.health.version !== signature.version || probed.health.build !== signature.build)) {
+          await retireIdleBroker(probed, signature, { directory, deadline, pollMs });
+        }
+        // A closing helper can stop answering before deleting its endpoint.
+        // Never launch into its still-owned service slot in that gap.
+        const available = await acquireOwnedLock(join(directory, 'service'));
+        if (!available) { await sleep(pollMs); continue; }
+        await available.release();
         if (spawnHelper) await spawnHelper();
         else {
           const child = spawn(process.execPath, [entry, 'serve', owner], {
@@ -188,6 +223,8 @@ export async function serve(owner, { directory = ownerDirectory(owner), clientFa
     assertConnected();
     await writeJson(endpointPath, { port: server.address().port, token, pid: process.pid, ...signature });
     assertConnected();
+    // Host-lease expiry intentionally cleans up owned work after the host is
+    // gone. Build upgrades use the separate, active-work-safe idle_shutdown.
     lease = setInterval(() => { if (idle.expired()) void shutdown().catch(() => exit(1)); }, 10000);
   } catch (error) {
     failure = error;
@@ -209,7 +246,7 @@ export async function main(argv = process.argv.slice(2)) {
   const dir = ownerDirectory(body.owner);
   const existing = await probe(join(dir, 'endpoint.json'));
   let endpoint = body.operation === 'shutdown' ? existing?.endpoint : compatible(existing, await runtimeSignature());
-  if (!endpoint && ['observe', 'ack', 'confirm', 'release', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
+  if (!existing && ['observe', 'ack', 'confirm', 'release', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
   endpoint ||= await ensureBroker(body.owner, body.cwd || process.cwd());
   try { return await call(endpoint, body, body.operation === 'wait' ? 35000 : 150000); }
   catch (error) {
