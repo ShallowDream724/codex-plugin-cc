@@ -25,6 +25,35 @@ test('direct user sends have no parent delivery representation', () => {
   assert.equal(formatDeliveryEvent({ ...original, kind: 'user_action_receipt', quoted_user_message: original.message }), null);
 });
 
+test('compaction status stays out of parent deliveries, including legacy queued events', async () => {
+  for (const channel of ['prompt', 'wait']) {
+    const c = controller(0);
+    c.events = [
+      { seq: 1, agent_id: 'agent', kind: 'compacting' },
+      { seq: 2, agent_id: 'agent', kind: 'compacted' },
+      ...['question', 'approval', 'failed', 'completed', 'message', 'future_event'].map((kind, i) => ({ seq: i + 3, agent_id: 'agent', kind })),
+    ];
+    assert.equal(formatDeliveryEvent(c.events[0]), null);
+    assert.equal(formatDeliveryEvent(c.events[1]), null);
+    const store = new DeliveryStore({ controller: c });
+    const batch = await store.claim({ channel });
+    assert.deepEqual(batch.events.map(e => e.kind), ['question', 'approval', 'failed', 'completed', 'message', 'future_event']);
+    assert.deepEqual(c.events.map(e => e.seq), [3, 4, 5, 6, 7, 8]);
+  }
+});
+
+test('an old lease containing only compaction does not block the next useful notification', async () => {
+  const c = controller(0);
+  c.events = [{ seq: 1, agent_id: 'agent', kind: 'compacting' }];
+  const records = new MemoryReceipts({ old: { status: 'issued', sequences: [1], acknowledged: [] } });
+  const store = new DeliveryStore({ controller: c, records, now: () => 10 });
+  store.lease = { id: 'old', expiresAt: 1000 };
+  assert.deepEqual(await store.claim({ channel: 'prompt' }), { events: [] });
+  assert.equal(store.lease, null); assert.deepEqual(c.events, []);
+  c.events.push({ seq: 2, agent_id: 'agent', kind: 'completed', result: 'done' });
+  assert.deepEqual((await store.claim()).events, c.events);
+});
+
 test('stop receipts distinguish requested, stopped, and unconfirmed without a new task message', () => {
   const base = { seq: 1, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'interrupt', message: 'Stop status detail' };
   for (const [phase, expected] of [['requested', '用户已请求停止 Codex 子代理 worker 及其子代理。'], ['stopping', 'Codex 子代理 worker 及其子代理 正在按用户要求停止。'], ['confirmed', 'Codex 子代理 worker 及其子代理 已按用户要求停止。'], ['unconfirmed', '用户请求停止 Codex 子代理 worker 及其子代理，停止状态未确认。']]) {

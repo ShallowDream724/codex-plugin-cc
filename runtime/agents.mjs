@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 import { prepareAttachments, directUserInput } from './attachments.mjs';
-import { AUTOMATIC_TURN_EVENTS, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
+import { AUTOMATIC_TURN_EVENTS, isCompactionStatus, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const STARTED_TURN_ID = Symbol('startedTurnId');
@@ -1054,7 +1054,7 @@ export class AgentController extends EventEmitter {
 
   publish(a, kind, details) {
     if (isUserSend({ kind, ...details })) return;
-    if (AUTOMATIC_TURN_EVENTS.has(kind) && a.turnOrigin === 'user') { this.persist().then(() => this.emit('state')).catch(() => {}); return; }
+    if (isCompactionStatus({ kind }) || AUTOMATIC_TURN_EVENTS.has(kind) && a.turnOrigin === 'user') { this.persist().then(() => this.emit('state')).catch(() => {}); return; }
     const event = { seq: this.nextSeq++, agent_id: a.id, name: a.name ?? null, turn_id: details.turnId ?? a.turnId ?? a.lastTurnId ?? null, kind, ...details };
     if (AUTOMATIC_TURN_EVENTS.has(kind) && a.pendingUserSteer?.turnId === event.turn_id) {
       a.pendingUserSteer.events.push(event); this.persist().catch(() => {}); return;

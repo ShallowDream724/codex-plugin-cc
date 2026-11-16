@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { DiskReceipts, MemoryReceipts, requestFingerprint } from './receipts.mjs';
 import { readJson, writeJson } from './storage.mjs';
-import { isUserSend, parentDeliveryEvents } from './event-routing.mjs';
+import { isCompactionStatus, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
 
 const INTERNAL_EVENT_FIELDS = new Set(['turn_id', 'turnId', 'thread_id', 'threadId', 'source_thread_id', 'item_id', 'itemId']);
 
@@ -14,9 +14,9 @@ function projectDeliveryEvent(event) {
   return Object.fromEntries(Object.entries(event).filter(([key]) => !INTERNAL_EVENT_FIELDS.has(key)));
 }
 
-// Only user stop facts are parent receipts. Direct conversations stay in Codex.
+// Only user stop facts are parent receipts. Activity and private chats stay in Codex.
 export function formatDeliveryEvent(event) {
-  if (isUserSend(event)) return null;
+  if (isCompactionStatus(event) || isUserSend(event)) return null;
   if (event?.kind !== 'message' || event.origin !== 'user' || event.action !== 'interrupt') return event;
   const { message, ...receipt } = event;
   const target = `Codex 子代理 ${event.name || event.agent_id}`;

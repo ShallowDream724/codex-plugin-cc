@@ -1009,6 +1009,8 @@ test('normal compaction completion clears activity without blocking other agents
     client.note('turn/started', { threadId: 'compaction-child', turn: { id: 'child-turn' } });
     client.note('item/started', { threadId: root.thread_id, turnId: root.turn_id, item: { type: 'contextCompaction', id: 'normal-compact' } });
     assert.equal(controller.find(root.id).activity, 'compacting context');
+    assert.equal(controller.hasParentWork(), true);
+    assert.deepEqual(controller.eventsAfter(), []);
     const steered = await controller.dispatch('send_message', { target: other.id, message: 'Continue the independent task' });
     assert.equal(steered.status, 'steered'); assert.equal(client.calls.at(-1).params.threadId, other.thread_id);
     client.ask('child-during-compaction', 'item/tool/requestUserInput', pendingQuestion('compaction-child', 'child-turn')); await tick();
@@ -1017,6 +1019,7 @@ test('normal compaction completion clears activity without blocking other agents
     assert.equal(client.replies.at(-1).id, 'child-during-compaction');
     client.note(completion, { threadId: root.thread_id, turnId: root.turn_id, item: { type: 'contextCompaction', id: 'normal-compact' } });
     assert.equal(controller.find(root.id).activity, 'working');
+    assert.equal(controller.eventsAfter().some(e => ['compacting', 'compacted'].includes(e.kind)), false);
     assert.equal(controller.find(other.id).status, 'running');
     assert.equal(controller.descendantTurns.get('compaction-child'), 'child-turn');
     client.complete(other.thread_id, other.turn_id); client.complete('compaction-child', 'child-turn');
@@ -1053,7 +1056,7 @@ test('true overflow compacts after failed turn, waits for compaction turn, and r
   assert.doesNotMatch(client.calls.at(-1).params.input[0].text, /Solve task/);
   client.complete('thread-1', 'turn-2', 'failed', { message: 'Still too long', codexErrorInfo: 'contextWindowExceeded' }); await tick();
   assert.equal(client.calls.filter((c) => c.method === 'thread/compact/start').length, 1);
-  assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'compacting').length, 1);
+  assert.equal(controller.eventsAfter(0).filter((e) => e.kind === 'compacting').length, 0);
   assert.equal(controller.eventsAfter(0).at(-1).kind, 'failed');
 });
 
@@ -1246,10 +1249,15 @@ test('failed subscription restoration remains unconfirmed and reports recovery',
   assert.match(controller.eventsAfter(0).find(e => e.code === 'subscription_restore_failed').message, /resume failed/);
 });
 
-test('automatic compaction emits once per item without claiming an overflow', async (t) => {
-  const { client, controller, spawn } = await setup(t); await spawn();
+test('automatic compaction updates local state without publishing parent events or claiming overflow', async (t) => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  const published = []; controller.on('event', e => published.push(e));
   for (const method of ['item/started', 'item/completed']) client.note(method, { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'auto', type: 'contextCompaction' } });
-  assert.equal(controller.eventsAfter(0).length, 1); assert.equal(controller.eventsAfter(0)[0].reason, undefined);
+  await tick();
+  assert.deepEqual(controller.eventsAfter(0), []); assert.deepEqual(published, []);
+  assert.equal(controller.find(agent.id).activity, 'working');
+  assert.equal(Boolean(controller.find(agent.id).overflow), false);
+  assert.equal(controller.hasParentWork(), true);
 });
 
 test('models use pagination and actual catalog effort IDs', async (t) => {

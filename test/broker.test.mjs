@@ -148,6 +148,25 @@ test('waiting wakes on an important event and observation cannot steal it', asyn
   assert.deepEqual(controller.acks, [[1]]);
 });
 
+test('compaction alone does not prompt Claude or finish its wait, but a question still does', async t => {
+  const { controller, post } = await setup(t, { waitTimeoutMs: 1000 });
+  controller.status = 'compacting';
+  controller.publish('compacting');
+  const observed = (await post({ operation: 'observe', args: { deliver: true } })).body;
+  assert.deepEqual(observed.events, []); assert.equal(observed.delivery_id, undefined);
+  assert.equal(observed.agents[0].status, 'compacting');
+  let finished = false;
+  const waiting = post({ operation: 'wait' }).then(value => { finished = true; return value; });
+  while (!controller.listenerCount('state')) await new Promise(resolve => setImmediate(resolve));
+  controller.publish('compacting');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(finished, false);
+  controller.publish('question');
+  const result = (await waiting).body;
+  assert.deepEqual(result.events.map(e => e.kind), ['question']);
+  assert.ok(result.delivery_id);
+});
+
 test('wait wakes when the last matching descendant turn completes', async t => {
   class Client extends EventEmitter {
     async request(method, params) {
