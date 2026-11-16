@@ -2,7 +2,7 @@
 
 在 Claude Code 中调用 Codex 子代理执行任务，并在侧栏查看消息、工具调用和文件修改。支持继续原对话、直接给子代理发消息、等待答复和停止任务。
 
-仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件位于 **[feat/codex-subagents 分支](https://github.com/ShallowDream724/codex-plugin-cc/tree/feat/codex-subagents)**；分享和安装时请使用这个分支，默认 `main` 是上游项目。
+仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
 当前版本为 **0.2.0-rc.12（候选测试版）**。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
@@ -32,7 +32,7 @@ VS Code 扩展绘制面板需 **2.1.299+**；不获取功能开关的会话（�
 在 Claude Code 对话中依次执行以下两条命令（不是在系统终端执行）：
 
 ```text
-/plugin marketplace add ShallowDream724/codex-plugin-cc#feat/codex-subagents
+/plugin marketplace add ShallowDream724/codex-plugin-cc
 /plugin install codex-subagents@codex-subagents
 ```
 
@@ -54,10 +54,10 @@ VS Code 扩展绘制面板需 **2.1.299+**；不获取功能开关的会话（�
 - 在侧栏直接发消息：运行中指导当前轮，空闲时继续原对话。
 - 输入 `/codex-stop` 立即停止当前 Claude 会话的全部 Codex 代理及其后代；Claude 自己的停止按钮保持原行为。
 
-已安装用户可在系统终端更新：
+已安装用户可在系统终端更新。第一条命令也会将此前指定的 `feat/codex-subagents` 来源切换到默认分支，无须卸载插件：
 
 ```bash
-claude plugin marketplace update codex-subagents
+claude plugin marketplace add ShallowDream724/codex-plugin-cc
 claude plugin update codex-subagents@codex-subagents
 ```
 
