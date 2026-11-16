@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFileSync, unlinkSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { ActivityStore } from '../runtime/activity.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { toolSections, communicationFailure } from '../hooks/tool-presentation.js';
@@ -19,6 +21,112 @@ function fixture() {
   };
   return { client, controller, requests, store: ActivityStore.attach(client, controller) };
 }
+
+test('message metadata survives previews and requires evidence for a final reply', async () => {
+  const { client, store } = fixture();
+  const emit = (method, params) => client.emit('notification', { method, params: { threadId: 'root', turnId: 'turn', ...params } });
+  emit('item/completed', { item: { id: 'c', type: 'agentMessage', text: 'x'.repeat(10000), phase: 'commentary' } });
+  let entry = store.revision({ target: 'a' }).entries[0];
+  assert.deepEqual(entry.message, { phase: 'commentary', complete: true, truncated: true, is_final: false });
+  emit('item/completed', { item: { id: 'p', type: 'agentMessage', text: 'partial', phase: 'partial_answer' } });
+  emit('turn/completed', { turn: { id: 'turn', status: 'completed' } });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, false);
+  emit('item/completed', { item: { id: 'f', type: 'agentMessage', text: 'ok', phase: 'final_answer' } });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, true);
+  store.close();
+});
+
+test('legacy final inference requires a completed turn and its last message', async () => {
+  const { client, store } = fixture();
+  let status = 'inProgress';
+  client.request = async (method) => method === 'thread/turns/list' ? { data: [{ id: 'turn', status }], nextCursor: null } : { data: [
+    { item: { id: 'last', type: 'agentMessage', text: 'answer' } },
+    { item: { id: 'old', type: 'agentMessage', text: 'old' } },
+  ], nextCursor: null };
+  assert.equal((await store.history({ target: 'a' })).entries.at(-1).message.is_final, false);
+  status = 'completed';
+  const entries = (await store.history({ target: 'a' })).entries;
+  assert.equal(entries[0].message.is_final, false); assert.equal(entries[1].message.is_final, true);
+  const emit = (method, params) => client.emit('notification', { method, params: { threadId: 'root', turnId: 'live', ...params } });
+  emit('item/completed', { item: { id: 'live-last', type: 'agentMessage', text: 'legacy' } });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, false);
+  emit('turn/completed', { turn: { id: 'live', status: 'completed' } });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, true);
+  store.close();
+});
+
+test('message detail returns original text across Unicode boundaries and rejects tools', async () => {
+  const { client, store } = fixture();
+  const text = 'x'.repeat(15999) + '😀' + ' tail\n';
+  client.request = async () => ({ data: [{ turnId: 'turn', item: { id: 'reply', type: 'agentMessage', text } }] });
+  const first = await store.detail({ target: 'a', turn_id: 'turn', item_id: 'reply', view: 'message' });
+  const second = await store.detail({ target: 'a', turn_id: 'turn', item_id: 'reply', view: 'message', offset: first.next_offset });
+  assert.equal(first.text + second.text, text); assert.equal(first.total_length, text.length); assert.equal(second.next_offset, null);
+  client.request = async () => ({ data: [{ turnId: 'turn', item: { id: 'reply', type: 'mcpToolCall', result: 'secret' } }] });
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 'turn', item_id: 'reply', view: 'message' }), /unavailable/);
+  store.close();
+});
+
+test('bulk message and communication pages preserve long text within the process output limit', async () => {
+  const { client, store } = fixture();
+  const text = '\u0000'.repeat(524287) + '😀' + '\u0000'.repeat(524300);
+  let calls = 0, type = 'agentMessage';
+  client.request = async () => {
+    calls++;
+    return { data: [{ turnId: 'turn', item: type === 'agentMessage'
+      ? { id: 'body', type, text }
+      : { id: 'body', type: 'dynamicToolCall', tool: 'notify_parent', arguments: { message: text } } }] };
+  };
+  for (const view of ['message', 'communication']) {
+    type = view === 'message' ? 'agentMessage' : 'dynamicToolCall';
+    const args = { target: 'a', turn_id: 'turn', item_id: 'body', view, bulk: true };
+    let offset = 0, assembled = '', pages = 0;
+    do {
+      const page = await store.detail({ ...args, offset });
+      assert.ok(Buffer.byteLength(JSON.stringify(page), 'utf8') < 4 * 1024 * 1024);
+      assembled += page.text; offset = page.next_offset; pages++;
+    } while (offset !== null);
+    assert.equal(assembled, text); assert.equal(pages, 3);
+  }
+  const before = calls;
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 'turn', item_id: 'body', view: 'output', bulk: true }), /Invalid bulk/);
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 'turn', item_id: 'body', view: 'message', bulk: false }), /Invalid bulk/);
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 'turn', item_id: 'body', view: 'communication', bulk: true, export: true }), /Invalid bulk/);
+  assert.equal(calls, before);
+  await store.close();
+});
+
+test('communication export creates a reusable complete owned Markdown snapshot', async () => {
+  const { client, store } = fixture();
+  const text = '# Message\n' + 'long😀'.repeat(30000);
+  client.request = async () => ({ data: [{ turnId: 'turn', item: { id: 'msg', type: 'dynamicToolCall', tool: 'notify_parent', arguments: { message: text } } }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: 'msg', view: 'communication', export: true };
+  const [first, second] = await Promise.all([store.detail(args), store.detail(args)]);
+  assert.deepEqual(second, first); assert.equal(fileURLToPath(first.file_url), first.file_path);
+  assert.equal(readFileSync(first.file_path, 'utf8'), text);
+  unlinkSync(first.file_path);
+  assert.deepEqual(await store.detail(args), first);
+  assert.equal(readFileSync(first.file_path, 'utf8'), text);
+  await assert.rejects(() => store.detail({ ...args, item_id: 'foreign' }), /unavailable/);
+  await assert.rejects(() => store.detail({ ...args, target: 'foreign' }), /Unknown/);
+  let requests = 0;
+  client.request = async () => { requests++; throw new Error('unexpected RPC'); };
+  await assert.rejects(() => store.detail({ ...args, offset: 1 }), /Invalid export/);
+  await assert.rejects(() => store.detail({ ...args, file_path: 'other' }), /Invalid export/);
+  assert.equal(requests, 0);
+  await store.close();
+});
+
+test('closing an activity store rejects queued exports and waits for cleanup', async () => {
+  const { store } = fixture();
+  let release;
+  store.exportQueue = new Promise(resolve => { release = resolve; });
+  const result = assert.rejects(store.exportCommunication('message'), /closed/);
+  const closed = store.close();
+  release();
+  await result; await closed;
+  assert.equal(store.exportDir, null);
+});
 
 test('activity summaries expose persistent context origins without guessing missing metadata', () => {
   const { controller, store } = fixture();
@@ -461,7 +569,7 @@ test('native communication exposes only the direct sender message', async () => 
   assert.equal(entries[5].communication.text, '简短消息');
   assert.ok(!JSON.stringify(entries[0]).includes('private descendant output'));
   client.request = async () => ({ data: [{ item }] });
-  assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'native', view: 'communication' }), { text: item.prompt, next_offset: null, format: 'markdown' });
+  assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'native', view: 'communication' }), { text: item.prompt, next_offset: null, format: 'markdown', total_length: item.prompt.length });
   store.close();
 });
 

@@ -12,6 +12,11 @@ const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
 let paneRevision = 0;
 const MAX_DETAILS = 16;
 const VISIBLE_ENTRIES = 500;
+const INLINE_COMMUNICATION_LIMIT = 48000;
+const MAX_COPY_LENGTH = 16 * 1024 * 1024;
+const MAX_COPY_PAGES = 1100;
+const refreshIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9a7 7 0 0 1 12-2L20 12M4 12l2.5 5a7 7 0 0 0 12-2"/></svg>';
+let copyIntent = 0;
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
 const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
@@ -451,6 +456,12 @@ async function chooseAttachments($, id, source = 'file') {
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false, view) {
     const page = pageFor(id), key = detailKey(entry, filePath, view), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailSequence;
+    const snapshot = page.details.get(key);
+    if (view === 'communication') {
+      const cached = snapshot, shown = cached?.error ? cached.previous : cached;
+      const expected = cached?.error ? cached.offset : shown ? shown.next_offset : 0;
+      if (page.detailRequests.has(key) || expected == null || offset !== expected || shown?.external) return;
+    }
     page.detailRequests.set(key, request);
     while (page.detailRequests.size > MAX_DETAILS) page.detailRequests.delete(page.detailRequests.keys().next().value);
     const fetch = async () => {
@@ -459,13 +470,53 @@ async function chooseAttachments($, id, source = 'file') {
       if (request !== page.detailRequests.get(key)) return;
       page.detailRequests.delete(key);
       if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
-      if (result.error || result.offline) cacheDetail(page, key, { text: `无法读取内容：${failureText(result)}`, error: true, next_offset: null, offset, ...(view === 'communication' ? { previous: page.details.get(key)?.previous ?? page.details.get(key) } : {}) });
-      else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
+      const previous = view === 'communication' ? snapshot : page.details.get(key);
+      if (result.error || result.offline || (result.next_offset != null && (!Number.isInteger(result.next_offset) || result.next_offset <= offset))) cacheDetail(page, key, { text: `无法读取内容：${result.error || result.offline ? failureText(result) : '读取位置未推进'}`, error: true, next_offset: null, offset, ...(view === 'communication' ? { previous: previous?.previous ?? previous } : {}) });
+      else if (view === 'communication') {
+        const text = (offset ? (previous?.error ? previous.previous?.text : previous?.text) || '' : '') + (result.text || '');
+        const end = /[\uD800-\uDBFF]/.test(text[INLINE_COMMUNICATION_LIMIT - 1] || '') ? INLINE_COMMUNICATION_LIMIT - 1 : INLINE_COMMUNICATION_LIMIT;
+        cacheDetail(page, key, { text: text.slice(0, end), next_offset: result.next_offset, offset, format: result.format, external: text.length > INLINE_COMMUNICATION_LIMIT || (result.next_offset != null && text.length >= INLINE_COMMUNICATION_LIMIT) });
+      } else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
       await invalidate($);
     };
     if (background) $.clock.after(0, fetch);
     await invalidate($);
     if (!background) await fetch();
+  }
+  async function copyMessage($, id, entry, surface, view = 'message') {
+    const page = pageFor(id), gen = state.generation, intent = ++copyIntent, key = entryKey(entry);
+    const valid = () => intent === copyIntent && state.opened && state.selected === id && state.generation === gen;
+    try {
+      let text = view === 'communication' ? entry.communication.text : body(entry);
+      if (view === 'communication' ? entry.communication.truncated : entry.message?.truncated) {
+        text = ''; let offset = 0, pages = 0;
+        while (true) {
+          if (++pages > MAX_COPY_PAGES) throw new Error('正文超过复制大小限制');
+          const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view, offset, bulk: true });
+          if (!valid()) return;
+          if (result.error || result.offline || typeof result.text !== 'string') throw new Error(failureText(result));
+          text += result.text;
+          if (text.length > MAX_COPY_LENGTH || (Number.isFinite(result.total_length) && result.total_length > MAX_COPY_LENGTH)) throw new Error('正文超过复制大小限制');
+          if (result.next_offset == null) break;
+          if (!Number.isSafeInteger(result.next_offset) || result.next_offset <= offset) throw new Error('读取位置未推进');
+          offset = result.next_offset;
+        }
+      }
+      if (!valid()) return;
+      const result = await $.ui.copy({ text, surface });
+      if (result?.isCopied === false) throw new Error(result.reason || '剪贴板未接受内容');
+      if (valid()) { page.copyError = null; await invalidate($); }
+    } catch (error) { if (valid()) { page.copyError = { key, text: `复制失败：${failureText(error)}` }; await invalidate($); } }
+  }
+  async function exportCommunication($, id, entry, foldKey) {
+    const page = pageFor(id), key = detailKey(entry, undefined, 'communication'), gen = state.generation, snapshot = page.details.get(key);
+    try {
+      const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view: 'communication', export: true });
+      if (!state.opened || state.selected !== id || state.generation !== gen || !state.folds.has(foldKey)) return;
+      if (result.error || result.offline || typeof result.file_url !== 'string') throw new Error(failureText(result));
+      cacheDetail(page, key, { ...(page.details.get(key) ?? snapshot), file_url: result.file_url, exportError: '' });
+    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && state.folds.has(foldKey)) cacheDetail(page, key, { ...(page.details.get(key) ?? snapshot), exportError: `无法打开完整正文：${failureText(error)}` }); }
+    if (state.opened && state.selected === id && state.generation === gen) await invalidate($);
   }
 export function registerUI(on) {
   on('command.run', { command: 'codex-stop' }, async ($) => stopAllAgents($));
@@ -646,7 +697,13 @@ function renderPane($, e, next, attempt = {}) {
           if (['userMessage', 'parentMessage'].includes(entry.type)) message.push(caption(`author_${key}`, 'Claude'));
           const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
           const text = safe(loaded?.text ?? body(entry));
-          message.push(incoming ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: e.surface === 'desktop' ? normalizeDisplayMath(text) : text }));
+          message.push(entry.type === 'directUserMessage' ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: e.surface === 'desktop' ? normalizeDisplayMath(text) : text }));
+          if (entry.type === 'agentMessage' && entry.message?.is_final) {
+            const copy = (press = {}) => copyMessage($, id, entry, press.surface ?? e.surface);
+            const action = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function' ? hint(`message_copy_hint_${key}`, iconButton(`message_copy_${key}`, { source: copyIcon, label: '复制回复', size: 14, onPress: copy }), '复制回复', 12, -10) : Button({ key: `message_copy_${key}`, plain: true, label: '⧉', onPress: copy });
+            message.push(Box({ key: `message_actions_${key}`, flexDirection: 'row', justifyContent: 'flex-start', children: [action] }));
+            if (page.copyError?.key === entryKey(entry)) message.push(caption(`message_copy_error_${key}`, page.copyError.text));
+          }
           const attachments = Array.isArray(entry.data?.attachments) ? entry.data.attachments : Array.isArray(entry.data?.content) ? entry.data.content.filter((part) => ['localImage', 'mention'].includes(part?.type)) : [];
           if (attachments.length) message.push(caption(`attachments_${key}`, attachments.map((part) => `附件：${part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件'}`).join('  ')));
           if (loaded?.offset > 0) message.push(disclosure(`message_prev_${key}`, '上一页正文', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
@@ -693,21 +750,22 @@ function renderPane($, e, next, attempt = {}) {
         const toolStart = itemRows.length;
         if (entry.communication && typeof entry.communication.text === 'string') {
           const view = 'communication', cacheKey = detailKey(entry, undefined, view);
-          const load = (offset, background = false) => detail($, id, entry, offset, key, undefined, background, view);
+          const load = (offset) => detail($, id, entry, offset, key, undefined, false, view);
           itemRows.push(disclosure(`item_${key}`, safe(description(entry)).slice(0, 120), async () => {
             toggle(key);
             if (expanded) page.detailRequests.delete(cacheKey);
-            else if (entry.communication.truncated && !detailFor(page, entry, undefined, view)) return load(0, true);
             await invalidate($);
           }, entry, false, expanded));
           if (expanded) {
             const loaded = detailFor(page, entry, undefined, view), shown = loaded?.error ? loaded.previous : loaded;
             const text = safe(shown?.text ?? entry.communication.text);
-            const markdown = shown ? shown.format === 'markdown' : !entry.communication.truncated;
+            const markdown = shown ? shown.next_offset == null && !shown.external : !entry.communication.truncated;
             const contents = [markdown ? Markdown({ key: `communication_${key}`, text: e.surface === 'desktop' ? normalizeDisplayMath(text) : text }) : Text({ key: `communication_${key}`, size: 'body', children: [text] })];
             const failure = communicationFailure(entry);
             if (failure) contents.push(caption(`communication_failure_${key}`, `发送异常：${failure}`));
             if (loaded?.error) contents.push(caption(`communication_error_${key}`, loaded.text));
+            if (shown?.exportError) contents.push(caption(`communication_export_error_${key}`, shown.exportError));
+            if (page.copyError?.key === entryKey(entry)) contents.push(caption(`communication_copy_error_${key}`, page.copyError.text));
             const rawKey = `${key}:raw`, sections = toolSections(entry);
             if (sections.length) {
               contents.push(Box({ key: `tool_raw_row_${key}`, flexDirection: 'row', children: [hint(`tool_raw_hover_${key}`, disclosure(`tool_raw_${key}`, '‹/›', () => { toggle(rawKey); return invalidate($); }), state.folds.has(rawKey) ? '收起原始调用' : '显示原始调用', 16)] }));
@@ -715,8 +773,16 @@ function renderPane($, e, next, attempt = {}) {
             }
             itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: contents }));
             const loading = page.detailRequests.has(cacheKey);
-            if (!loading && shown?.offset > 0) itemRows.push(disclosure(`communication_prev_${key}`, '上一页正文', () => load(Math.max(0, shown.offset - 16000))));
-            if (!loading && (loaded?.error || shown?.next_offset != null)) itemRows.push(disclosure(`communication_detail_${key}`, loaded?.error ? '重试读取正文' : '下一页正文', () => load(loaded?.error ? loaded.offset : shown.next_offset)));
+            if (!loading && !shown?.external && (loaded?.error || (!shown && entry.communication.truncated) || shown?.next_offset != null)) itemRows.push(disclosure(`communication_detail_${key}`, loaded?.error ? '重试读取正文' : shown ? '继续展开' : '展开全文', () => load(loaded?.error ? loaded.offset : shown?.next_offset ?? 0)));
+            if (shown?.external) {
+              if (shown.file_url) {
+                const refresh = () => exportCommunication($, id, entry, key);
+                const refreshControl = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function' ? hint(`communication_refresh_hint_${key}`, iconButton(`communication_refresh_${key}`, { source: refreshIcon, label: '重新生成完整正文', onPress: refresh }), '重新生成完整正文', 22, -10) : Button({ key: `communication_refresh_${key}`, plain: true, label: '↻', onPress: refresh });
+                itemRows.push(Box({ key: `communication_link_row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [Markdown({ key: `communication_link_${key}`, text: `[打开完整正文](${shown.file_url})` }), refreshControl] }));
+              }
+              else itemRows.push(disclosure(`communication_export_${key}`, '打开完整正文', () => exportCommunication($, id, entry, key)));
+              itemRows.push(disclosure(`communication_copy_${key}`, '复制完整正文', () => copyMessage($, id, entry, e.surface, 'communication')));
+            }
           }
           itemRows.push(Box({ key: `tool_entry_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.5 : 'sm', children: itemRows.splice(toolStart) }));
           continue;

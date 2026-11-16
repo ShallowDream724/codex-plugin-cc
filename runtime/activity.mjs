@@ -3,6 +3,11 @@
 import { toolOutputText } from '../shared/tool-output.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { communication, safeBoundary } from '../shared/communication.mjs';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdtemp, writeFile, rename, unlink, rmdir, access } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
@@ -115,7 +120,9 @@ const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) 
   const end = message ? Math.min(message.text.length, 2048) : 0;
   const safeEnd = message && end < message.text.length && safeBoundary(message.text, end) !== end ? end - 1 : end;
   const communicationPreview = message && { title: message.title, text: message.text.slice(0, safeEnd), truncated: safeEnd < message.text.length };
-  return { ...(communicationPreview ? { communication: communicationPreview } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
+  const phase = ['final_answer', 'commentary', 'partial_answer'].includes(item.phase) ? item.phase : null;
+  const messageMeta = item.type === 'agentMessage' ? { phase, complete: stage === 'completed', truncated: typeof item.text === 'string' && data.text !== item.text, is_final: phase === 'final_answer' && stage === 'completed' } : null;
+  return { ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
@@ -146,7 +153,8 @@ export class ActivityStore {
   static attach(client, controller) { return new ActivityStore({ client, controller }); }
   constructor({ client, controller }) {
     this.client = client; this.controller = controller; this.live = new Map(); this.nextRevision = 1;
-    this.agentNames = new Map(); this.turnStates = new Map();
+    this.agentNames = new Map(); this.turnStates = new Map(); this.lastMessages = new Map();
+    this.exportDir = null; this.exports = new Map(); this.exportQueue = Promise.resolve(); this.closed = false;
     this.notification = (message) => this.observe(message);
     this.action = (action) => this.recordAction(action);
     client.on('notification', this.notification);
@@ -156,7 +164,50 @@ export class ActivityStore {
     this.client.off('notification', this.notification);
     this.controller.off('agentAction', this.action);
     this.live.clear();
-    this.agentNames.clear(); this.turnStates.clear();
+    this.agentNames.clear(); this.turnStates.clear(); this.lastMessages.clear();
+    this.closed = true;
+    // Serialize cleanup behind in-flight writes; close remains safe for callers
+    // that do not await it, and only files created by this store are removed.
+    const cleanup = this.exportQueue.then(async () => {
+      for (const file of this.exports.values()) { try { await unlink(file); } catch { /* Best effort for files currently in use. */ } }
+      if (this.exportDir) { try { await rmdir(this.exportDir); } catch { /* Never remove unknown files. */ } }
+      this.exports.clear(); this.exportDir = null;
+    });
+    this.exportQueue = cleanup.catch(() => {});
+    return cleanup;
+  }
+  exportCommunication(text) {
+    // A single queue prevents eviction, recreation and close from racing with
+    // each other, including simultaneous requests for the same content.
+    const operation = this.exportQueue.then(async () => {
+      if (this.closed) throw new Error('Activity store is closed.');
+      if (!this.exportDir) this.exportDir = await mkdtemp(join(tmpdir(), 'codex-subagents-display-'));
+      if (this.closed) throw new Error('Activity store is closed.');
+      const hash = createHash('sha256').update(text).digest('hex');
+      const filePath = join(this.exportDir, `${hash}.md`);
+      let exists = false;
+      if (this.exports.has(hash)) {
+        try { await access(filePath); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      if (!exists) {
+        const temporary = join(this.exportDir, `${randomUUID()}.tmp`);
+        try { await writeFile(temporary, text, { encoding: 'utf8', flag: 'wx' }); await rename(temporary, filePath); }
+        finally { try { await unlink(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+        this.exports.set(hash, filePath);
+      }
+      if (this.closed) throw new Error('Activity store is closed.');
+      // Keep the most recently accessed snapshots, capped at 32 per store.
+      this.exports.delete(hash); this.exports.set(hash, filePath);
+      if (this.exports.size > 32) {
+        const oldest = this.exports.keys().next().value;
+        await unlink(this.exports.get(oldest)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+        this.exports.delete(oldest);
+      }
+      if (this.closed) throw new Error('Activity store is closed.');
+      return { file_path: filePath, file_url: pathToFileURL(filePath).href };
+    });
+    this.exportQueue = operation.catch(() => {});
+    return operation;
   }
   find(target) {
     const agent = this.controller.find(target);
@@ -222,7 +273,14 @@ export class ActivityStore {
       }
       return;
     }
-    if (message.method === 'turn/completed' && p.turn?.id) this.remember(this.turnStates, `${p.threadId}:${p.turn.id}`, p.turn.status);
+    if (message.method === 'turn/completed' && p.turn?.id) {
+      this.remember(this.turnStates, `${p.threadId}:${p.turn.id}`, p.turn.status);
+      if (p.turn.status === 'completed') {
+        const bucket = this.bucket(agent.id);
+        const last = [...bucket.entries].reverse().find(entry => entry.turn_id === p.turn.id && entry.type === 'agentMessage');
+        if (last?.message?.phase === null) this.put(agent, { ...last, message: { ...last.message, complete: true, is_final: true } });
+      }
+    }
     if (message.method === 'thread/compacted') {
       const bucket = this.bucket(agent.id);
       const entry = [...bucket.entries].reverse().find(entry => entry.type === 'contextCompaction' && (!p.turnId || entry.turn_id === p.turnId));
@@ -234,7 +292,9 @@ export class ActivityStore {
       const isCommand = message.method === 'item/commandExecution/outputDelta';
       const field = isCommand ? 'aggregatedOutput' : 'text';
       const text = (old?.data?.[field] ?? '') + p.delta;
-      this.put(agent, simplify({ ...old?.data, id: p.itemId, type: isCommand ? 'commandExecution' : 'agentMessage', [field]: text }, p.turnId));
+      const entry = simplify({ ...old?.data, ...(old?.message?.phase ? { phase: old.message.phase } : {}), id: p.itemId, type: isCommand ? 'commandExecution' : 'agentMessage', [field]: text }, p.turnId);
+      if (entry.message && old?.message?.truncated) entry.message.truncated = true;
+      this.put(agent, entry);
     }
   }
   revision({ target, revision } = {}) {
@@ -273,11 +333,21 @@ export class ActivityStore {
         else if (!turnsCursor) done = true;
         continue;
       }
+      const firstItemsPage = !itemsCursor;
       const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit: limit - entries.length, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
       requests++;
       if ((page.data?.length ?? 0) > limit - entries.length) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
-      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry), entry.startedAtMs ?? entry.item.startedAtMs, agent.threadId)));
+      if (firstItemsPage) this.remember(this.lastMessages, `${agent.threadId}:${turnId}`, null);
+      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => {
+        const actualTurn = entry.turnId ?? turnId, key = `${agent.threadId}:${actualTurn}`;
+        const result = simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), actualTurn, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, actualTurn, entry), entry.startedAtMs ?? entry.item.startedAtMs, agent.threadId);
+        if (result.message) {
+          if (this.lastMessages.has(key) && this.lastMessages.get(key) === null) this.remember(this.lastMessages, key, result.id);
+          if (result.message.phase === null && this.turnStates.get(key) === 'completed' && this.lastMessages.get(key) === result.id) result.message.is_final = true;
+        }
+        return result;
+      }));
       if (!itemsCursor) {
         turnId = null; seenItems = new Set();
         if (!turnsCursor) done = true;
@@ -286,12 +356,16 @@ export class ActivityStore {
     const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
     return { agent: this.summary(agent), entries: orderWaits(entries.reverse()), next_cursor };
   }
-  async detail({ target, turn_id, item_id, offset = 0, file_path, view } = {}) {
+  async detail({ target, turn_id, item_id, offset = 0, file_path, view, export: exportMessage, bulk } = {}) {
     const agent = this.find(target);
     if (typeof turn_id !== 'string' || !turn_id || typeof item_id !== 'string' || !item_id) throw new TypeError('turn_id and item_id are required.');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid detail offset.');
     if (file_path !== undefined && (typeof file_path !== 'string' || !file_path)) throw new TypeError('Invalid file path.');
-    if (view !== undefined && view !== 'output' && view !== 'communication') throw new TypeError('Invalid detail view.');
+    if (view !== undefined && view !== 'output' && view !== 'communication' && view !== 'message') throw new TypeError('Invalid detail view.');
+    if (exportMessage !== undefined && (view !== 'communication' || exportMessage !== true)) throw new TypeError('Invalid export request.');
+    if (bulk !== undefined && (bulk !== true || !['message', 'communication'].includes(view) || exportMessage)) throw new TypeError('Invalid bulk request.');
+    if (exportMessage && (file_path !== undefined || offset !== 0)) throw new TypeError('Invalid export request.');
+    const pageSize = bulk ? 524288 : 16000;
     const page = await this.client.request('thread/items/read', { threadId: agent.threadId, turnId: turn_id, itemIds: [item_id] });
     const record = page.data?.[0];
     const item = record?.item;
@@ -299,8 +373,15 @@ export class ActivityStore {
       if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id)) throw new Error('Communication item is unavailable.');
       const message = communication(item, agent.threadId);
       if (!message) throw new Error('Communication item is unavailable.');
-      const text = message.text, next_offset = offset + 16000 < text.length ? offset + 16000 : null;
-      return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + 16000)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text' };
+      if (exportMessage) return this.exportCommunication(message.text);
+      const text = message.text, next_offset = offset + pageSize < text.length ? offset + pageSize : null;
+      return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + pageSize)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text', total_length: text.length };
+    }
+    if (view === 'message') {
+      if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id) || !['agentMessage', 'parentMessage', 'directUserMessage', 'userMessage'].includes(item.type)) throw new Error('Message item is unavailable.');
+      const text = formatItem(removeGuidance(item, this.controller.guidance));
+      const next_offset = offset + pageSize < text.length ? offset + pageSize : null;
+      return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + pageSize)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text', total_length: text.length };
     }
     if (!visible(item)) return { text: '', next_offset: null };
     const change = file_path !== undefined && item.type === 'fileChange' ? item.changes?.find(change => change.path === file_path) : null;

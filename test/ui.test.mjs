@@ -471,7 +471,8 @@ test('communication expansion shows readable messages while keeping raw calls se
   assert.ok(!tree.some(n => n.props.key === 'communication_error_a:t:failed'));
   await click('item_a:t:long');
   assert.ok(nodes(await draw()).some(n => n.type === 'Text' && n.props.children?.[0] === '预览\n内容'));
-  await afters.shift()();
+  assert.equal(calls.length, 0);
+  await click('communication_detail_a:t:long');
   assert.deepEqual(calls.map(c => [c.view, c.offset]), [['communication', 0]]);
   assert.ok(nodes(await draw()).some(n => n.type === 'Text' && n.props.children?.[0] === '第一页\n正文'));
   fail = true; await click('communication_detail_a:t:long');
@@ -480,13 +481,155 @@ test('communication expansion shows readable messages while keeping raw calls se
   assert.ok(tree.some(n => n.props.key === 'communication_error_a:t:long'));
   fail = false; await click('communication_detail_a:t:long');
   assert.equal(calls.at(-1).offset, 16000);
-  assert.ok(nodes(await draw()).some(n => n.type === 'Text' && n.props.children?.[0] === '第二页\n正文'));
+  assert.ok(nodes(await draw()).some(n => n.type === 'Markdown' && n.props.text === '第一页\n正文第二页\n正文'));
   await click('item_a:t:long'); await click('item_a:t:long');
   assert.equal(afters.length, 0, 'reopening uses the communication cache');
-  await click('communication_prev_a:t:long');
-  assert.equal(calls.at(-1).offset, 0);
+  assert.ok(!nodes(await draw()).some(n => /上一页正文|下一页正文/.test(n.props.label || '')));
   await click('item_a:t:unknown');
   assert.ok(nodes(await draw()).some(n => n.type === 'Code' && n.props.source === 'generic output'));
+});
+
+test('final response copy retrieves raw pages and ignores commentary and stale requests', async (t) => {
+  const hooks = [], copied = [], calls = []; let deferred;
+  const entries = [
+    { id: 'comment', turn_id: 't', type: 'agentMessage', data: { text: 'thinking' }, message: { is_final: false } },
+    { id: 'tool', turn_id: 't', type: 'commandExecution', data: { command: 'test' } },
+    { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } },
+  ];
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => { copied.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: args.target === 'a' ? entries : [] };
+    if (op === 'ui_detail') { calls.push(args); if (deferred) return new Promise(resolve => { deferred.resolve = resolve; }); return args.offset ? { text: '\\[raw\\]', next_offset: null } : { text: '**full**\r\n', next_offset: 524288 }; }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null);
+  let tree = nodes(await draw());
+  assert.deepEqual(tree.filter(n => n.props.key?.startsWith('message_copy_')).map(n => n.props.key), ['message_copy_a:t:final']);
+  await tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  assert.deepEqual(copied, ['**full**\r\n\\[raw\\]']);
+  assert.deepEqual(calls.map(c => [c.view, c.offset, c.bulk]), [['message', 0, true], ['message', 524288, true]]);
+  deferred = {}; const pending = tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  await new Promise(setImmediate); await openAgent($, 'b'); deferred.resolve({ text: 'stale', next_offset: null }); await pending;
+  assert.equal(copied.length, 1);
+});
+
+test('copy reports stalled cursors without writing to clipboard', async (t) => {
+  const hooks = [], copied = [];
+  const entry = { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => copied.push(value), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : op === 'ui_detail' ? { text: 'part', next_offset: 0 } : { entries: [], next_cursor: null });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
+  (await draw()).find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  await new Promise(setImmediate);
+  assert.equal(copied.length, 0);
+  assert.match((await draw()).find(n => n.props.key === 'message_copy_error_a:t:final').props.children[0], /复制失败.*未推进/);
+});
+
+test('copy reports a rejected clipboard result', async (t) => {
+  const hooks = [];
+  const entry = { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'answer' }, message: { is_final: true, truncated: false } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async () => ({ isCopied: false, reason: 'clipboard unavailable' }), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : { entries: [], next_cursor: null });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
+  await (await draw()).find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  assert.match((await draw()).find(n => n.props.key === 'message_copy_error_a:t:final').props.children[0], /复制失败.*clipboard unavailable/);
+});
+
+test('copy immediately preserves short raw text and stops an unending sequence', async (t) => {
+  const hooks = [], copied = []; let reads = 0;
+  const entries = [{ id: 'short', turn_id: 't', type: 'agentMessage', data: { text: '**raw**\r\n\\[x\\]' }, message: { is_final: true, truncated: false } }, { id: 'long', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } }];
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => { copied.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries } : op === 'ui_detail' ? (reads++, { text: 'x', next_offset: args.offset + 1 }) : { entries: [], next_cursor: null });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
+  let tree = await draw(); await tree.find(n => n.props.key === 'message_copy_a:t:short').props.onPress();
+  assert.deepEqual(copied, ['**raw**\r\n\\[x\\]']); assert.equal(reads, 0);
+  assert.equal(tree.find(n => n.props.key === 'message_actions_a:t:short').props.justifyContent, 'flex-start');
+  await tree.find(n => n.props.key === 'message_copy_a:t:long').props.onPress();
+  tree = await draw(); assert.equal(reads, 1100); assert.equal(copied.length, 1);
+  assert.match(tree.find(n => n.props.key === 'message_copy_error_a:t:long').props.children[0], /复制大小限制/);
+});
+
+test('communication ignores duplicate in-flight and stale loads and renders complete rich text', async (t) => {
+  const hooks = [], calls = []; let resolveDetail;
+  const entry = { id: 'comm', turn_id: 't', type: 'collabToolCall', communication: { title: '发送', text: 'preview', truncated: true }, data: { tool: 'sendMessage' } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [entry] };
+    if (op === 'ui_detail') { calls.push(args.offset); return new Promise(resolve => { resolveDetail = resolve; }); }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
+  await (await draw()).find(n => n.props.key === 'item_a:t:comm').props.onPress();
+  const first = (await draw()).find(n => n.props.key === 'communication_detail_a:t:comm').props.onPress;
+  const pending = first(); await first(); await new Promise(setImmediate); assert.deepEqual(calls, [0]);
+  resolveDetail({ text: '**first**', next_offset: 16000, format: 'text' }); await pending; await first(); assert.deepEqual(calls, [0]);
+  const next = (await draw()).find(n => n.props.key === 'communication_detail_a:t:comm').props.onPress;
+  const pendingNext = next(); await new Promise(setImmediate); resolveDetail({ text: '\n`second`', next_offset: null, format: 'text' }); await pendingNext;
+  const body = (await draw()).find(n => n.props.key === 'communication_a:t:comm');
+  assert.equal(body.type, 'Markdown'); assert.equal(body.props.text, '**first**\n`second`');
+  await next(); assert.deepEqual(calls, [0, 16000]);
+});
+
+test('communication keeps its prefix and export state when in-flight cache entries are evicted', async (t) => {
+  const hooks = []; let resolvePending;
+  const entry = id => ({ id, turn_id: 't', type: 'collabToolCall', communication: { title: id, text: 'preview', truncated: true }, data: { tool: 'sendMessage' } });
+  const entries = ['target', ...Array.from({ length: 32 }, (_, i) => `other${i}`)].map(entry);
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries };
+    if (op === 'ui_detail') {
+      if (args.item_id === 'target' && (args.offset === 16000 || args.export)) return new Promise(resolve => { resolvePending = resolve; });
+      if (args.item_id === 'target') return { text: args.offset ? 'c'.repeat(16000) : 'a'.repeat(16000), next_offset: args.offset ? 48000 : 16000, format: 'text' };
+      return { text: args.item_id, next_offset: null, format: 'text' };
+    }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
+  const click = async key => (await draw()).find(n => n.props.key === key).props.onPress();
+  const evict = async (start, end) => { for (let i = start; i < end; i++) { await click(`item_a:t:other${i}`); await click(`communication_detail_a:t:other${i}`); } };
+  await click('item_a:t:target'); await click('communication_detail_a:t:target');
+  const pending = click('communication_detail_a:t:target'); await new Promise(setImmediate); await evict(0, 16);
+  resolvePending({ text: 'b'.repeat(16000), next_offset: 32000, format: 'text' }); await pending;
+  let body = (await draw()).find(n => n.props.key === 'communication_a:t:target');
+  assert.equal(body.props.children[0], 'a'.repeat(16000) + 'b'.repeat(16000));
+  await click('communication_detail_a:t:target');
+  const exporting = click('communication_export_a:t:target'); await new Promise(setImmediate); await evict(16, 32);
+  resolvePending({ file_path: 'C:/full.md', file_url: 'file:///C:/full.md' }); await exporting;
+  const tree = await draw(); body = tree.find(n => n.props.key === 'communication_a:t:target');
+  assert.equal(body.props.children[0], 'a'.repeat(16000) + 'b'.repeat(16000) + 'c'.repeat(16000));
+  assert.ok(tree.some(n => n.props.key === 'communication_link_a:t:target' && n.props.text.includes('file:///C:/full.md')));
+});
+
+test('extreme communication stays bounded and exports a complete file on demand', async (t) => {
+  const hooks = [], calls = [], copied = [], full = 'x'.repeat(64010);
+  const entry = { id: 'long', turn_id: 't', type: 'collabToolCall', communication: { title: '发送', text: '预览', truncated: true }, data: { tool: 'sendMessage' } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => { copied.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [entry] };
+    if (op === 'ui_detail') { calls.push(args); if (args.export) return { file_path: 'C:/full.md', file_url: 'file:///C:/full.md' }; const size = args.bulk ? 524288 : 16000; return { text: full.slice(args.offset, args.offset + size), next_offset: args.offset + size < full.length ? args.offset + size : null, format: 'markdown' }; }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => { const tree = await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null); assertNativeDimensions(tree); return nodes(tree); };
+  const click = async key => (await draw()).find(n => n.props.key === key).props.onPress();
+  await click('item_a:t:long'); for (let i = 0; i < 3; i++) await click('communication_detail_a:t:long');
+  let tree = await draw(); assert.equal(tree.find(n => n.props.key === 'communication_a:t:long').props.children[0].length, 48000);
+  assert.ok(!calls.some(c => c.export)); await click('communication_export_a:t:long');
+  tree = await draw(); assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text.includes('file:///C:/full.md')));
+  await click('communication_refresh_a:t:long'); assert.equal(calls.filter(c => c.export).length, 2);
+  await click('communication_copy_a:t:long'); assert.deepEqual(copied, [full]);
+  assert.equal(calls.at(-1).bulk, true); assert.equal(calls.at(-1).offset, 0);
+  assert.ok(calls.filter(c => !c.export && !c.bulk).every(c => c.bulk === undefined));
 });
 
 test('expanding a tool paints existing output without waiting for scrolling or a cold detail read', async (t) => {
@@ -765,9 +908,9 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
     const bubble = nodes(row).find(node => node.props.key === `message_content_a:t:${id}`);
     assert.equal(bubble.props.width, undefined, 'short messages size to content');
     assert.equal(bubble.props.alignSelf, 'flex-end');
-    assert.equal(nodes(row).find((node) => node.props.key === `message_a:t:${id}`).type, 'Text');
+    assert.equal(nodes(row).find((node) => node.props.key === `message_a:t:${id}`).type, id === 'parent' ? 'Markdown' : 'Text');
   }
-  assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:parent').props.children[0], 'line one\nline two');
+  assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:parent').props.text, 'line one\nline two');
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_container_a:t:reply').props.justifyContent, 'flex-start');
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:reply').type, 'Markdown');
   assert.equal(nodes(tree).filter((node) => node.props.key?.startsWith('author_')).length, 1);
