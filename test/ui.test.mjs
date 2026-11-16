@@ -785,7 +785,7 @@ test('cold history merges with live deltas, updates duplicates and retains more 
   assert.deepEqual(messages, ['cold-one', 'cold-two', 'new-one updated']);
   recent = Array.from({ length: 260 }, (_, i) => entry(`new-${i + 2}`)); revision++; await timers[0]();
   messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
-  assert.equal(messages.length, 90); assert.equal(messages.at(-1), 'new-261');
+  assert.equal(messages.length, 60); assert.equal(messages.at(-1), 'new-261');
   assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_older'), undefined);
   closeUI();
 });

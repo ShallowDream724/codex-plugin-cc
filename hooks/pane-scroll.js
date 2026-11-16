@@ -2,7 +2,7 @@
 // revision marker: Desktop's key table does not contain Box keys. Native leaf
 // layout can settle after that marker, so changed frames get another sample.
 // Never await network/history work in the wheel handler.
-export function paneScroll({ scroll, later, valid, position }) {
+export function paneScroll({ scroll, later, valid, position, refresh }) {
   let pending = null, serial = 0, disposed = false;
   const sample = e => ({ offset: Math.max(0, e.offset - (e.origin.kind === 'plugin' ? e.by : 0)), contentRows: e.contentRows, bodyRows: e.bodyRows });
   let latest = null, intent = 0;
@@ -40,7 +40,7 @@ export function paneScroll({ scroll, later, valid, position }) {
       const result = { ...measured, offset: Math.max(0, Math.min(offset, Math.max(0, measured.contentRows - measured.bodyRows))) };
       latest = result;
       request.result = result;
-      position(result.offset);
+      if (e.origin.kind === 'person') position(result.offset);
       return { ...e, offset: result.offset };
     },
     async measure(key, before = null, above = false) {
@@ -57,13 +57,17 @@ export function paneScroll({ scroll, later, valid, position }) {
         if (delay) await new Promise(resolve => later(delay, resolve));
         elapsed += delay;
         if (disposed || !valid() || token !== serial) break;
+        if (refresh) await refresh();
+        if (disposed || !valid() || token !== serial) break;
         request.result = null;
-        try { await scroll({ to: { key }, block: 'start' }); } catch { /* Not drawn yet. */ }
-        if (request.result) {
+        let accepted = false;
+        try { accepted = !(await scroll({ to: { key }, block: 'start' }))?.deny; } catch { /* Not drawn yet. */ }
+        if (accepted && request.result) {
           result = request.result;
+          position(result.offset);
           if (!before || elapsed >= 96 && previous && previous.contentRows === result.contentRows && previous.bodyRows === result.bodyRows) break;
           previous = result;
-        }
+        } else previous = null;
       }
       if (pending === request) pending = null;
       return token === serial ? result : null;

@@ -16,6 +16,35 @@ test('measurement retries until the revision Button is painted and compensates f
   assert.ok(attempts >= 2); assert.equal(result.offset, 50); assert.ok(positions.every(offset => offset === 50));
 });
 
+test('a denied native scroll cannot confirm a sampled measurement', async () => {
+  let controller, attempts = 0; const positions = [];
+  controller = paneScroll({ valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n), scroll: async () => {
+    attempts++;
+    controller.observe(event('plugin', 10, -10, 140));
+    return { deny: 'the window moved meanwhile' };
+  } });
+  const result = await controller.measure('revision-button', { offset: 20, contentRows: 110, bodyRows: 10 }, true);
+  assert.equal(result, null);
+  assert.ok(attempts > 1, 'a denied scroll is retried');
+  assert.deepEqual(positions, [], 'a denied measurement cannot confirm a position');
+});
+
+test('a denied native scroll is retried until the sampled measurement succeeds', async () => {
+  let controller, attempts = 0, positionsAtRetry; const positions = [];
+  controller = paneScroll({ valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n), scroll: async () => {
+    attempts++;
+    if (attempts === 2) positionsAtRetry = positions.length;
+    controller.observe(event('plugin', 10, -10, 140));
+    return attempts === 1 ? { deny: 'the window moved meanwhile' } : {};
+  } });
+  const result = await controller.measure('revision-button', { offset: 20, contentRows: 110, bodyRows: 10 }, true);
+  assert.ok(attempts > 1, 'the rejected first sample must not terminate measurement');
+  assert.equal(positionsAtRetry, 0, 'the denied sample did not confirm a position');
+  assert.equal(result.offset, 50);
+  assert.ok(positions.length > 0);
+  assert.ok(positions.every(n => n === 50));
+});
+
 for (const sample of [
   { name: 'before the prepend paints', rows: 100, expected: 135 },
   { name: 'after the prepend paints', rows: 200, expected: 35 },
