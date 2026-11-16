@@ -2,6 +2,7 @@
 // delivery queue is deliberately independent of this bounded live cache.
 import { toolOutputText } from '../shared/tool-output.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
+import { communication, safeBoundary } from '../shared/communication.mjs';
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
@@ -97,9 +98,24 @@ export function formatItem(item) {
   }
 }
 const visible = (item) => item && item.type !== 'reasoning';
-const simplify = (item, turnId, deferred = false, stage, startedAtMs) => {
-  const data = clean({ ...(stage ? { stage } : {}), ...project(item) }, PREVIEW_BUDGET / 2);
-  return { id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
+const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) => {
+  const message = communication(item, threadId);
+  let projected = project(item);
+  if (message) {
+    // Preserve delivery failures even when a large input would exhaust the
+    // shared preview budget. Limit each field before projecting other data.
+    const { status, success, error, ...rest } = projected;
+    const errorValue = error && typeof error === 'object' && !Array.isArray(error) && typeof error.message === 'string'
+      ? { message: error.message, ...error } : error;
+    projected = { ...(status !== undefined ? { status: clean(status, 128) } : {}),
+      ...(success !== undefined ? { success: clean(success, 128) } : {}),
+      ...(error !== undefined ? { error: clean(errorValue, 512) } : {}), ...rest };
+  }
+  const data = clean({ ...(stage ? { stage } : {}), ...projected }, PREVIEW_BUDGET / 2);
+  const end = message ? Math.min(message.text.length, 2048) : 0;
+  const safeEnd = message && end < message.text.length && safeBoundary(message.text, end) !== end ? end - 1 : end;
+  const communicationPreview = message && { title: message.title, text: message.text.slice(0, safeEnd), truncated: safeEnd < message.text.length };
+  return { ...(communicationPreview ? { communication: communicationPreview } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
@@ -202,7 +218,7 @@ export class ActivityStore {
       if (visible(p.item)) {
         const previous = this.bucket(agent.id).entries.find(entry => entry.turn_id === p.turnId && entry.id === p.item.id);
         const startedAtMs = p.item.startedAtMs ?? (message.method === 'item/started' ? p.startedAtMs : undefined) ?? previous?.started_at_ms;
-        this.put(agent, simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started', startedAtMs));
+        this.put(agent, simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started', startedAtMs, agent.threadId));
       }
       return;
     }
@@ -261,7 +277,7 @@ export class ActivityStore {
       requests++;
       if ((page.data?.length ?? 0) > limit - entries.length) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
-      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry), entry.startedAtMs ?? entry.item.startedAtMs)));
+      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), entry.turnId ?? turnId, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, entry.turnId ?? turnId, entry), entry.startedAtMs ?? entry.item.startedAtMs, agent.threadId)));
       if (!itemsCursor) {
         turnId = null; seenItems = new Set();
         if (!turnsCursor) done = true;
@@ -275,9 +291,17 @@ export class ActivityStore {
     if (typeof turn_id !== 'string' || !turn_id || typeof item_id !== 'string' || !item_id) throw new TypeError('turn_id and item_id are required.');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid detail offset.');
     if (file_path !== undefined && (typeof file_path !== 'string' || !file_path)) throw new TypeError('Invalid file path.');
-    if (view !== undefined && view !== 'output') throw new TypeError('Invalid detail view.');
+    if (view !== undefined && view !== 'output' && view !== 'communication') throw new TypeError('Invalid detail view.');
     const page = await this.client.request('thread/items/read', { threadId: agent.threadId, turnId: turn_id, itemIds: [item_id] });
-    const item = page.data?.[0]?.item;
+    const record = page.data?.[0];
+    const item = record?.item;
+    if (view === 'communication') {
+      if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id)) throw new Error('Communication item is unavailable.');
+      const message = communication(item, agent.threadId);
+      if (!message) throw new Error('Communication item is unavailable.');
+      const text = message.text, next_offset = offset + 16000 < text.length ? offset + 16000 : null;
+      return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + 16000)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text' };
+    }
     if (!visible(item)) return { text: '', next_offset: null };
     const change = file_path !== undefined && item.type === 'fileChange' ? item.changes?.find(change => change.path === file_path) : null;
     if (file_path !== undefined && !change) throw new Error('File is not part of this recorded change.');

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { ActivityStore } from '../runtime/activity.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
-import { toolSections } from '../hooks/tool-presentation.js';
+import { toolSections, communicationFailure } from '../hooks/tool-presentation.js';
 
 function fixture() {
   const client = new EventEmitter(), controller = new EventEmitter(), requests = [];
@@ -417,4 +417,92 @@ test('output-only detail preserves safe binary omission and existing non-tool vi
   assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'message', view: 'output' }), { text: 'Ordinary message', next_offset: null });
   client.request = async () => ({ data: [{ item: { id: 'files', type: 'fileChange', changes: [{ path: 'a.js', diff: '@@ -1 +1 @@\n-old\n+new' }] } }] });
   assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'files', view: 'output', file_path: 'a.js' }), { text: '@@ -1 +1 @@\n-old\n+new', next_offset: null, file_path: 'a.js', format: 'diff' });
+});
+
+
+test('communication pages preserve complete sent text and enforce ownership', async () => {
+  const { client, store } = fixture();
+  const body = '中'.repeat(15999) + '😀' + '\n公式 $x^2$\n```js\nconsole.log(1)\n```' + '尾'.repeat(18000);
+  const sent = { id: 'sent', type: 'dynamicToolCall', tool: 'notify_parent', arguments: JSON.stringify({ message: body }), result: 'Delivered to parent.' };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: sent } });
+  assert.deepEqual(store.revision({ target: 'a' }).entries[0].communication, { title: '发给 Claude', text: body.slice(0, 2048), truncated: true });
+  let current = sent;
+  client.request = async (method, args) => { assert.equal(args.threadId, 'root'); return { data: [{ turnId: 't', item: current }] }; };
+  let offset = 0, reconstructed = '';
+  do {
+    const part = await store.detail({ target: 'a', turn_id: 't', item_id: 'sent', view: 'communication', offset });
+    assert.equal(part.format, 'text');
+    assert.ok(!/[\uD800-\uDBFF]$/.test(part.text));
+    assert.ok(!/^[\uDC00-\uDFFF]/.test(part.text));
+    reconstructed += part.text; offset = part.next_offset;
+  } while (offset !== null);
+  assert.equal(reconstructed, body);
+  await assert.rejects(() => store.detail({ target: 'foreign', turn_id: 't', item_id: 'sent', view: 'communication' }), /Unknown/);
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 'wrong', item_id: 'sent', view: 'communication' }), /unavailable/);
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 't', item_id: 'wrong', view: 'communication' }), /unavailable/);
+  current = { ...sent, type: 'mcpToolCall' };
+  await assert.rejects(() => store.detail({ target: 'a', turn_id: 't', item_id: 'sent', view: 'communication' }), /unavailable/);
+  store.close();
+});
+
+test('native communication exposes only the direct sender message', async () => {
+  const { client, store } = fixture();
+  const emit = item => client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
+  const item = { id: 'native', type: 'collabAgentToolCall', tool: 'sendMessage', senderThreadId: 'root', receiverThreadIds: ['child-id'], prompt: '你好\n$x$\n```\ncode\n```', agentsStates: { 'child-id': { name: '小组', message: 'private descendant output' } } };
+  emit(item);
+  emit({ ...item, id: 'spawn', tool: 'spawnAgent' });
+  emit({ ...item, id: 'followup', tool: 'followupTask' });
+  emit({ ...item, id: 'foreign-sender', senderThreadId: 'child-id' });
+  emit({ id: 'mcp', type: 'mcpToolCall', tool: 'notify_parent', arguments: { message: 'unrelated' } });
+  emit({ id: 'object', type: 'dynamicToolCall', tool: 'notify_parent', arguments: { message: '简短消息' } });
+  const entries = store.revision({ target: 'a' }).entries;
+  assert.deepEqual(entries[0].communication, { title: '发给 小组', text: item.prompt, truncated: false });
+  for (const entry of entries.slice(1, 5)) assert.equal(entry.communication, undefined);
+  assert.equal(entries[5].communication.text, '简短消息');
+  assert.ok(!JSON.stringify(entries[0]).includes('private descendant output'));
+  client.request = async () => ({ data: [{ item }] });
+  assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'native', view: 'communication' }), { text: item.prompt, next_offset: null, format: 'markdown' });
+  store.close();
+});
+
+
+test('history projects full native communication before bounded cleaning', async () => {
+  const { client, store } = fixture();
+  const text = '汉字\n$x$\n'.repeat(1500);
+  const item = { id: 'notice', type: 'dynamicToolCall', namespace: null, tool: 'notify_parent', arguments: { message: text } };
+  client.request = async method => method === 'thread/turns/list' ? { data: [{ id: 't' }], nextCursor: null } : { data: [{ item }], nextCursor: null };
+  const { entries } = await store.history({ target: 'a' });
+  assert.equal(entries[0].communication.text, text.slice(0, 2048));
+  assert.equal(entries[0].communication.truncated, true);
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: { ...item, id: 'namespaced', namespace: 'other' } } });
+  assert.equal(store.revision({ target: 'a' }).entries[0].communication, undefined);
+  store.close();
+});
+
+test('communication displays agent names and preserves emoji at the preview boundary', () => {
+  const { client, store } = fixture();
+  const emit = item => client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
+  const body = 'a'.repeat(2047) + '😀' + 'end';
+  emit({ id: 'preview', type: 'dynamicToolCall', tool: 'notify_parent', arguments: { message: body } });
+  emit({ id: 'names', type: 'collabAgentToolCall', tool: 'sendInput', senderThreadId: 'root', receiverThreadIds: ['known', '/root/raw-id'], prompt: 'hello', agentsStates: { known: { name: '/root/team/researcher' } } });
+  const [preview, names] = store.revision({ target: 'a' }).entries;
+  assert.equal(preview.communication.text, 'a'.repeat(2047));
+  assert.equal(preview.communication.truncated, true);
+  assert.equal(names.communication.title, '发给 Researcher, /root/raw-id');
+  assert.deepEqual(names.data.receiverThreadIds, ['known', '/root/raw-id']);
+  store.close();
+});
+
+test('long communication arguments cannot hide a later delivery failure', () => {
+  const { client, store } = fixture();
+  const item = { id: 'failed-notice', type: 'dynamicToolCall', tool: 'notify_parent',
+    arguments: { message: '长消息'.repeat(10000) }, status: 'failed', success: false,
+    error: { details: 'x'.repeat(10000), message: '投递失败' } };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.equal(entry.data.status, 'failed');
+  assert.equal(entry.data.success, false);
+  assert.equal(communicationFailure(entry), '投递失败');
+  assert.ok(JSON.stringify(entry.data).length < 5000);
+  store.close();
 });

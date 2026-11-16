@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { toolSections } from '../hooks/tool-presentation.js';
+import { toolSections, communicationFailure } from '../hooks/tool-presentation.js';
 
 test('completed tool shows its useful input and duration without transport-only details', () => {
   const sections = toolSections({ type: 'mcpToolCall', data: {
@@ -12,6 +12,15 @@ test('completed tool shows its useful input and duration without transport-only 
     { label: '参数', source: JSON.stringify({ message: 'Ready for review' }, null, 2) },
     { label: '状态', source: '11 ms', compact: true },
   ]);
+});
+
+test('communication failures surface errors and failure states without implying delivery', () => {
+  assert.equal(communicationFailure({ data: { error: { message: 'denied' }, status: 'failed' } }), 'denied');
+  assert.equal(communicationFailure({ data: { status: 'FAILED' } }), 'FAILED');
+  assert.equal(communicationFailure({ data: { success: false } }), '工具报告失败');
+  assert.equal(communicationFailure({ data: { status: 'completed', success: true } }), '');
+  const sections = toolSections({ type: 'collabToolCall', communication: { text: 'hello' }, data: { tool: 'sendMessage', message: 'hello', result: 'receipt', status: 'completed', namespace: null, startedAtMs: 10 } });
+  assert.deepEqual(sections, [{ label: '输出', source: 'receipt' }, { label: '详情', source: JSON.stringify({ message: 'hello' }, null, 2), collapsible: true }]);
 });
 
 test('deduplicates status while preserving failure, output and nested business fields', () => {

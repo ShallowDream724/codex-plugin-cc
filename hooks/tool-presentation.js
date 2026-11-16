@@ -3,6 +3,16 @@ import { toolOutputText } from '../shared/tool-output.mjs';
 const text = (value) => typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '';
 const outputText = toolOutputText;
 const completedStates = new Set(['completed', 'complete', 'success', 'succeeded']);
+const failureStates = new Set(['failed', 'failure', 'error', 'cancelled', 'canceled', 'rejected', 'interrupted', 'timeout', 'timed_out']);
+
+export function communicationFailure(entry) {
+  const data = entry.data || {};
+  const error = data.error;
+  if (error != null && error !== '' && error !== false) return typeof error === 'object' && typeof error.message === 'string' ? error.message : text(error);
+  const status = [data.status, data.stage].find(value => typeof value === 'string' && failureStates.has(value.trim().toLowerCase()));
+  if (status) return status;
+  return data.success === false ? '工具报告失败' : '';
+}
 
 function statusText(data) {
   const seen = new Set(), parts = [];
@@ -26,7 +36,7 @@ export function toolSections(entry) {
     add('命令', data.command);
     add('目录', data.cwd);
     add('输出', data.aggregatedOutput);
-  } else if (['mcpToolCall', 'dynamicToolCall'].includes(entry.type)) {
+  } else if (['mcpToolCall', 'dynamicToolCall'].includes(entry.type) || (entry.communication && ['collabAgentToolCall', 'collabToolCall'].includes(entry.type))) {
     consumed = ['arguments', 'result', 'contentItems', 'server', 'tool'];
     let args = data.arguments;
     if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /* Preserve an opaque input as supplied. */ } }

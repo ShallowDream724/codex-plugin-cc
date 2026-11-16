@@ -1,6 +1,6 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
 import { agentIcon, agentVisual, retainIcons, clearIcons, displayLabel, agentDisplayName } from './presentation.js';
-import { toolSections } from './tool-presentation.js';
+import { toolSections, communicationFailure } from './tool-presentation.js';
 import { activityIcon, contextIndicator, disclosureIcon, copyIcon, jumpIcon } from './tool-icons.js';
 import { normalizeDisplayMath } from './math-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
@@ -16,8 +16,8 @@ const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x0
 const idOf = (agent) => agent.agent_id || agent.id;
 const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
-const detailKey = (entry, filePath) => JSON.stringify([entryKey(entry), filePath ?? null]);
-const detailFor = (page, entry, filePath) => page.details.get(detailKey(entry, filePath));
+const detailKey = (entry, filePath, view) => JSON.stringify([entryKey(entry), filePath ?? null, ...(view ? [view] : [])]);
+const detailFor = (page, entry, filePath, view) => page.details.get(detailKey(entry, filePath, view));
 function cacheDetail(page, key, value) {
   page.details.delete(key); page.details.set(key, value);
   while (page.details.size > MAX_DETAILS) page.details.delete(page.details.keys().next().value);
@@ -104,6 +104,7 @@ function isUnifiedDiff(text) {
 }
 const description = (entry) => {
   const d = entry.data || {};
+  if (typeof entry.communication?.title === 'string' && entry.communication.title.trim()) return entry.communication.title;
   if (entry.type === 'parentMessage') return 'Claude';
   if (entry.type === 'directUserMessage') return '你';
   if (entry.type === 'userMessage') return 'Claude';
@@ -448,17 +449,17 @@ async function chooseAttachments($, id, source = 'file') {
     await $.ui.scroll({ in: PANE, to: state.restore ? 'start' : 'end' }).catch(() => {});
     if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
   }
-  async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false) {
-    const page = pageFor(id), key = detailKey(entry, filePath), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailSequence;
+  async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false, view) {
+    const page = pageFor(id), key = detailKey(entry, filePath, view), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailSequence;
     page.detailRequests.set(key, request);
     while (page.detailRequests.size > MAX_DETAILS) page.detailRequests.delete(page.detailRequests.keys().next().value);
     const fetch = async () => {
       if (request !== page.detailRequests.get(key) || state.selected !== id || !state.opened || state.generation !== gen || !state.folds.has(foldKey)) return;
-      const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset, ...(filePath !== undefined ? { file_path: filePath } : outputTypes.has(entry.type) ? { view: 'output' } : {}) }).catch((error) => ({ error: { message: failureText(error) } }));
+      const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, offset, ...(filePath !== undefined ? { file_path: filePath } : view ? { view } : outputTypes.has(entry.type) ? { view: 'output' } : {}) }).catch((error) => ({ error: { message: failureText(error) } }));
       if (request !== page.detailRequests.get(key)) return;
       page.detailRequests.delete(key);
       if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
-      if (result.error || result.offline) cacheDetail(page, key, { text: `无法读取内容：${failureText(result)}`, error: true, next_offset: null, offset });
+      if (result.error || result.offline) cacheDetail(page, key, { text: `无法读取内容：${failureText(result)}`, error: true, next_offset: null, offset, ...(view === 'communication' ? { previous: page.details.get(key)?.previous ?? page.details.get(key) } : {}) });
       else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
       await invalidate($);
     };
@@ -631,7 +632,7 @@ function renderPane($, e, next, attempt = {}) {
       }
       const itemRows = [];
       for (const entry of group.items) {
-        if (['collabAgentToolCall', 'collabToolCall', 'subAgentActivity'].includes(entry.type)) {
+        if (['collabAgentToolCall', 'collabToolCall', 'subAgentActivity'].includes(entry.type) && !entry.communication) {
           const d = entry.data || {}, target = d.agentThreadId || d.agent_id || d.agentId || d.agents?.[0]?.id || d.receiverThreadIds?.[0] || d.name || d.names?.[0] || entry.id;
           const waiting = d.tool === 'wait';
           itemRows.push(Box({ key: `activity_${id}:${entryKey(entry)}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [waiting ? iconFor(`wait_icon_${id}:${entryKey(entry)}`, activityIcon(entry)) : agentMark(`agent_icon_${id}:${entryKey(entry)}`, target), caption(`activity_label_${id}:${entryKey(entry)}`, description(entry))] }));
@@ -690,6 +691,36 @@ function renderPane($, e, next, attempt = {}) {
           continue;
         }
         const toolStart = itemRows.length;
+        if (entry.communication && typeof entry.communication.text === 'string') {
+          const view = 'communication', cacheKey = detailKey(entry, undefined, view);
+          const load = (offset, background = false) => detail($, id, entry, offset, key, undefined, background, view);
+          itemRows.push(disclosure(`item_${key}`, safe(description(entry)).slice(0, 120), async () => {
+            toggle(key);
+            if (expanded) page.detailRequests.delete(cacheKey);
+            else if (entry.communication.truncated && !detailFor(page, entry, undefined, view)) return load(0, true);
+            await invalidate($);
+          }, entry, false, expanded));
+          if (expanded) {
+            const loaded = detailFor(page, entry, undefined, view), shown = loaded?.error ? loaded.previous : loaded;
+            const text = safe(shown?.text ?? entry.communication.text);
+            const markdown = shown ? shown.format === 'markdown' : !entry.communication.truncated;
+            const contents = [markdown ? Markdown({ key: `communication_${key}`, text: e.surface === 'desktop' ? normalizeDisplayMath(text) : text }) : Text({ key: `communication_${key}`, size: 'body', children: [text] })];
+            const failure = communicationFailure(entry);
+            if (failure) contents.push(caption(`communication_failure_${key}`, `发送异常：${failure}`));
+            if (loaded?.error) contents.push(caption(`communication_error_${key}`, loaded.text));
+            const rawKey = `${key}:raw`, sections = toolSections(entry);
+            if (sections.length) {
+              contents.push(Box({ key: `tool_raw_row_${key}`, flexDirection: 'row', children: [hint(`tool_raw_hover_${key}`, disclosure(`tool_raw_${key}`, '‹/›', () => { toggle(rawKey); return invalidate($); }), state.folds.has(rawKey) ? '收起原始调用' : '显示原始调用', 16)] }));
+              if (state.folds.has(rawKey)) sections.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
+            }
+            itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: contents }));
+            const loading = page.detailRequests.has(cacheKey);
+            if (!loading && shown?.offset > 0) itemRows.push(disclosure(`communication_prev_${key}`, '上一页正文', () => load(Math.max(0, shown.offset - 16000))));
+            if (!loading && (loaded?.error || shown?.next_offset != null)) itemRows.push(disclosure(`communication_detail_${key}`, loaded?.error ? '重试读取正文' : '下一页正文', () => load(loaded?.error ? loaded.offset : shown.next_offset)));
+          }
+          itemRows.push(Box({ key: `tool_entry_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.5 : 'sm', children: itemRows.splice(toolStart) }));
+          continue;
+        }
         itemRows.push(disclosure(`item_${key}`, safe(description(entry)).slice(0, 120), async () => {
           toggle(key); if (expanded) page.detailRequests.delete(detailKey(entry));
           if (!expanded && entry.deferred && outputTypes.has(entry.type) && !detailFor(page, entry)) return detail($, id, entry, 0, key, undefined, true);

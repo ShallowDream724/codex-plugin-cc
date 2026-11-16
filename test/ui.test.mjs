@@ -435,6 +435,60 @@ test('desktop tool expansion keeps the pane valid through output and raw-call di
   assert.ok(!nodes(await draw()).some(node => node.props.key === 'item_a:t:run'));
 });
 
+test('communication expansion shows readable messages while keeping raw calls separate', async (t) => {
+  const hooks = [], afters = [], calls = [];
+  let fail = false;
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => { afters.push(fn); } } };
+  const entries = [
+    { id: 'short', turn_id: 't', type: 'dynamicToolCall', communication: { title: '发送消息', text: '**正文**', truncated: false }, data: { tool: 'notify_parent', arguments: { message: '**正文**' }, result: 'receipt', status: 'completed', stage: 'completed', namespace: null, startedAtMs: 10, completedAtMs: 11, success: true } },
+    { id: 'long', turn_id: 't', type: 'collabToolCall', communication: { title: '发送给子代理', text: '预览\n内容', truncated: true }, data: { tool: 'sendMessage', message: '原始参数', result: '回执' } },
+    { id: 'failed', turn_id: 't', type: 'collabToolCall', communication: { title: '发送失败测试', text: '待发送内容', truncated: false }, data: { tool: 'sendMessage', error: { message: '接收方不可用' }, status: 'failed', success: false } },
+    { id: 'unknown', turn_id: 't', type: 'dynamicToolCall', data: { tool: 'other', arguments: { value: 1 }, result: 'generic output' } },
+    { id: 'answer', turn_id: 't', type: 'agentMessage', data: { text: '最终回复' } },
+  ];
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries };
+    if (op === 'ui_detail') { calls.push(args); return fail ? { error: { message: '读取失败' } } : { text: args.offset ? '第二页\n正文' : '第一页\n正文', next_offset: args.offset ? null : 16000, format: 'text' }; }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => { const tree = await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null); assertNativeDimensions(tree); return tree; };
+  const click = async key => nodes(await draw()).find(node => node.props.key === key).props.onPress();
+  await click('item_a:t:short');
+  let tree = nodes(await draw());
+  assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text === '**正文**'));
+  assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text === '最终回复'));
+  assert.ok(!tree.some(n => n.type === 'Code' && /receipt|message/.test(n.props.source)));
+  await click('tool_raw_a:t:short');
+  tree = nodes(await draw());
+  assert.ok(tree.some(n => n.type === 'Code' && n.props.source.includes('receipt')));
+  assert.ok(!tree.some(n => n.type === 'Code' && /namespace|startedAtMs|completedAtMs|completed/.test(n.props.source)));
+  await click('item_a:t:failed');
+  tree = nodes(await draw());
+  assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text === '待发送内容'));
+  assert.ok(tree.some(n => n.props.key === 'communication_failure_a:t:failed' && n.props.children[0].includes('接收方不可用')));
+  assert.ok(!tree.some(n => n.props.key === 'communication_error_a:t:failed'));
+  await click('item_a:t:long');
+  assert.ok(nodes(await draw()).some(n => n.type === 'Text' && n.props.children?.[0] === '预览\n内容'));
+  await afters.shift()();
+  assert.deepEqual(calls.map(c => [c.view, c.offset]), [['communication', 0]]);
+  assert.ok(nodes(await draw()).some(n => n.type === 'Text' && n.props.children?.[0] === '第一页\n正文'));
+  fail = true; await click('communication_detail_a:t:long');
+  tree = nodes(await draw());
+  assert.ok(tree.some(n => n.type === 'Text' && n.props.children?.[0] === '第一页\n正文'));
+  assert.ok(tree.some(n => n.props.key === 'communication_error_a:t:long'));
+  fail = false; await click('communication_detail_a:t:long');
+  assert.equal(calls.at(-1).offset, 16000);
+  assert.ok(nodes(await draw()).some(n => n.type === 'Text' && n.props.children?.[0] === '第二页\n正文'));
+  await click('item_a:t:long'); await click('item_a:t:long');
+  assert.equal(afters.length, 0, 'reopening uses the communication cache');
+  await click('communication_prev_a:t:long');
+  assert.equal(calls.at(-1).offset, 0);
+  await click('item_a:t:unknown');
+  assert.ok(nodes(await draw()).some(n => n.type === 'Code' && n.props.source === 'generic output'));
+});
+
 test('expanding a tool paints existing output without waiting for scrolling or a cold detail read', async (t) => {
   const hooks = [], afters = [];
   let resolveDetail, detailCalls = 0;
