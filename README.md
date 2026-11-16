@@ -4,7 +4,7 @@
 
 仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
-当前开发候选版为 **0.2.0-rc.22**，修复内置安全模块跳过旧钩子后，Claude 忙碌期间收不到子代理通知的问题。沿用 rc.21 按实际渲染大小选择历史窗口的改动。此候选尚未覆盖本地正在运行的版本，等待用户安排安装和验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
+当前开发候选版为 **0.2.0-rc.22**，包含中途通知兼容、压缩状态静默、实时跟随和长行 Diff 行号对齐修复。沿用 rc.21 按实际渲染大小选择历史窗口的改动。此候选尚未覆盖本地正在运行的版本，等待用户安排安装和验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 

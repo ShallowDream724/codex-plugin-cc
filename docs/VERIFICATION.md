@@ -1,12 +1,16 @@
 # 验证记录
 
-## rc.22：允许的中途通知入口（2026-11-16，未安装）
+## rc.22：通知与侧栏修复（2026-11-16，未安装）
 
 只读实际 Claude Code 2.1.325：安全模块 `ro` 将 `classic.*` 越过个人插件，`hco` 生成用户看到的 skipped 提示；公开 `turn.step` 与 tool-result 事件不在该跳过规则中。`Xp` 在 `gi` 派发 step 之前已经复制消息并合并 arrived rows，因此把通知移到 step 开头仍然错误。响应结束后、工具结果 append 返回前才是可用边界；原生外围 through 会等 append 完成后才把工具结果交回 query loop。未改安全策略，也未用会影响工具 detach 的广泛 tool.call 钩子。
 
 通知、交付、桥接与控制策略测试共 **64 项通过**，包括 36 项 hooks 测试：流和返回值原样转发、根/嵌套边界区分、取消及迟到结果释放、拒收不确认、wait 先确认后观察、同一事件不重放、下一步骤消费后不再唤醒、正常结束时处理未读通知。独立代码审查未发现额外交付或停止竞态问题。实际宿主插件校验、元数据/语法及 diff 检查通过；日志为 `artifacts/rc22-notifications.log`、`rc22-native-validation.log`、`rc22-check.log`。
 
 同一候选随后移除压缩状态的父级通知。交付、broker、控制器、活动视图及 hooks 相关测试 **226 项通过、1 项环境相关跳过**：压缩保留活动状态与侧栏阶段，不生成父级事件，不让 wait 提前结束；真实问题和失败仍能交付；旧版排队压缩项及纯压缩租约不会阻塞下一条有用通知，未知业务事件保留。日志为 `artifacts/rc22-compaction-notifications.log`；此补充同样未安装。
+
+实时跟随回归先复现了“轮询已读到并绘制新内容，但布局增长的 person/by:0 事件取消跟随”；改为先设置尾部请求再绘制，并忽略无位移的布局事件对跟随意图的影响。自动绘制夹具使用 state 订阅和计时器调用身份，轮询后不手动 draw；覆盖无滚动时的新内容、尾部定位、真正上滚取消以及相同 revision 不重绘。实际原始 state→ui_invalidate→Desktop render 链隔离重放也确认同 props/offset 下可以自动重绘，没有增加 retitle 或全局刷新回退。
+
+Diff 的源行号计算保持不变；实际 Desktop `$h` 标记与 `s_` 样式会把未指定 alignItems 的 row 内 span 居中。行和 gutter 改为显式 flex-start 后，`work/rc22-diff-geometry/geometry.cjs` 用产品树和提取的宿主样式在 180/240/320px 下验证：长中文新增/删除/上下文、空行的行号与首行顶端差均为 0px，旧布局折行偏低约 84–231px。探针使用简化主题值，不代表完整 Claude GUI。UI、滚动、预算和 Diff 相关 **111 项测试通过**，元数据/语法检查通过；日志为 `artifacts/rc22-live-diff.log`、`rc22-live-diff-check.log`。
 
 遵照用户要求仅改开发目录并打包：没有覆盖安装、重启 Claude 或触碰运行中的 Astra，没有调用实际模型或使用 Computer Use。真实会话的通知体验尚待之后安装验收；未发布 GitHub。
 

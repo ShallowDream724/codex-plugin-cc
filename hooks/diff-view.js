@@ -24,8 +24,8 @@ export function renderDiff({ Box, Text, Button }, { key, source, rows: suppliedR
   for (const [index, row] of visible.entries()) {
     const backgroundColor = row.kind === 'added' ? 'rgba(46,160,67,0.16)' : row.kind === 'removed' ? 'rgba(248,81,73,0.16)' : undefined;
     const numberColor = row.kind === 'added' ? '#2ea043' : row.kind === 'removed' ? '#f85149' : undefined;
-    children.push(Box({ key: `${key}:row:${current * PAGE_SIZE + index}`, flexDirection: 'row', ...(copy && index === 0 ? { paddingRight: 3 } : {}), ...(backgroundColor ? { backgroundColor } : {}), children: [
-      Box({ width: lineWidth + 1, flexShrink: 0, flexDirection: 'row', justifyContent: 'flex-end', paddingRight: 1, children: [text((row.kind === 'removed' ? row.old : row.new) == null ? '' : String(row.kind === 'removed' ? row.old : row.new), { ...(numberColor ? { color: numberColor } : { dimColor: true }), tabular: true })] }),
+    children.push(Box({ key: `${key}:row:${current * PAGE_SIZE + index}`, flexDirection: 'row', alignItems: 'flex-start', ...(copy && index === 0 ? { paddingRight: 3 } : {}), ...(backgroundColor ? { backgroundColor } : {}), children: [
+      Box({ width: lineWidth + 1, flexShrink: 0, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'flex-end', paddingRight: 1, children: [text((row.kind === 'removed' ? row.old : row.new) == null ? '' : String(row.kind === 'removed' ? row.old : row.new), { ...(numberColor ? { color: numberColor } : { dimColor: true }), tabular: true })] }),
       Box({ flexGrow: 1, flexShrink: 1, minWidth: 0, children: [text(['added', 'removed', 'context'].includes(row.kind) && !row.continuation ? row.text.slice(1) : row.text, row.kind === 'marker' ? { dimColor: true } : {})] }),
     ] }));
   }

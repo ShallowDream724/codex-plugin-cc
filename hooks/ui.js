@@ -525,10 +525,11 @@ async function chooseAttachments($, id, source = 'file') {
         dirty ||= entriesChanged;
       }
       if (appended && page.followTail) page.windowAnchor = null;
-      if (dirty) await invalidate($);
       if (entriesChanged && hadRevision && page.followTail && !page.navigating && !page.scroller?.pending && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
+        // Install the tail request before the changed tree can emit layout
+        // scroll events. One invalidation paints both content and its request.
         await requestTail($, id);
-      }
+      } else if (dirty) await invalidate($);
       const selected = state.agents.find((agent) => idOf(agent) === id);
       if (selected && selected.status !== 'starting' && !page.historyChecked) await latestHistory($, id);
     } catch (error) {
@@ -810,6 +811,9 @@ export function registerUI(on) {
     // placement; after the first reveal, genuine upward input owns it again.
     const tail = page?.tailRequest;
     if (tail?.placement && (!tail.revealed || tail.geometry && (e.contentRows !== tail.geometry.contentRows || e.bodyRows !== tail.geometry.bodyRows))) return next(e);
+    // Desktop reports content growth/resizing as person scrolls even when the
+    // viewport did not move. That is not an instruction to stop live following.
+    if (page?.followTail && e.by === 0 && !page.scroller?.pending) return next(e);
     const view = page && drawnWindow(page);
     const atBottom = Number.isFinite(e.contentRows) && Number.isFinite(e.bodyRows) && e.offset >= e.contentRows - e.bodyRows - 1;
     const controller = page && scrollController($, id, page);

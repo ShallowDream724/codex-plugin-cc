@@ -7,8 +7,8 @@ import navigationSync from '../hooks/navigation-sync.js';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 const entry = (id, type, text) => ({ id, turn_id: 'turn', type, data: { text } });
 
-async function setup(handler, { acceptScroll = () => true } = {}) {
-  const hooks = [], timers = [], afters = [], scrolls = [], calls = []; let painted = [], draw; const surfacePending = new Set();
+async function setup(handler, { acceptScroll = () => true, autoPaint = false } = {}) {
+  const hooks = [], timers = [], afters = [], scrolls = [], calls = []; let painted = [], draw, rendering = false, afterPaint, renderCount = 0; const surfacePending = new Set(), subscriptions = new Set();
   const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
     const promise = new Promise(resolve => setImmediate(resolve)).then(() => host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data })));
     surfacePending.add(promise); promise.finally(() => surfacePending.delete(promise));
@@ -18,8 +18,8 @@ async function setup(handler, { acceptScroll = () => true } = {}) {
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client', 'Image'].map((type) => [type, (props) => ({ type, props })])),
       invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { if (args.to?.key && (!painted.some(node => node.type === 'Button' && node.props.key === args.to.key) || !acceptScroll(args))) throw Error('key not painted'); scrolls.push(args); if (args.to?.key) await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 }); },
     },
-    clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn: () => host.callback(fn), cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
-    state: { get: async () => ({}), set: async () => ({ isSet: true }) },
+    clock: { every(_ms, fn) { timers.push(() => autoPaint ? host.callback(fn) : fn()); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn: () => host.callback(fn), cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
+    state: { get: async key => { if (rendering) subscriptions.add(JSON.stringify(key)); return {}; }, set: async key => { if (autoPaint && subscriptions.has(JSON.stringify(key))) { await host.surface(() => draw()); if (afterPaint) { const callback = afterPaint; afterPaint = null; await host.surface(callback); } } return { isSet: true }; } },
     session: { id: async () => 'session', cwd: async () => 'C:/work' },
     env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
     process: { run: async (_argv, options) => {
@@ -32,7 +32,11 @@ async function setup(handler, { acceptScroll = () => true } = {}) {
   const host = nativeHooks(hooks, $); registerUI(host.on);
   await openAgent($, 'a');
   draw = async (options = {}) => {
-    const tree = await hooks.find((hook) => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', ...options }, () => null); painted = nodes(tree);
+    renderCount++;
+    rendering = true;
+    let tree;
+    try { tree = await hooks.find((hook) => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', ...options }, () => null); } finally { rendering = false; }
+    painted = nodes(tree);
     const sync = painted.find(node => node.type === 'Client' && node.props.module === './navigation-sync.js');
     if (sync) navigationSync(sync.props.props, surface);
     return tree;
@@ -40,7 +44,7 @@ async function setup(handler, { acceptScroll = () => true } = {}) {
   const item = async (key) => nodes(await draw()).find((node) => node.props.key?.startsWith(key));
   const scroll = (by = -1, offset = 0) => host.dispatch('ui.scroll', { origin: { kind: 'person' }, by, offset, contentRows: 100, bodyRows: 10 });
   const scrollEvent = (event) => host.dispatch('ui.scroll', event);
-  return { draw, item, surfacePending, tick: async () => { await timers[0](); await draw(); }, scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e), message: (e) => hooks.find((hook) => hook.event === 'ui.message').fn($, e, async () => ({})) };
+  return { draw, item, surfacePending, tick: async () => { await timers[0](); if (!autoPaint) await draw(); }, painted: () => painted, renderCount: () => renderCount, afterNextPaint: callback => { afterPaint = callback; }, scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e), message: (e) => hooks.find((hook) => hook.event === 'ui.message').fn($, e, async () => ({})) };
 }
 
 const tailCalls = scrolls => scrolls.filter(s => /^codex_tail_a_\d+$/.test(s.to?.key || '') && s.block === 'end');
@@ -168,6 +172,36 @@ const flushTimers = async (ui) => {
 };
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const messages = async (ui) => nodes(await ui.draw()).filter(node => node.type === 'Markdown').map(node => node.props.text);
+
+for (const { name, by, offset, shouldFollow } of [
+  { name: 'layout growth', by: 0, offset: 90, shouldFollow: true },
+  { name: 'upward scrolling', by: -1, offset: 89, shouldFollow: false },
+]) test(`automatic live repaint handles ${name} during invalidation`, async t => {
+  t.after(closeUI);
+  let revision = 1, entries = [entry('initial', 'agentMessage', 'initial message')];
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'running' }] } : op === 'ui_history' ? { entries: [], next_cursor: null } : { revision, entries }, { autoPaint: true });
+  await flushTimers(ui);
+  const beforeUnchanged = ui.renderCount();
+  await ui.tick();
+  assert.equal(ui.renderCount(), beforeUnchanged, 'an unchanged revision does not repaint');
+  const before = tailCount(ui.scrolls), beforeCalls = ui.scrolls.length;
+  ui.afterNextPaint(() => ui.scrollEvent({ origin: { kind: 'person' }, by, offset, contentRows: 120, bodyRows: 10 }));
+  entries = [...entries, entry('new', 'agentMessage', 'new live message')]; revision++;
+  await ui.tick();
+  const pending = new Set();
+  for (let round = 0; round < 100; round++) {
+    for (const timer of ui.afters.splice(0)) if (!timer.cancelled) {
+      const promise = Promise.resolve().then(timer.fn);
+      pending.add(promise); promise.finally(() => pending.delete(promise));
+    }
+    await settle();
+    if (!pending.size && !ui.afters.length && !ui.surfacePending.size) break;
+    if (round === 99) throw Error('automatic painting did not settle');
+  }
+  assert.match(JSON.stringify(ui.painted()), /new live message/, 'the subscription paints the new message');
+  if (shouldFollow) assertTailReveal(ui.scrolls.slice(beforeCalls));
+  else assert.equal(tailCount(ui.scrolls), before, 'a real upward scroll cancels following');
+});
 
 test('initial layout scroll cannot cancel placement, but reading after reveal can', async t => {
   t.after(closeUI);
