@@ -151,7 +151,7 @@ async function handle($, e, next, operation) {
   } catch (error) { return { result: JSON.stringify({ error: { code: 'plugin_error', message: String(error.message || error) } }) }; }
 }
 
-async function observe($, atBatch = false) {
+async function observe($, atBoundary = false, signal) {
   if (!active || observing) return;
   observing = true;
   try {
@@ -160,14 +160,14 @@ async function observe($, atBatch = false) {
       if (expected.confirmedEvents) await confirm($, delivery_id, expected.confirmedEvents);
     }
     const pendingDelivery = notificationPending || deliveries.keys().next().value;
-    const deliver = !pausedAfterStop && !wakePending && !waking && !waiters && !pendingDelivery && (!busyTurns.size || atBatch);
+    const deliver = !signal?.aborted && !pausedAfterStop && !wakePending && !waking && !waiters && !pendingDelivery && (!busyTurns.size || Boolean(atBoundary));
     const result = await bridge($, 'observe', { deliver, ...(pendingDelivery ? { lease_id: pendingDelivery } : {}) });
     if (result.offline) { active = false; return; }
     if (result.error) return;
     await observeUI($, result);
     if (result.events?.length && result.delivery_id) {
       // Recheck after the async bridge: a tool wait may have started meanwhile.
-      if (pausedAfterStop || wakePending || waking || waiters || notificationPending || deliveries.size || (busyTurns.size && (!atBatch || [...busyTurns].some(turn => !atBatch.has(turn))))) { await release($, result.delivery_id); return; }
+      if (signal?.aborted || pausedAfterStop || wakePending || waking || waiters || notificationPending || deliveries.size || (busyTurns.size && (!atBoundary || [...busyTurns].some(turn => !atBoundary.has(turn))))) { await release($, result.delivery_id); return; }
       const delivery = remember($, result, 'prompt');
       notificationPending = result.delivery_id;
       const text = EVENT_PREFIX + JSON.stringify({ delivery_id: delivery.delivery_id, events: delivery.events });
@@ -179,8 +179,8 @@ async function observe($, atBatch = false) {
           const expected = deliveries.get(delivery.delivery_id);
           const sequences = retained.filter(item => item.delivery_id === delivery.delivery_id).flatMap(item => retainedSequences(item, expected));
           if (sequences.length) {
-            // A tool can end the turn without a further model request. A later
-            // turn.step clears this; otherwise completion wakes the retained note.
+            // A response or tool can end the turn without another model request.
+            // The next step consumes arrived notes; otherwise completion wakes it.
             for (const turn of turns) {
               if (busyTurns.has(turn)) wakeTurns.add(turn);
               else if (endedTurns.get(turn)) wakePending = true;
@@ -199,6 +199,11 @@ async function observe($, atBatch = false) {
         }).catch(() => release($, delivery.delivery_id));
     }
   } finally { observing = false; }
+}
+
+async function observeBoundary($, turns, signal) {
+  if (signal?.aborted || !turns.size || !busyTurns.size || [...busyTurns].some(turn => !turns.has(turn))) return;
+  await observe($, turns, signal).catch(() => {});
 }
 
 async function wake($) {
@@ -250,20 +255,29 @@ export function register(on, options = {}) {
     catch { /* Keep an existing command with the same name intact. */ }
     return next(e);
   });
-  on('session.append', { door: 'tool-result', origin: { kind: 'tool', tool: WAIT_TOOL } }, handleAppend);
+  on('session.append', { door: 'tool-result' }, async ($, e, next) => {
+    const turns = !e.agentId ? new Set(busyTurns) : new Set();
+    // Confirm our own wait result before asking for another delivery. For all
+    // other tools handleAppend keeps their row and receipt unchanged.
+    const result = await handleAppend($, e, next);
+    // A long-running tool may finish after the response that requested it.
+    // Observe its retained result without intercepting tool execution itself.
+    await observeBoundary($, turns, next.signal);
+    return result;
+  });
   on('session.append', { door: 'prompt' }, handleAppend);
   on('turn.start', ($, e, next) => {
     if (!e.agentId) { pausedAfterStop = false; wakePending = false; busyTurns.add(e.turnId); }
     return next(e);
   });
-  on('classic.PostToolBatch', async ($, e, next) => {
-    const result = await next(e);
-    if (!e.agent_id && busyTurns.size) await observe($, new Set(busyTurns)).catch(() => {});
-    return result;
-  });
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) wakeTurns.delete(e.turnId);
-    return yield* next(e);
+    const turns = !e.agentId && busyTurns.has(e.turnId) ? new Set([e.turnId]) : new Set();
+    const result = yield* next(e);
+    // At entry the host already selected this request's messages. Append only
+    // after its response, before a subsequent request drains the arrived queue.
+    await observeBoundary($, turns, next.signal);
+    return result;
   });
   on('turn.complete', ($, e, next) => {
     if (!e.agentId) {
