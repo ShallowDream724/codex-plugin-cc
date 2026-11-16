@@ -46,7 +46,8 @@ async function setup(handler) {
 test('first open starts at the end and reopening restores the saved reading position', async (t) => {
   t.after(closeUI);
   const ui = await setup(async (op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('saved', 'agentMessage', 'saved')], next_cursor: null } : { revision: 1, entries: [] });
-  assert.deepEqual(ui.scrolls, [{ in: 'codex_subagent_activity', to: 'end' }]);
+  await flushTimers(ui);
+  assert.deepEqual(ui.scrolls, [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
   await ui.scroll(1, 42);
   await ui.close();
   await ui.open('a');
@@ -102,13 +103,15 @@ test('sending while reading history keeps the conversation and shows the subsequ
     if (op === 'ui_send') { entries = [...entries, entry('sent', 'directUserMessage', 'new question')]; revision++; return { agent_id: 'a', status: 'steered' }; }
     throw new Error(`Unexpected operation: ${op}`);
   });
+  await flushTimers(ui);
   assert.match(JSON.stringify(await ui.draw()), /older history/);
   const scrollCount = ui.scrolls.length;
   await (await ui.item('codex_message_a')).props.onSubmit('new question');
+  await flushTimers(ui);
   let rendered = JSON.stringify(await ui.draw());
   assert.match(rendered, /new question/); assert.match(rendered, /live before send/); assert.match(rendered, /older history/);
   assert.doesNotMatch(rendered, /消息已发送/);
-  assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: 'end' }]);
+  assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
   entries = [...entries, entry('answer', 'agentMessage', 'subsequent answer')]; revision++;
   await ui.tick(); rendered = JSON.stringify(await ui.draw());
   assert.match(rendered, /new question/); assert.match(rendered, /subsequent answer/);
@@ -127,6 +130,7 @@ test('a send during an in-flight poll triggers a follow-up refresh', async (t) =
     if (op === 'ui_send') { revision++; entries = [entry('sent', 'directUserMessage', 'sent during poll')]; return { agent_id: 'a', status: 'steered' }; }
     throw new Error(`Unexpected operation: ${op}`);
   });
+  await flushTimers(ui);
   block = true;
   const polling = ui.tick();
   while (!release) await new Promise((resolve) => setImmediate(resolve));
@@ -135,9 +139,10 @@ test('a send during an in-flight poll triggers a follow-up refresh', async (t) =
   assert.equal(ui.scrolls.length, scrollCount);
   release({ revision: 1, entries: [] });
   await polling;
+  await flushTimers(ui);
   assert.match(JSON.stringify(await ui.draw()), /sent during poll/);
   assert.equal(ui.calls.filter((call) => call.operation === 'ui_revision').length, 3);
-  assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: 'end' }]);
+  assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
 });
 
 const flushTimers = async (ui) => {
@@ -164,16 +169,16 @@ test('jump control returns to the latest message', async (t) => {
   const before = ui.scrolls.length;
   const jump = nodes(await ui.draw()).find(node => node.type === 'Button' && node.props.key === 'codex_jump_a_viewport');
   assert.ok(jump); await jump.props.onPress(); await flushTimers(ui);
-  assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: 'end' }]);
+  assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
   assert.match(JSON.stringify(await ui.draw()), /message 149/);
 });
-test('new activity follows the bottom, pauses for reading, and resumes after returning', async (t) => {
+test('new activity pauses for reading and resumes after an explicit jump', async (t) => {
   t.after(closeUI);
   const tool = { id: 'tool', turn_id: 'turn', type: 'commandExecution', data: { command: 'test', aggregatedOutput: 'output' } };
   let revision = 1, entries = [tool];
   const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'running' }] } : op === 'ui_revision' ? { revision, entries } : op === 'ui_history' ? { entries: [], next_cursor: null } : { text: '', next_offset: null });
   await (await ui.item('item_a:turn:tool')).props.onPress();
-  const countEnd = () => ui.scrolls.filter(s => s.to === 'end').length;
+  const countEnd = () => ui.scrolls.filter(s => s.to?.key === 'codex_tail_a' && s.block === 'end').length;
   let count = countEnd();
   entries = [...entries, entry('one', 'agentMessage', 'first')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), ++count, 'opening a tool at the bottom does not disable following');
@@ -182,9 +187,12 @@ test('new activity follows the bottom, pauses for reading, and resumes after ret
   assert.equal(countEnd(), count, 'a pending follow is cancelled by a user scroll');
   entries = [...entries, entry('three', 'agentMessage', 'third')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), count, 'new activity does not interrupt reading');
+  assert.ok(ui.scrolls.every(s => s.to !== 'end'), 'tail positioning never enables native follow-end');
   await ui.scrollEvent({ origin: { kind: 'person' }, by: 1, offset: 80, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
-  // Reach the bottom again after the newer window has been drawn.
   await ui.scrollEvent({ origin: { kind: 'person' }, by: 1, offset: 80, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
+  entries = [...entries, entry('layout', 'agentMessage', 'layout update')]; revision++; await ui.tick(); await flushTimers(ui);
+  assert.equal(countEnd(), count, 'a bottom-position layout event does not resume following');
+  await (await ui.item('codex_jump_a_viewport')).props.onPress(); await flushTimers(ui);
   count = countEnd(); entries = [...entries, entry('four', 'agentMessage', 'fourth')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), count + 1, 'reaching the bottom resumes following');
 });
@@ -197,12 +205,12 @@ test('a user scroll during an in-flight send refresh cancels the pending jump', 
     if (op === 'ui_send') { block = true; return { agent_id: 'a', status: 'steered' }; }
     if (op === 'ui_revision') { if (block) return new Promise(resolve => { release = resolve; }); return { revision, entries: [] }; }
   });
-  const before = ui.scrolls.filter(s => s.to === 'end').length;
+  const before = ui.scrolls.filter(s => s.to?.key === 'codex_tail_a' && s.block === 'end').length;
   const sending = (await ui.item('codex_message_a')).props.onSubmit('hello');
   while (!release) await new Promise(setImmediate);
   await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 10, contentRows: 100, bodyRows: 20 });
   revision++; release({ revision, entries: [entry('sent', 'directUserMessage', 'hello')] }); await sending; await flushTimers(ui);
-  assert.equal(ui.scrolls.filter(s => s.to === 'end').length, before);
+  assert.equal(ui.scrolls.filter(s => s.to?.key === 'codex_tail_a' && s.block === 'end').length, before);
 });
 
 test('switching or closing discards a delayed history result', async t => {

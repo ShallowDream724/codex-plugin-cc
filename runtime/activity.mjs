@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 const runFile = promisify(execFile);
 const previewScript = fileURLToPath(new URL('../scripts/image-preview.ps1', import.meta.url));
+const inlineScript = fileURLToPath(new URL('../scripts/image-inline.ps1', import.meta.url));
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
@@ -299,6 +300,21 @@ export class ActivityStore {
     this.exportQueue = operation.catch(() => {});
     return operation;
   }
+  async inlinePreview(sourcePath) {
+    if (process.platform !== 'win32') return null;
+    try {
+      const info = await stat(sourcePath);
+      if (!info.isFile() || info.size <= 0 || info.size > 10 * 1024 * 1024) return null;
+      const { stdout } = await runFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', inlineScript], {
+        windowsHide: true, timeout: 15000, maxBuffer: 100000,
+        env: { ...process.env, CODEX_SUBAGENTS_IMAGE_SOURCE: sourcePath },
+      });
+      const result = JSON.parse(stdout);
+      const valid = (value, max) => typeof value === 'string' && value.length <= Math.ceil(max / 3) * 4 && /^[A-Za-z0-9+/]+={0,2}$/.test(value) && value.startsWith('/9j/');
+      if (!valid(result.thumbnail, 4500) || !valid(result.large, 42000)) return null;
+      return { desktop_thumbnail: `data:image/jpeg;base64,${result.thumbnail}`, desktop_preview: `data:image/jpeg;base64,${result.large}` };
+    } catch { return null; }
+  }
   find(target) {
     const agent = this.controller.find(target);
     if (!agent?.threadId || this.controller.threads.get(agent.threadId) !== agent) throw new Error('Agent thread is unavailable.');
@@ -466,7 +482,11 @@ export class ActivityStore {
           if (found.images.length && !found.truncated) ({ images, omitted, truncated } = found);
         }
       }
-      const batch = await Promise.all(images.slice(offset, offset + 8).map(image => materializeImage(image, (buffer, mime) => this.exportImage(buffer, mime), path => this.exportPreview(path))));
+      const batch = await Promise.all(images.slice(offset, offset + 8).map(async image => {
+        const result = await materializeImage(image, (buffer, mime) => this.exportImage(buffer, mime), path => this.exportPreview(path));
+        const inline = result.previewable && result.path ? await this.inlinePreview(result.path) : null;
+        return inline ? { ...result, ...inline } : result;
+      }));
       return { images: batch, count: images.length, next_offset: offset + 8 < images.length ? offset + 8 : null, ...(omitted ? { omitted: true, notice: truncated ? '原始图片数据已被截断，无法恢复完整图片。' : 'Image scan reached its limit; additional images may not be listed.' } : {}) };
     }
     if (view === 'communication') {

@@ -67,30 +67,32 @@ const older = h => h.painted.find(n => n.type === 'Button' && n.props.key?.start
 test('window navigation reaches earlier and later cached messages over multiple pages', async t => {
   const h = await setup({ live: Array.from({ length: 240 }, (_, i) => entry(i)) }); t.after(h.close);
   assert.equal(messages(h).length, 120); assert.equal(messages(h)[0], 'message-120');
-  for (let i = 0; i < 8 && older(h).props.label === '加载更早消息'; i++) { await h.press(older(h).props.key); await pause(600); }
+  for (let i = 0; i < 8 && messages(h)[0] !== 'message-0'; i++) { h.wheel(-1); await pause(600); }
   assert.equal(messages(h)[0], 'message-0');
   for (let i = 0; i < 20 && !messages(h).includes('message-239'); i++) { h.wheel(1); await pause(350); }
   assert.ok(messages(h).includes('message-239'));
   assert.ok(h.scrolls.filter(s => s.to?.key?.startsWith('codex_history_a_')).length > 3);
 });
 
-test('short list can load earlier history by its button without a wheel event', async t => {
+test('short list loads earlier history automatically without a visible load button', async t => {
   const h = await setup({ history: args => args.cursor ? { entries: [entry(0)], next_cursor: null } : { entries: [entry(1)], next_cursor: { turns_cursor: 'older' } } }); t.after(h.close);
   assert.deepEqual(messages(h), ['message-1']);
-  await h.press(older(h).props.key); await pause(30);
+  assert.ok(!h.painted.some(n => n.type === 'Button' && /加载更早消息|加载后续消息/.test(n.props.label || '')));
+  const markerContainer = h.painted.find(n => n.type === 'Box' && n.props.children?.includes(older(h)));
+  assert.equal(markerContainer?.props.height, 0);
+  assert.equal(markerContainer?.props.overflow, 'hidden', 'the measurement marker cannot be seen or clicked');
+  h.wheel(-1); await pause(100);
   assert.deepEqual(messages(h), ['message-0', 'message-1']);
 });
 
-test('wheel returns immediately while a history request is unfinished and late history does not move the view', async t => {
+test('continued upward scrolling during an unfinished history request completes navigation', async t => {
   let resolveHistory;
   const h = await setup({ history: args => args.cursor ? new Promise(resolve => { resolveHistory = resolve; }) : { entries: [entry(1)], next_cursor: { turns_cursor: 'older' } } }); t.after(h.close);
   await pause(10);
   const first = h.wheel(-1, 0); assert.equal(first.offset, 0);
   await pause(45);
-  const second = h.wheel(1, 7); assert.equal(second.offset, 7);
-  resolveHistory({ entries: [entry(0)], next_cursor: null }); await pause(35);
-  assert.deepEqual(messages(h), ['message-1']);
-  await h.press(older(h).props.key); await pause(25);
+  const second = h.wheel(-1, 0); assert.equal(second.offset, 0);
+  resolveHistory({ entries: [entry(0)], next_cursor: null }); await pause(100);
   assert.deepEqual(messages(h), ['message-0', 'message-1']);
 });
 
@@ -98,16 +100,16 @@ test('budget-limited windows preserve access to both sides of the cached convers
   const live = Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(2000)}` } }));
   const h = await setup({ live }); t.after(h.close);
   const initial = messages(h); assert.ok(initial.length < 100); assert.ok(initial.at(-1).startsWith('message-99 '));
-  for (let i = 0; i < 60 && !messages(h).some(x => x.startsWith('message-0 ')); i++) { await h.press(older(h).props.key); await pause(75); }
+  for (let i = 0; i < 60 && !messages(h).some(x => x.startsWith('message-0 ')); i++) { h.wheel(-1); await pause(75); }
   assert.ok(messages(h).some(x => x.startsWith('message-0 ')));
   for (let i = 0; i < 40 && !messages(h).some(x => x.startsWith('message-99 ')); i++) { h.wheel(1); await pause(100); }
   assert.ok(messages(h).some(x => x.startsWith('message-99 ')));
 });
 
-test('empty initial history can load an older page by clicking', async t => {
+test('empty initial history can load an older page by scrolling', async t => {
   const h = await setup({ history: args => args.cursor ? { entries: [entry(0)], next_cursor: null } : { entries: [], next_cursor: { turns_cursor: 'older' } } }); t.after(h.close);
   assert.deepEqual(messages(h), []);
-  await h.press(older(h).props.key); await pause(30);
+  h.wheel(-1); await pause(100);
   assert.deepEqual(messages(h), ['message-0']);
 });
 
@@ -119,14 +121,15 @@ test('live updates during a navigation measurement retain the range and appear a
     revision: () => ({ revision, entries: live }),
     onMeasurement: key => key.endsWith('_1') && !release ? new Promise(resolve => { release = resolve; started(); }) : undefined,
   }); t.after(h.close);
-  const navigation = h.press(older(h).props.key);
+  h.wheel(-1);
   await measuring;
+  h.wheel(-1, 0);
   live = [{ ...entry(130), data: { text: 'message-130 updated with extra height\n'.repeat(30) } }, entry(240)]; revision++;
   await h.tick(); await h.draw();
   assert.ok(messages(h).includes('message-130'), 'the measured frame remains stable during the update');
   assert.ok(!messages(h).some(text => text.includes('extra height')));
-  release(); await navigation; await pause(600); await h.draw();
-  assert.equal(messages(h)[0], 'message-90');
+  release(); await pause(600); await h.draw();
+  assert.equal(messages(h)[0], 'message-90', 'continued upward scrolling does not interrupt the in-flight window change');
   assert.ok(messages(h).some(text => text.startsWith('message-130 updated with extra height')));
   assert.ok(messages(h).includes('message-179'));
   for (let i = 0; i < 12 && !messages(h).includes('message-240'); i++) { h.wheel(1); await pause(120); }
@@ -150,8 +153,8 @@ test('wheel navigation uses a fresh surface message frame for measurements', asy
   await h.host.callback(() => h.$.ui.scroll({ to: { key: older(h).props.key }, block: 'start' }));
   assert.equal(scrollHooks.calls.length, before, 'a raw native callback origin excludes all own registrations');
   assert.equal(h.offset, 3, 'without an observer the native scroll reaches the target');
-  await h.press(older(h).props.key); await h.waitNavigation();
-  assert.equal(messages(h)[0], 'message-0', 'registered ui.press remains a working navigation path');
+  h.wheel(-1, 0); await h.waitNavigation();
+  assert.equal(messages(h)[0], 'message-0', 'another wheel event continues navigation');
 });
 
 test('a stale surface navigation token cannot move the window', async t => {

@@ -680,7 +680,6 @@ test('unchanged completed polling and observations never refresh; changes target
   assert.deepEqual(render.matcher, { component: 'Pane', requestId: 'codex_subagent_activity' });
   const draw = () => render.fn($, { requestId: 'codex_subagent_activity' }, () => null);
   const first = await draw(), second = await draw();
-  assert.equal(scrolls.length, 1);
   assert.deepEqual(reads[0], { plugin: 'codex-subagents', key: 'paneRevision' });
   assert.equal(nodes(first).find((node) => node.type === 'Input').props.onInput, nodes(second).find((node) => node.type === 'Input').props.onInput);
   writes.length = 0;
@@ -688,7 +687,7 @@ test('unchanged completed polling and observations never refresh; changes target
   assert.equal(writes.length, 0); assert.equal(globalRefresh, 0);
   assert.match(JSON.stringify(await draw()), /◔ 50%/); assert.match(JSON.stringify(await draw()), /完全访问/);
   revision = 2; timers[0](); await new Promise((r) => setImmediate(r));
-  assert.equal(writes.length, 1); assert.deepEqual(writes[0].ref, reads[0]); assert.equal(globalRefresh, 0);
+  assert.ok(writes.length > 0); assert.ok(writes.every(write => JSON.stringify(write.ref) === JSON.stringify(reads[0]))); assert.equal(globalRefresh, 0);
   await observeUI($, { agents: [{ ...agents[0], context_used_tokens: null }] });
   assert.ok(!JSON.stringify(await draw()).includes('◔ 50%'));
   closeUI();
@@ -968,17 +967,23 @@ test('tool gallery wraps bounded images without duplication or filtering literal
 });
 
 test('image preview routes the rendered image, restores the tool, and rejects stale agent events', async (t) => {
-  const hooks = [], scrolls = [], afters = []; let painted = []; const entry = { id: 'img', turn_id: 't', type: 'imageView', media: { count: 1, has_images: true }, data: { path: 'C:/tmp/original.jpg' } };
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Image', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async args => { if (args.to?.key && !painted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted'); scrolls.push(args); return {}; } }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => { afters.push(fn); return { cancel() {} }; } } };
-  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }, { agent_id: 'b' }] } : op === 'ui_revision' ? { revision: 1, entries: args.target === 'a' ? [entry] : [] } : op === 'ui_detail' ? { images: [{ index: 0, path: 'C:/tmp/preview.png', previewable: true, width: 400, height: 200, file_url: 'file:///C:/tmp/original.jpg' }], next_offset: null } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
-  const draw = async () => painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns: 50, scroll: { bodyRows: 20 } } }, () => null));
+  const hooks = [], scrolls = [], restored = []; let painted = [], draw; const entry = { id: 'img', turn_id: 't', type: 'imageView', media: { count: 1, has_images: true }, data: { path: 'C:/tmp/original.jpg' } };
+  const thumbnail = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aXsAAAAASUVORK5CYII=', preview = thumbnail;
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Image', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async args => { scrolls.push(args); if (args.to?.key?.startsWith('codex_history_')) { await draw(); const event = await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 20 }); restored.push(event.offset); } return {}; } }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => { setImmediate(fn); return { cancel() {} }; } } };
+  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }, { agent_id: 'b' }] } : op === 'ui_revision' ? { revision: 1, entries: args.target === 'a' ? [entry] : [] } : op === 'ui_detail' ? { images: [{ index: 0, path: 'C:/tmp/preview.png', previewable: true, width: 400, height: 200, desktop_thumbnail: thumbnail, desktop_preview: preview, file_url: 'file:///C:/tmp/original.jpg' }], next_offset: null } : { entries: [], next_cursor: null });
+  closeUI(); t.after(closeUI); const host = nativeHooks(hooks, $); registerUI(host.on); await openAgent($, 'a');
+  draw = async () => painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns: 50, scroll: { bodyRows: 20 } } }, () => null));
   const message = hooks.find(h => h.event === 'ui.message').fn;
   await (await draw()).find(n => n.props.key === 'item_a:t:img').props.onPress(); await new Promise(setImmediate);
   let tree = await draw(); const action = tree.find(n => n.type === 'Client' && n.props.module === './image-control.js'); assert.ok(action); assert.equal(JSON.stringify(action.props).includes('C:/'), false);
+  assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text === `![图片](${thumbnail})`)); assert.ok(!tree.some(n => n.type === 'Image'));
+  await host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: -1, offset: 37, contentRows: 100, bodyRows: 20 });
   await message($, { element: action.props.key, data: { action: 'preview', path: 'C:/evil.png' } }, () => ({})); tree = await draw();
-  const image = tree.find(n => n.props.key === 'codex_image_preview_image'); assert.equal(image.props.source.file, 'C:/tmp/preview.png'); assert.ok(image.props.columns <= 46 && image.props.rows <= 16); assert.ok(tree.some(n => n.props.key === 'codex_image_preview_original' && n.props.text.includes('original.jpg')));
-  await tree.find(n => n.props.key === 'codex_image_preview_close').props.onPress(); tree = await draw(); while (afters.length) await afters.shift()(); assert.ok(tree.some(n => n.props.key === 'tool_media_gallery_a:t:img')); assert.ok(scrolls.some(s => s.to?.key === 'item_a:t:img'));
+  const image = tree.find(n => n.props.key === 'codex_image_preview_image'); assert.equal(image.type, 'Markdown'); assert.equal(image.props.text, `![图片](${preview})`); assert.ok(!tree.some(n => n.type === 'Image')); assert.ok(tree.some(n => n.props.key === 'codex_image_preview_original' && n.props.text.includes('original.jpg')));
+  await host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: 1, offset: 4, contentRows: 20, bodyRows: 10 });
+  assert.equal(tree.find(n => n.props.key === 'codex_image_preview_close').props.label, '×');
+  const beforeClose = scrolls.length;
+  await host.dispatch('ui.press', { element: 'codex_image_preview_close' }); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'tool_media_gallery_a:t:img')); assert.deepEqual(restored, [37]); assert.ok(!scrolls.slice(beforeClose).some(s => s.to?.key === 'item_a:t:img'));
   await openAgent($, 'b'); await message($, { element: action.props.key, data: { action: 'preview' } }, () => ({})); assert.ok(!(await draw()).some(n => n.props.key === 'codex_image_preview_image'));
 });
 

@@ -920,6 +920,12 @@ test('Windows codecs convert generated JPEG GIF BMP previews and preserve origin
       assert.notEqual(result.path, fileURLToPath(result.file_url));
       assert.deepEqual(await readFile(fileURLToPath(result.file_url)), Buffer.from(sources[i].data, 'base64'));
       assert.deepEqual((await readFile(result.path)).subarray(0, 8), Buffer.from([137,80,78,71,13,10,26,10]));
+      for (const [key, limit] of [['desktop_thumbnail', 4500], ['desktop_preview', 42000]]) {
+        assert.match(result[key], /^data:image\/jpeg;base64,/);
+        const bytes = Buffer.from(result[key].split(',')[1], 'base64');
+        assert.ok(bytes.length <= limit);
+        assert.deepEqual(bytes.subarray(0, 3), Buffer.from([0xff, 0xd8, 0xff]));
+      }
     }
     assert.match(first.images[1].notice, /first frame/);
     const second = await store.detail(args); assert.deepEqual(second.images.map(image => image.path), first.images.map(image => image.path));
