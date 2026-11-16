@@ -432,9 +432,11 @@ export class ActivityStore {
     const agent = this.find(target), bucket = this.bucket(agent.id);
     return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: orderWaits(bucket.entries) }) };
   }
-  async history({ target, cursor, limit = 30 } = {}) {
+  async history({ target, cursor, limit = 30, character_budget: characterBudget } = {}) {
     const agent = this.find(target);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new TypeError('limit must be between 1 and 50.');
+    if (characterBudget !== undefined && (!Number.isInteger(characterBudget) || characterBudget < 16000 || characterBudget > 100000)) throw new TypeError('character_budget must be between 16000 and 100000.');
+    const maxLimit = characterBudget === undefined ? 50 : 400;
+    if (!Number.isInteger(limit) || limit < 1 || limit > maxLimit) throw new TypeError(`limit must be between 1 and ${maxLimit}.`);
     if (cursor != null && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor))) throw new TypeError('Invalid history cursor.');
     let { turn_id: turnId, turns_cursor: turnsCursor, items_cursor: itemsCursor, seen_turn_cursors: seenTurns = [], seen_item_cursors: seenItems = [] } = cursor ?? {};
     const validToken = (v) => v == null || (typeof v === 'string' && v.length > 0);
@@ -443,7 +445,7 @@ export class ActivityStore {
     seenTurns = new Set(seenTurns); seenItems = new Set(seenItems);
     const entries = [];
     // Bound work even when native pages contain only hidden or empty items.
-    let requests = 0, done = false;
+    let requests = 0, done = false, projectedChars = 2;
     const advance = (current, next, seen) => {
       if (!validToken(next)) throw new Error('Invalid native history cursor.');
       if (current) {
@@ -453,7 +455,7 @@ export class ActivityStore {
       if (next && seen.has(next)) throw new Error('Repeated native history cursor.');
       return next ?? null;
     };
-    while (entries.length < limit && requests < 80 && !done) {
+    while (entries.length < limit && requests < 80 && !done && (characterBudget === undefined || projectedChars < characterBudget)) {
       if (!turnId) {
         const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded', ...(turnsCursor ? { cursor: turnsCursor } : {}) });
         requests++;
@@ -464,22 +466,28 @@ export class ActivityStore {
         else if (!turnsCursor) done = true;
         continue;
       }
-      const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit: limit - entries.length, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
+      const pageLimit = Math.min(50, limit - entries.length);
+      const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit: pageLimit, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
       requests++;
-      if ((page.data?.length ?? 0) > limit - entries.length) throw new Error('Native history page exceeded its requested limit.');
+      if ((page.data?.length ?? 0) > pageLimit) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
-      entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => {
+      const projected = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => {
         const actualTurn = entry.turnId ?? turnId;
         const result = simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), actualTurn, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, actualTurn, entry), entry.startedAtMs ?? entry.item.startedAtMs, agent.threadId);
         return result;
-      }));
+      });
+      projectedChars += projected.reduce((total, entry) => total + JSON.stringify(entry).length + 1, 0);
+      if (!entries.length && projected.length) projectedChars--;
+      entries.push(...projected);
       if (!itemsCursor) {
         turnId = null; seenItems = new Set();
         if (!turnsCursor) done = true;
       }
     }
     const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
-    return { agent: this.summary(agent), entries: orderWaits(entries.reverse()), next_cursor };
+    const result = { agent: this.summary(agent), entries: orderWaits(entries.reverse()), next_cursor };
+    if (Buffer.byteLength(JSON.stringify(result), 'utf8') >= 4 * 1024 * 1024) throw new Error('Projected history exceeds the 4 MiB bridge limit.');
+    return result;
   }
   async detail({ target, turn_id, item_id, offset = 0, file_path, view, export: exportMessage, bulk, expand } = {}) {
     const agent = this.find(target);

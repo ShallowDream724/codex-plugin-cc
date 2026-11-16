@@ -70,6 +70,25 @@ test('late native leaf layout preserves the reading anchor after an earlier fram
   assert.equal(positions.at(-1), 95);
 });
 
+test('reading marker displacement ignores layout growth below the anchor', async () => {
+  let controller, calls = 0; const positions = [];
+  controller = paneScroll({ valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n), scroll: async ({ to }) => {
+    assert.equal(to.key, 'reading-marker');
+    calls++;
+    const marker = calls === 1 ? 20 : 30;
+    const rows = calls < 3 ? 140 : 190;
+    controller.observe(event('plugin', marker, marker - 35, rows));
+    return {};
+  } });
+  const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
+  controller.stage(before, true, true);
+  const result = await controller.measure('reading-marker', before, true, true);
+  assert.equal(result.offset, 45, 'only the ten rows inserted before the marker shift the reading position');
+  assert.equal(result.anchorOffset, 30);
+  assert.equal(result.contentRows, 190, 'later content below the marker has grown');
+  assert.equal(positions.at(-1), 45);
+});
+
 for (const scenario of [
   { name: 'layout adjustment', events: [event('person', 10, 0, 140)], expected: 50 },
   { name: 'human movement after layout adjustment', events: [event('person', 10, 0, 140), event('person', 45, 35, 140)], expected: 45 },
