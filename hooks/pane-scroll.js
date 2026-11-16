@@ -12,10 +12,18 @@ export function paneScroll({ scroll, later, valid, position }) {
     get pending() { return !!pending; },
     get disposed() { return disposed; },
     cancel() { disposed = true; serial++; pending = null; },
+    stage(before, above) {
+      pending = { token: ++serial, intent, before, above, staged: true, layoutChange: true, result: null };
+    },
     observe(e) {
       if (e.origin.kind === 'person') {
-        latest = sample(e); intent++;
-        return e;
+        // Desktop reports resize/scroll anchoring as person input too. During
+        // our own layout transaction, a changed geometry is not a new reading
+        // position. Preserve the anchor; same-geometry input remains user-owned.
+        const baseline = latest ?? pending?.before;
+        const layoutChanged = pending?.layoutChange && baseline &&
+          (e.contentRows !== baseline.contentRows || e.bodyRows !== baseline.bodyRows);
+        if (!layoutChanged) { latest = sample(e); intent++; return e; }
       }
       if (!pending) { latest = sample(e); return e; }
       const request = pending;
@@ -36,20 +44,24 @@ export function paneScroll({ scroll, later, valid, position }) {
       return { ...e, offset: result.offset };
     },
     async measure(key, before = null, above = false) {
-      const token = ++serial, request = { intent, before, above, result: null };
+      const request = pending?.staged && pending.before === before && pending.above === above
+        ? pending : { token: ++serial, intent, before, above, result: null };
+      const token = request.token;
+      request.staged = false;
       pending = request;
-      let previous = null, result = null;
+      let previous = null, result = null, elapsed = 0;
       // A missing key means the host has not painted this revision yet. The
       // retries are bounded and run independently of native scrolling.
       for (const delay of before ? [0, 32, 64, 128] : [0, 16, 32, 64, 128]) {
         if (disposed || !valid() || token !== serial) break;
         if (delay) await new Promise(resolve => later(delay, resolve));
+        elapsed += delay;
         if (disposed || !valid() || token !== serial) break;
         request.result = null;
         try { await scroll({ to: { key }, block: 'start' }); } catch { /* Not drawn yet. */ }
         if (request.result) {
           result = request.result;
-          if (!before || previous && previous.contentRows === result.contentRows && previous.bodyRows === result.bodyRows) break;
+          if (!before || elapsed >= 96 && previous && previous.contentRows === result.contentRows && previous.bodyRows === result.bodyRows) break;
           previous = result;
         }
       }

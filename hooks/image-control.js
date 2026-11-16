@@ -23,5 +23,5 @@ export default function ImageControl(props, surface) {
   surface.onKey(event => {
     if (!event.ctrl && !event.meta && !event.shift && (event.key === 'return' || event.key === ' ')) surface.post({ action: 'preview' });
   });
-  return Box({ key: 'image-hit', width: '100%', height: props.rows, children: [] });
+  return Box({ key: 'image-hit', width: '100%', height: props.natural ? '100%' : props.rows, children: [] });
 }

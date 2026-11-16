@@ -46,9 +46,9 @@ async function setup(handler, { acceptScroll = () => true } = {}) {
 const tailCalls = scrolls => scrolls.filter(s => /^codex_tail_a_\d+$/.test(s.to?.key || '') && s.block === 'end');
 const tailCount = scrolls => new Set(tailCalls(scrolls).map(s => s.to.key)).size;
 const assertTailReveal = scrolls => {
-  assert.equal(scrolls.length, 2, 'the painted tail is confirmed twice');
-  assert.equal(tailCalls(scrolls).length, 2);
-  assert.equal(scrolls[0].to.key, scrolls[1].to.key);
+  assert.ok(scrolls.length >= 2, 'the painted tail is confirmed after geometry settles');
+  assert.equal(tailCalls(scrolls).length, scrolls.length);
+  assert.ok(scrolls.every(call => call.to.key === scrolls[0].to.key));
 };
 
 test('first open starts at the end and reopening restores the saved reading position', async (t) => {
@@ -169,10 +169,21 @@ const flushTimers = async (ui) => {
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const messages = async (ui) => nodes(await ui.draw()).filter(node => node.type === 'Markdown').map(node => node.props.text);
 
+test('initial layout scroll cannot cancel placement, but reading after reveal can', async t => {
+  t.after(closeUI);
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('saved', 'agentMessage', 'saved')], next_cursor: null } : { revision: 1, entries: [] });
+  await ui.scroll(-1, 0);
+  await flushTimers(ui);
+  assertTailReveal(ui.scrolls);
+  await ui.scroll(-1, 10);
+  assert.ok(nodes(await ui.draw()).some(node => node.type === 'Button' && node.props.key === 'codex_jump_a_viewport'));
+});
+
 test('jump control returns to the latest message', async (t) => {
   t.after(closeUI);
   const saved = Array.from({ length: 150 }, (_, i) => entry(String(i), 'agentMessage', 'message ' + i));
   const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: saved, next_cursor: null } : { revision: 1, entries: [] });
+  await flushTimers(ui);
   await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 30, contentRows: 130, bodyRows: 10 });
   const before = ui.scrolls.length;
   const jump = nodes(await ui.draw()).find(node => node.type === 'Button' && node.props.key === 'codex_jump_a_viewport');
@@ -235,6 +246,7 @@ test('a user scroll during an in-flight send refresh cancels the pending jump', 
     if (op === 'ui_send') { block = true; return { agent_id: 'a', status: 'steered' }; }
     if (op === 'ui_revision') { if (block) return new Promise(resolve => { release = resolve; }); return { revision, entries: [] }; }
   });
+  await flushTimers(ui);
   const before = tailCount(ui.scrolls);
   const sending = (await ui.item('codex_message_a')).props.onSubmit('hello');
   while (!release) await new Promise(setImmediate);

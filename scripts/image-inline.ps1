@@ -23,7 +23,7 @@ try {
           $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]$quality)
           try {
             $bitmap.Save($stream, $codec, $params)
-            if ($stream.Length -le $maxBytes) { return [Convert]::ToBase64String($stream.ToArray()) }
+            if ($stream.Length -le $maxBytes) { return @{ data = [Convert]::ToBase64String($stream.ToArray()); width = $width; height = $height } }
           } finally { $params.Dispose(); $stream.Dispose() }
         }
       } finally { $graphics.Dispose(); $bitmap.Dispose() }
@@ -33,5 +33,5 @@ try {
   }
   $thumbnail = Encode-Preview 320 4500
   $large = Encode-Preview 1280 42000
-  @{ thumbnail = $thumbnail; large = $large } | ConvertTo-Json -Compress
+  @{ thumbnail = $thumbnail.data; thumbnail_width = $thumbnail.width; thumbnail_height = $thumbnail.height; large = $large.data } | ConvertTo-Json -Compress
 } finally { $image.Dispose() }

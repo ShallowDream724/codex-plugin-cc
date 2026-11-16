@@ -785,7 +785,7 @@ test('cold history merges with live deltas, updates duplicates and retains more 
   assert.deepEqual(messages, ['cold-one', 'cold-two', 'new-one updated']);
   recent = Array.from({ length: 260 }, (_, i) => entry(`new-${i + 2}`)); revision++; await timers[0]();
   messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
-  assert.equal(messages.length, 120); assert.equal(messages.at(-1), 'new-261');
+  assert.equal(messages.length, 90); assert.equal(messages.at(-1), 'new-261');
   assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_older'), undefined);
   closeUI();
 });
@@ -793,7 +793,7 @@ test('cold history merges with live deltas, updates duplicates and retains more 
 test('failed discovery has a recovery action without an untargeted composer and read failures keep visible messages', async () => {
   const hooks = [], timers = [], afters = [], panes = []; let discoveryFails = true, historyFails = true, pollFails = false;
 
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async (options) => { panes.push(options); return { isPlaced: true }; }, scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Client'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async (options) => { panes.push(options); return { isPlaced: true }; }, scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
   const entry = (id) => ({ id, type: 'agentMessage', turn_id: 't', data: { text: id } });
   connect($, async (_$, op) => {
     if (op === 'ui_list') return discoveryFails ? { error: { message: 'helper version mismatch' } } : { agents: [{ agent_id: 'a', name: 'Saved agent', status: 'completed' }] };
@@ -812,9 +812,14 @@ test('failed discovery has a recovery action without an untargeted composer and 
   assert.equal(composer.props.borderStyle, undefined); assert.equal(composer.props.gap, 0);
   historyFails = false; await nodes(tree).find((node) => node.props.key === 'codex_retry_conversation').props.onPress();
   tree = await draw(); assert.match(JSON.stringify(tree), /saved reply/); assert.match(JSON.stringify(tree), /live reply/);
-  historyFails = true; while (afters.length) await afters.shift()();
-  await host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: -1, offset: 0, contentRows: 100, bodyRows: 10 });
+  historyFails = true;
+  const initialToken = nodes(tree).find(node => node.props.module === './navigation-sync.js').props.props.tailToken;
+  const tail = host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data: { action: 'tail', token: initialToken } }));
+  for (let i = 0; i < 10; i++) { while (afters.length) await afters.shift()(); await new Promise(setImmediate); }
+  await tail;
   while (afters.length) await afters.shift()();
+  await host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: -1, offset: 0, contentRows: 100, bodyRows: 10 });
+  for (let i = 0; i < 10; i++) { while (afters.length) await afters.shift()(); await new Promise(setImmediate); }
   tree = await draw(); assert.match(JSON.stringify(tree), /saved history unavailable/); assert.match(JSON.stringify(tree), /saved reply/);
   pollFails = true; await timers[0](); tree = await draw(); assert.match(JSON.stringify(tree), /broker offline/); assert.match(JSON.stringify(tree), /live reply/);
   closeUI();
@@ -976,6 +981,8 @@ test('image preview routes the rendered image, restores the tool, and rejects st
   closeUI(); t.after(closeUI); const host = nativeHooks(hooks, $); registerUI(host.on); await openAgent($, 'a');
   draw = async () => painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns: 50, scroll: { bodyRows: 20 } } }, () => null));
   const message = hooks.find(h => h.event === 'ui.message').fn;
+  const initialSync = (await draw()).find(n => n.props.module === './navigation-sync.js');
+  await host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data: { action: 'tail', token: initialSync.props.props.tailToken } }));
   await (await draw()).find(n => n.props.key === 'item_a:t:img').props.onPress(); await new Promise(setImmediate);
   let tree = await draw(); const action = tree.find(n => n.type === 'Client' && n.props.module === './image-control.js'); assert.ok(action); assert.equal(JSON.stringify(action.props).includes('C:/'), false);
   assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text === `![图片](${thumbnail})`)); assert.ok(!tree.some(n => n.type === 'Image'));

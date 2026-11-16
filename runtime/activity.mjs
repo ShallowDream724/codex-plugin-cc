@@ -19,6 +19,7 @@ const previewScript = fileURLToPath(new URL('../scripts/image-preview.ps1', impo
 const inlineScript = fileURLToPath(new URL('../scripts/image-inline.ps1', import.meta.url));
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
+const INLINE_CACHE_LIMIT = 64;
 const PREVIEW_BUDGET = 8192;
 const BINARY = /^(?:base64|imageData|image_data|b64_json)$/i;
 // This is a presentation projection only: it never changes the model's input or
@@ -171,6 +172,7 @@ export class ActivityStore {
     this.agentNames = new Map(); this.turnStates = new Map();
     this.rolloutMedia = new RolloutMedia(client);
     this.exportDir = null; this.exports = new Map(); this.exportSizes = new Map(); this.exportBytes = 0; this.cacheLimits = cacheLimits; this.exportQueue = Promise.resolve(); this.closed = false;
+    this.inlineCache = new Map();
     this.notification = (message) => this.observe(message);
     this.action = (action) => this.recordAction(action);
     client.on('notification', this.notification);
@@ -182,6 +184,7 @@ export class ActivityStore {
     this.live.clear();
     this.agentNames.clear(); this.turnStates.clear();
     this.closed = true;
+    this.inlineCache.clear();
     // Serialize cleanup behind in-flight writes; close remains safe for callers
     // that do not await it, and only files created by this store are removed.
     const cleanup = this.exportQueue.then(async () => {
@@ -301,18 +304,39 @@ export class ActivityStore {
     return operation;
   }
   async inlinePreview(sourcePath) {
-    if (process.platform !== 'win32') return null;
+    if (process.platform !== 'win32' || this.closed) return null;
     try {
       const info = await stat(sourcePath);
-      if (!info.isFile() || info.size <= 0 || info.size > 10 * 1024 * 1024) return null;
+      if (this.closed || !info.isFile() || info.size <= 0 || info.size > 10 * 1024 * 1024) return null;
+      const version = `${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+      const cached = this.inlineCache.get(sourcePath);
+      if (cached?.version === version) {
+        this.inlineCache.delete(sourcePath); this.inlineCache.set(sourcePath, cached);
+        return await cached.promise;
+      }
+      const entry = { version };
+      entry.promise = this.encodeInlinePreview(sourcePath).then(async result => {
+        const after = await stat(sourcePath);
+        return !this.closed && `${after.size}:${after.mtimeMs}:${after.ctimeMs}` === version ? result : null;
+      }).catch(() => null).then(result => {
+        if (!result && this.inlineCache.get(sourcePath) === entry) this.inlineCache.delete(sourcePath);
+        return result;
+      });
+      this.inlineCache.delete(sourcePath); this.inlineCache.set(sourcePath, entry);
+      while (this.inlineCache.size > INLINE_CACHE_LIMIT) this.inlineCache.delete(this.inlineCache.keys().next().value);
+      return await entry.promise;
+    } catch { return null; }
+  }
+  async encodeInlinePreview(sourcePath) {
+    try {
       const { stdout } = await runFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', inlineScript], {
         windowsHide: true, timeout: 15000, maxBuffer: 100000,
         env: { ...process.env, CODEX_SUBAGENTS_IMAGE_SOURCE: sourcePath },
       });
       const result = JSON.parse(stdout);
       const valid = (value, max) => typeof value === 'string' && value.length <= Math.ceil(max / 3) * 4 && /^[A-Za-z0-9+/]+={0,2}$/.test(value) && value.startsWith('/9j/');
-      if (!valid(result.thumbnail, 4500) || !valid(result.large, 42000)) return null;
-      return { desktop_thumbnail: `data:image/jpeg;base64,${result.thumbnail}`, desktop_preview: `data:image/jpeg;base64,${result.large}` };
+      if (!valid(result.thumbnail, 4500) || !valid(result.large, 42000) || !Number.isInteger(result.thumbnail_width) || !Number.isInteger(result.thumbnail_height) || result.thumbnail_width < 1 || result.thumbnail_height < 1 || result.thumbnail_width > 320 || result.thumbnail_height > 320) return null;
+      return { desktop_thumbnail: `data:image/jpeg;base64,${result.thumbnail}`, desktop_preview: `data:image/jpeg;base64,${result.large}`, desktop_thumbnail_width: result.thumbnail_width, desktop_thumbnail_height: result.thumbnail_height };
     } catch { return null; }
   }
   find(target) {

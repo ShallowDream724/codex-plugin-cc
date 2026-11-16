@@ -40,3 +40,20 @@ test('late native leaf layout preserves the reading anchor after an earlier fram
   assert.equal(result.offset, 95, 'the settled layout adds all 60 rows above the same anchor');
   assert.equal(positions.at(-1), 95);
 });
+
+for (const scenario of [
+  { name: 'layout adjustment', events: [event('person', 10, 0, 140)], expected: 50 },
+  { name: 'human movement after layout adjustment', events: [event('person', 10, 0, 140), event('person', 45, 35, 140)], expected: 45 },
+  { name: 'human movement before layout adjustment', events: [event('person', 5, -5, 100), event('person', 5, 0, 140)], expected: 45 },
+]) test(`staged prepend preserves ${scenario.name}`, async () => {
+  let controller; const positions = [];
+  controller = paneScroll({ valid: () => true, later: (_ms, fn) => fn(), position: offset => positions.push(offset),
+    scroll: async () => controller.observe(event('plugin', 0, 0, 140)),
+  });
+  const before = { offset: 10, contentRows: 100, bodyRows: 10 };
+  controller.stage(before, true);
+  for (const input of scenario.events) controller.observe(input);
+  const result = await controller.measure('revision-button', before, true);
+  assert.equal(result.offset, scenario.expected);
+  assert.equal(positions.at(-1), scenario.expected);
+});

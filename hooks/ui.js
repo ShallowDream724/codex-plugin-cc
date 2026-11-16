@@ -13,7 +13,7 @@ const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
 let paneRevision = 0;
 const MAX_DETAILS = 16;
-const VISIBLE_ENTRIES = 120;
+const VISIBLE_ENTRIES = 90;
 const MAX_COPY_LENGTH = 16 * 1024 * 1024;
 const MAX_COPY_PAGES = 1100;
 let copyIntent = 0;
@@ -207,9 +207,9 @@ function holdWindow(page) {
 const historyKey = (id, page) => `codex_history_${id}_${page.layoutRevision ?? 0}`;
 const tailKey = (id, token) => `codex_tail_${id}_${token || 0}`;
 let navigationSequence = 0;
-function scrollPane($, args, valid = () => true, controller = null) {
+function scrollPane($, args, valid = () => true, controller = null, observe = null) {
   const id = state.selected, generation = state.generation;
-  const request = { controller, valid: () => state.opened && state.selected === id && state.generation === generation && valid() };
+  const request = { controller, observe, valid: () => state.opened && state.selected === id && state.generation === generation && valid() };
   const run = async () => {
     if (!request.valid()) return { deny: 'obsolete navigation' };
     state.programmaticScroll = request;
@@ -225,9 +225,9 @@ function cancelNavigation(page) {
   page.navigationTimeline = null; page.adding = null; page.navigating = false;
   page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel();
 }
-function requestTail($, id) {
+function requestTail($, id, placement = false) {
   const page = pageFor(id);
-  page.tailRequest = { token: ++navigationSequence, generation: state.generation, scrollGeneration: page.scrollGeneration };
+  page.tailRequest = { token: ++navigationSequence, generation: state.generation, scrollGeneration: page.scrollGeneration, placement };
   page.tailMarkerToken = page.tailRequest.token;
   return invalidate($);
 }
@@ -279,6 +279,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   page.followTail = false; page.windowAnchor = null;
   page.windowStart = start; page.windowEnd = end; page.windowSize = Math.max(1, end - start);
   page.layoutRevision = (page.layoutRevision ?? 0) + 1;
+  scroller.stage(before, above);
   await invalidate($);
   const after = await scroller.measure(historyKey(id, page), before, above);
   return !!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner;
@@ -300,8 +301,10 @@ async function browseHistory($, id, direction) {
     // Trim only the opposite, off-screen side, then measure that frame before
     // adding anything. Mixing a prepend and a tail eviction in one redraw
     // makes total-height compensation incorrect.
-    while (view.entries.length > 1 && (page.renderCost?.chars > 44000 || page.renderCost?.nodes > 7000)) {
-      const keep = Math.max(1, Math.min(60, Math.floor(view.entries.length / 2)));
+    const keepGroups = Math.max(60, Math.ceil(page.scroller?.latest?.bodyRows || 0));
+    while (view.entries.length > 1 && (groupEntries(view.entries).length >= keepGroups + 30 || page.renderCost?.chars > 44000 || page.renderCost?.nodes > 7000)) {
+      const groups = groupEntries(view.entries), countTrim = groups.length >= keepGroups + 30;
+      const keep = countTrim ? (direction < 0 ? groups.slice(0, keepGroups) : groups.slice(-keepGroups)).reduce((sum, group) => sum + group.items.length, 0) : Math.max(1, Math.min(60, Math.floor(view.entries.length / 2)));
       const start = direction < 0 ? view.start : view.start + view.entries.length - keep;
       if (!await resizeWindow($, id, page, start, start + keep, direction > 0, owner)) return;
       view = drawnWindow(page);
@@ -507,10 +510,23 @@ async function chooseAttachments($, id, source = 'file') {
   function prefetchHistory($, id) {
     const page = pageFor(id), cursor = page.cursor, cursorKey = JSON.stringify(cursor);
     if (!cursor || !state.opened || state.selected !== id) return;
-    if (page.historyPrefetch?.cursorKey === cursorKey) return page.historyPrefetch.promise;
-    const promise = bridge($, 'ui_history', { target: id, cursor }).catch(error => ({ error: { message: failureText(error) } }));
-    page.historyPrefetch = { cursorKey, promise };
-    return promise;
+    const cache = page.historyPrefetches ??= new Map(), generation = state.generation;
+    const start = value => {
+      const key = JSON.stringify(value);
+      if (!cache.has(key)) {
+        cache.set(key, { promise: bridge($, 'ui_history', { target: id, cursor: value }).catch(error => ({ error: { message: failureText(error) } })) });
+        while (cache.size > 2) cache.delete(cache.keys().next().value);
+      }
+      return cache.get(key);
+    };
+    const entry = start(cursor);
+    if (!entry.warmed) {
+      entry.warmed = true;
+      void entry.promise.then(result => {
+        if (state.opened && state.selected === id && state.generation === generation && !result.error && result.next_cursor && JSON.stringify(result.next_cursor) !== cursorKey) start(result.next_cursor);
+      });
+    }
+    return entry.promise;
   }
   function queueHistoryPrefetch($, id) {
     if (!pageFor(id).cursor) return;
@@ -529,7 +545,7 @@ async function chooseAttachments($, id, source = 'file') {
     try {
       const result = await prefetchHistory($, id);
       if (!state.opened || state.selected !== id || state.generation !== gen) return;
-      page.historyPrefetch = null;
+      page.historyPrefetches?.delete(JSON.stringify(cursor));
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
       if (result.next_cursor && JSON.stringify(result.next_cursor) === JSON.stringify(cursor)) throw new Error('历史读取位置未推进');
       const previous = drawnWindow(page), first = previous.entries[0] && entryKey(previous.entries[0]);
@@ -613,7 +629,7 @@ async function chooseAttachments($, id, source = 'file') {
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
     if (state.restore) await scrollPane($, { to: 'start' }).catch(() => {});
-    else await requestTail($, state.selected);
+    else await requestTail($, state.selected, true);
     if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false, view) {
@@ -742,10 +758,16 @@ export function registerUI(on) {
     if (state.imagePreview || state.restoringPreview) return next(e);
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
+    // Before the new tail marker is painted, native layout/clamping may emit
+    // "person" scroll events. They cannot cancel the requested initial/jump
+    // placement; after the first reveal, genuine upward input owns it again.
+    const tail = page?.tailRequest;
+    if (tail?.placement && (!tail.revealed || tail.geometry && (e.contentRows !== tail.geometry.contentRows || e.bodyRows !== tail.geometry.bodyRows))) return next(e);
     const view = page && drawnWindow(page);
     const atBottom = Number.isFinite(e.contentRows) && Number.isFinite(e.bodyRows) && e.offset >= e.contentRows - e.bodyRows - 1;
     const controller = page && scrollController($, id, page);
-    controller?.observe(e);
+    const intent = controller?.intent, observed = controller?.observe(e);
+    if (controller && controller.intent === intent) return next(observed);
     if (e.origin.kind === 'person' && id) {
       const wasFollowing = page.followTail;
       page.browseTimer?.cancel();
@@ -766,7 +788,7 @@ export function registerUI(on) {
     if (e.origin.kind === 'person' && id && state.opened && !page.navigating) {
       const threshold = Math.max(2, (e.bodyRows || 12) * 2);
       if (e.by < 0 && e.offset <= threshold && page.cursor) prefetchHistory($, id);
-      const needsTrim = page.renderCost?.chars > 44000 || page.renderCost?.nodes > 7000;
+      const needsTrim = groupEntries(view.entries).length >= Math.max(90, Math.ceil(e.bodyRows || 0) + 30) || page.renderCost?.chars > 44000 || page.renderCost?.nodes > 7000;
       const earlier = e.by < 0 && e.offset <= (needsTrim ? 1 : threshold) && (view.start > 0 || page.cursor);
       const later = e.by > 0 && e.offset >= e.contentRows - e.bodyRows - (needsTrim ? 1 : threshold) && view.start + view.entries.length < view.total;
       if (earlier || later) {
@@ -783,6 +805,7 @@ export function registerUI(on) {
     if (!page) return next(e);
     const transfer = state.programmaticScroll;
     if (transfer && !transfer.valid()) return next({ ...e, offset: state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
+    transfer?.observe?.(e);
     if (transfer?.controller?.pending) return next(transfer.controller.observe(e));
     if (page.scroller?.pending) return next(page.scroller.observe(e));
     if (state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(id) || 0 }); }
@@ -813,12 +836,21 @@ export function registerUI(on) {
       if (!request || request.token !== e.data.token || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) return {};
       // to:'end' also enables native followEnd(), which can pull a later upward
       // scroll back down. A keyed reveal is strictly a single movement.
-      let revealed = false;
+      let previousGeometry = null, elapsed = 0;
       for (const delay of [0, 32, 64, 128]) {
         if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
+        elapsed += delay;
         if (state.selected !== id || page.tailRequest !== request || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) break;
-        const result = await scrollPane($, { to: { key: tailKey(id, request.token) }, block: 'end' }, () => page.tailRequest === request && request.scrollGeneration === page.scrollGeneration && page.followTail).catch(() => ({ deny: 'not painted' }));
-        if (!result?.deny) { if (revealed) break; revealed = true; }
+        let geometry;
+        const result = await scrollPane($, { to: { key: tailKey(id, request.token) }, block: 'end' }, () => page.tailRequest === request && request.scrollGeneration === page.scrollGeneration && page.followTail, null, event => {
+          geometry = { contentRows: event.contentRows, bodyRows: event.bodyRows };
+          request.geometry = geometry;
+        }).catch(() => ({ deny: 'not painted' }));
+        if (!result?.deny) {
+          request.revealed = true;
+          if (elapsed >= 96 && geometry && previousGeometry && geometry.contentRows === previousGeometry.contentRows && geometry.bodyRows === previousGeometry.bodyRows) break;
+          previousGeometry = geometry;
+        }
       }
       if (page.tailRequest === request) { page.tailRequest = null; await invalidate($); }
       return {};
@@ -894,7 +926,7 @@ function renderPane($, e, next, attempt = {}) {
     const jump = async () => {
       cancelNavigation(page);
       page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
-      await requestTail($, id);
+      await requestTail($, id, true);
     };
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
@@ -905,8 +937,8 @@ function renderPane($, e, next, attempt = {}) {
         ? Markdown({ key: `image_view_${key}`, text: image.desktop_thumbnail ? `![图片](${image.desktop_thumbnail})` : image.file_url ? `[打开图片](${image.file_url})` : '图片预览暂不可用' })
         : Image({ key: `image_view_${key}`, source: { file: image.path, format: 'png' }, ...size, alt: safe(image.alt || '图片') });
       if (typeof Client !== 'function') return Box({ key: `image_region_${key}`, flexDirection: 'column', children: [imageNode, Button({ key: actionKey, plain: true, label: '查看大图', onPress: () => showImagePreview($, id, { image, foldKey }) })] });
-      return Box({ key: `image_region_${key}`, position: 'relative', width: size.columns, height: size.rows, children: [imageNode,
-        Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key: actionKey, module: './image-control.js', width: size.columns, height: size.rows, props: { rows: size.rows } })] }),
+      return Box({ key: `image_region_${key}`, position: 'relative', width: size.columns, ...(e.surface === 'desktop' ? {} : { height: size.rows }), children: [imageNode,
+        Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key: actionKey, width: size.columns, ...(e.surface === 'desktop' ? { flexGrow: 1 } : { height: size.rows }), module: './image-control.js', props: { rows: size.rows, natural: e.surface === 'desktop' } })] }),
       ] });
     };
     const hint = (key, child, label, width = 18, left = 0, visible = false) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: visible ? 'flex' : 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
@@ -1235,7 +1267,7 @@ function renderPane($, e, next, attempt = {}) {
       const edgeToken = edgeDirection ? JSON.stringify([state.generation, id, edgeDirection, view.start, entries.length, view.total, page.cursor, page.layoutRevision || 0]) : '';
       page.edgeKey = edgeToken;
       const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
-      return Box({ key: 'codex_conversation', position: 'relative', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
+      return Box({ key: 'codex_conversation', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
     };
     let tree = root([timeline]);
     if (!budget.fits(tree) && entries.length > 1) {

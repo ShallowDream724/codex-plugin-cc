@@ -917,6 +917,7 @@ test('Windows codecs convert generated JPEG GIF BMP previews and preserve origin
     for (let i = 0; i < formats.length; i++) {
       const result = first.images[i]; assert.equal(result.previewable, true, result.notice); assert.equal(result.mime_type, formats[i][1]);
       assert.equal(result.preview_mime_type, 'image/png'); assert.equal(result.width, 1280); assert.equal(result.height, 640);
+      assert.equal(result.desktop_thumbnail_width, 320); assert.equal(result.desktop_thumbnail_height, 160);
       assert.notEqual(result.path, fileURLToPath(result.file_url));
       assert.deepEqual(await readFile(fileURLToPath(result.file_url)), Buffer.from(sources[i].data, 'base64'));
       assert.deepEqual((await readFile(result.path)).subarray(0, 8), Buffer.from([137,80,78,71,13,10,26,10]));
@@ -931,6 +932,34 @@ test('Windows codecs convert generated JPEG GIF BMP previews and preserve origin
     const second = await store.detail(args); assert.deepEqual(second.images.map(image => image.path), first.images.map(image => image.path));
     const paths = first.images.map(image => image.path); await store.close();
     for (const path of paths) await assert.rejects(readFile(path), /ENOENT/);
+  } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('inline preview shares work, invalidates changes, retries failures, and clears on close', { skip: process.platform !== 'win32' }, async () => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'codex-inline-test-'));
+  const path = join(dir, 'preview.png');
+  const { store } = fixture();
+  try {
+    await writeFile(path, 'one');
+    let calls = 0, release;
+    store.encodeInlinePreview = async () => { calls++; await new Promise(resolve => { release = resolve; }); return { value: calls }; };
+    const pending = [store.inlinePreview(path), store.inlinePreview(path)];
+    while (!release) await new Promise(resolve => setImmediate(resolve));
+    release();
+    assert.deepEqual(await Promise.all(pending), [{ value: 1 }, { value: 1 }]);
+    assert.deepEqual(await store.inlinePreview(path), { value: 1 });
+    assert.equal(calls, 1);
+    await writeFile(path, 'changed');
+    store.encodeInlinePreview = async () => { calls++; return null; };
+    assert.equal(await store.inlinePreview(path), null);
+    store.encodeInlinePreview = async () => { calls++; return { value: calls }; };
+    assert.deepEqual(await store.inlinePreview(path), { value: 3 });
+    await store.close();
+    assert.equal(store.inlineCache.size, 0);
+    assert.equal(await store.inlinePreview(path), null);
   } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
