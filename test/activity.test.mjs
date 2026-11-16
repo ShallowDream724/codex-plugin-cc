@@ -7,7 +7,7 @@ import { ActivityStore } from '../runtime/activity.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { toolSections, communicationFailure } from '../hooks/tool-presentation.js';
 
-function fixture() {
+function fixture(cacheLimits) {
   const client = new EventEmitter(), controller = new EventEmitter(), requests = [];
   const a = { id: 'a', threadId: 'root', name: 'worker', status: 'running' };
   controller.agents = new Map([[a.id, a]]); controller.threads = new Map([[a.threadId, a]]);
@@ -19,7 +19,7 @@ function fixture() {
     if (method === 'thread/items/list') return { data: [{ turnId: 'turn', outputDeferred: true, item: { id: 'cmd', type: 'commandExecution', command: 'test' } }], nextCursor: 'older-item' };
     if (method === 'thread/items/read') return { data: [{ item: { id: 'cmd', type: 'commandExecution', aggregatedOutput: 'x'.repeat(20000) } }] };
   };
-  return { client, controller, requests, store: ActivityStore.attach(client, controller) };
+  return { client, controller, requests, store: cacheLimits ? new ActivityStore({ client, controller, cacheLimits }) : ActivityStore.attach(client, controller) };
 }
 
 test('message metadata survives previews and requires evidence for a final reply', async () => {
@@ -36,23 +36,53 @@ test('message metadata survives previews and requires evidence for a final reply
   store.close();
 });
 
-test('legacy final inference requires a completed turn and its last message', async () => {
+test('only explicit final phase with completion is final in history and stream', async () => {
   const { client, store } = fixture();
   let status = 'inProgress';
   client.request = async (method) => method === 'thread/turns/list' ? { data: [{ id: 'turn', status }], nextCursor: null } : { data: [
     { item: { id: 'last', type: 'agentMessage', text: 'answer' } },
-    { item: { id: 'old', type: 'agentMessage', text: 'old' } },
+    { item: { id: 'old', type: 'agentMessage', text: 'x'.repeat(10000), phase: 'final_answer' } },
   ], nextCursor: null };
   assert.equal((await store.history({ target: 'a' })).entries.at(-1).message.is_final, false);
   status = 'completed';
   const entries = (await store.history({ target: 'a' })).entries;
-  assert.equal(entries[0].message.is_final, false); assert.equal(entries[1].message.is_final, true);
+  assert.equal(entries[0].message.is_final, true); assert.equal(entries[0].message.phase, 'final_answer'); assert.equal(entries[1].message.is_final, false);
   const emit = (method, params) => client.emit('notification', { method, params: { threadId: 'root', turnId: 'live', ...params } });
   emit('item/completed', { item: { id: 'live-last', type: 'agentMessage', text: 'legacy' } });
   assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, false);
   emit('turn/completed', { turn: { id: 'live', status: 'completed' } });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, false);
+  emit('item/started', { item: { id: 'explicit', type: 'agentMessage', text: 'x'.repeat(10000), phase: 'final_answer' } });
+  emit('item/agentMessage/delta', { itemId: 'explicit', delta: ' more' });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, false);
+  emit('turn/completed', { turn: { id: 'live', status: 'completed' } });
   assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, true);
   store.close();
+});
+
+test('expand reads once, preserves rich text, and exports long messages at Unicode boundaries', async () => {
+  const { client, store } = fixture();
+  let calls = 0, text = '# Heading\n\n' + '**rich** 😀\n'.repeat(1000), type = 'agentMessage';
+  client.request = async () => { calls++; return { data: [{ turnId: 'turn', item: type === 'agentMessage' ? { id: 'body', type, text } : { id: 'body', type: 'dynamicToolCall', tool: 'notify_parent', arguments: { message: text } } }] }; };
+  for (const view of ['message', 'communication']) {
+    type = view === 'message' ? 'agentMessage' : 'communication';
+    let before = calls;
+    const args = { target: 'a', turn_id: 'turn', item_id: 'body', view, expand: true };
+    assert.deepEqual(await store.detail(args), { text, format: 'markdown', total_length: text.length, external: false });
+    assert.equal(calls, before + 1);
+    const short = text; text = 'x'.repeat(47999) + '😀' + '\n**end**'; before = calls;
+    const result = await store.detail(args);
+    assert.equal(calls, before + 1); assert.equal(result.text, 'x'.repeat(47999));
+    assert.equal(result.total_length, text.length); assert.equal(result.format, 'text'); assert.equal(result.external, true);
+    assert.equal(fileURLToPath(result.file_url), result.file_path); assert.equal(readFileSync(result.file_path, 'utf8'), text);
+    text = short;
+  }
+  const before = calls;
+  for (const extra of [{ view: 'output' }, { view: 'message', expand: false }, { view: 'message', offset: 1 }, { view: 'message', file_path: 'x' }, { view: 'message', bulk: true }, { view: 'communication', export: true }]) {
+    await assert.rejects(() => store.detail({ target: 'a', turn_id: 'turn', item_id: 'body', expand: true, ...extra }), /Invalid/);
+  }
+  assert.equal(calls, before);
+  await store.close();
 });
 
 test('message detail returns original text across Unicode boundaries and rejects tools', async () => {
@@ -520,7 +550,7 @@ test('output-only detail preserves safe binary omission and existing non-tool vi
   const payload = 'A'.repeat(20000);
   client.request = async () => ({ data: [{ item: { id: 'tool', type: 'dynamicToolCall', result: { contentItems: [{ type: 'image', data: payload }], structuredContent: { base64: payload } } } }] });
   const result = await store.detail({ target: 'a', turn_id: 't', item_id: 'tool', view: 'output' });
-  assert.match(result.text, /non-text content omitted/); assert.match(result.text, /binary omitted/); assert.ok(!result.text.includes(payload));
+  assert.match(result.text, /binary omitted/); assert.ok(!result.text.includes(payload));
   client.request = async () => ({ data: [{ item: { id: 'message', type: 'agentMessage', text: 'Ordinary message' } }] });
   assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'message', view: 'output' }), { text: 'Ordinary message', next_offset: null });
   client.request = async () => ({ data: [{ item: { id: 'files', type: 'fileChange', changes: [{ path: 'a.js', diff: '@@ -1 +1 @@\n-old\n+new' }] } }] });
@@ -613,4 +643,167 @@ test('long communication arguments cannot hide a later delivery failure', () => 
   assert.equal(communicationFailure(entry), '投递失败');
   assert.ok(JSON.stringify(entry.data).length < 5000);
   store.close();
+});
+
+test('media detail lazily decodes mixed protocol images, pages them, and cleans owned cache', async () => {
+  const { client, store } = fixture();
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=';
+  const blocks = [{ type: 'text', text: 'before' }, ...Array.from({ length: 9 }, () => ({ type: 'image', data: png, mimeType: 'image/png' })), { type: 'text', text: 'after' }];
+  const item = { id: 'media', type: 'mcpToolCall', result: { content: [{ type: 'tool_result', content: blocks }] } };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.deepEqual(entry.media, { count: 9, has_images: true });
+  assert.ok(!JSON.stringify(entry).includes(png)); assert.equal(store.exportDir, null);
+  client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: 'media', view: 'media' };
+  const first = await store.detail(args), second = await store.detail({ ...args, offset: first.next_offset });
+  assert.equal(first.images.length, 8); assert.equal(first.count, 9); assert.equal(second.images.length, 1); assert.equal(second.next_offset, null);
+  assert.equal(first.images[0].previewable, true); assert.equal(first.images[0].width, 1); assert.equal(first.images[0].height, 1);
+  assert.ok(first.images.every(image => image.path === first.images[0].path));
+  assert.equal(readFileSync(first.images[0].path).toString('base64'), png);
+  const output = await store.detail({ ...args, view: 'output' });
+  assert.ok(!output.text.includes(png)); assert.match(output.text, /before/); assert.match(output.text, /after/);
+  const cachePath = first.images[0].path; await store.close();
+  assert.throws(() => readFileSync(cachePath), /ENOENT/);
+});
+
+test('media rejects invalid data, preserves original paths and enforces record ownership', async () => {
+  const { client, store } = fixture();
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=';
+  const file = fileURLToPath(new URL('./media-original.png', import.meta.url));
+  const { writeFile, unlink } = await import('node:fs/promises');
+  await writeFile(file, Buffer.from(png, 'base64'));
+  try {
+    const item = { id: 'media', type: 'dynamicToolCall', result: { contentItems: [
+      { type: 'image', data: 'bad!', mime_type: 'image/png' },
+      { type: 'image', data: png, mimeType: 'image/jpeg' },
+      { type: 'input_image', imageUrl: { url: `data:image/png;base64,${png}` } },
+      { type: 'image', data: 'A'.repeat(14 * 1024 * 1024), mimeType: 'image/png' },
+      { type: 'image', data: png, mimeType: 'image/unknown' },
+    ] } };
+    client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+    const args = { target: 'a', turn_id: 'turn', item_id: 'media', view: 'media' };
+    const result = await store.detail(args);
+    assert.deepEqual(result.images.map(i => i.previewable), [false, false, true, false, false]);
+    assert.ok(result.images.filter(i => !i.previewable).every(i => i.notice));
+    await assert.rejects(() => store.detail({ ...args, target: 'foreign' }), /Unknown/);
+    await assert.rejects(() => store.detail({ ...args, turn_id: 'foreign' }), /unavailable/);
+    await assert.rejects(() => store.detail({ ...args, item_id: 'foreign' }), /unavailable/);
+    client.request = async () => ({ data: [{ turnId: 'turn', item: { id: 'media', type: 'imageView', path: file } }] });
+    const local = (await store.detail(args)).images[0]; assert.equal(local.path, file); assert.equal(local.previewable, true);
+    await store.close(); assert.equal(readFileSync(file).toString('base64'), png);
+  } finally { await unlink(file); }
+});
+
+test('non-PNG image bytes stay intact and unrelated business data stays text', async () => {
+  const { client, store } = fixture();
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const item = { id: 'media', type: 'mcpToolCall', result: { content: [
+    { type: 'text', text: 'first' }, { type: 'image', data: jpeg.toString('base64'), mimeType: 'image/jpeg' },
+    { type: 'text', text: 'last' },
+  ], structuredContent: { data: 'ordinary business data', category: 'photo' } } };
+  client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: 'media' };
+  const image = (await store.detail({ ...args, view: 'media' })).images[0];
+  assert.equal(image.previewable, false); assert.equal(image.mime_type, 'image/jpeg'); assert.ok(image.file_url); assert.deepEqual(readFileSync(image.path), jpeg);
+  const text = (await store.detail({ ...args, view: 'output' })).text;
+  assert.ok(text.indexOf('first') < text.indexOf('last')); assert.match(text, /ordinary business data/); assert.ok(!text.includes(jpeg.toString('base64')));
+  await store.close();
+});
+
+test('image-only output has no text while mixed text and safe raw metadata remain', async () => {
+  const { client, store } = fixture();
+  const payload = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=';
+  let content = [{ type: 'tool_result', content: [{ type: 'image', mimeType: 'image/png', data: payload }] }];
+  const item = () => ({ id: 'media', type: 'mcpToolCall', result: { content } });
+  client.request = async () => ({ data: [{ turnId: 'turn', item: item() }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: 'media' };
+  assert.equal((await store.detail({ ...args, view: 'output' })).text, '');
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item: item() } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.ok(!JSON.stringify(entry).includes(payload)); assert.match(JSON.stringify(entry.data), /media_omitted/);
+  content = [{ type: 'text', text: 'first' }, { type: 'image', mimeType: 'image/png', data: payload }, { type: 'text', text: 'last' }];
+  assert.equal((await store.detail({ ...args, view: 'output' })).text, 'first\nlast');
+  content = [{ type: 'text', text: '[image omitted from text]' }];
+  assert.equal((await store.detail({ ...args, view: 'output' })).text, '[image omitted from text]');
+  await store.close();
+});
+
+test('media sanitization bounds deeply nested and cyclic data', async () => {
+  const { sanitizeMedia } = await import('../shared/tool-media.mjs');
+  const root = {}, cyclic = { root }; let node = root;
+  for (let i = 0; i < 10000; i++) { node.next = {}; node = node.next; }
+  node.back = cyclic;
+  assert.match(JSON.stringify(sanitizeMedia(root)), /nested data omitted/);
+  const loop = {}; loop.self = loop;
+  assert.match(JSON.stringify(sanitizeMedia(loop)), /circular data omitted/);
+});
+
+test('Windows codecs convert generated JPEG GIF BMP previews and preserve originals', { skip: process.platform !== 'win32' }, async () => {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const dir = await mkdtemp(join(tmpdir(), 'codex-preview-test-'));
+  const script = `Add-Type -AssemblyName System.Drawing\n$b = New-Object System.Drawing.Bitmap(1600, 800)\ntry { $b.SetPixel(0, 0, [System.Drawing.Color]::Red); foreach ($kind in @('Jpeg', 'Gif', 'Bmp')) { $f = [System.Drawing.Imaging.ImageFormat]::$kind; $b.Save((Join-Path $env:CODEX_PREVIEW_FIXTURES ($kind.ToLower() + '.img')), $f) } } finally { $b.Dispose() }`;
+  const { client, store } = fixture();
+  try {
+    await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, timeout: 15000, env: { ...process.env, CODEX_PREVIEW_FIXTURES: dir } });
+    const formats = [['jpeg', 'image/jpeg'], ['gif', 'image/gif'], ['bmp', 'image/bmp']];
+    const sources = await Promise.all(formats.map(async ([name, mimeType]) => ({ type: 'image', mimeType, data: (await readFile(join(dir, `${name}.img`))).toString('base64') })));
+    const item = { id: 'media', type: 'mcpToolCall', result: { content: sources } };
+    client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+    const args = { target: 'a', turn_id: 'turn', item_id: 'media', view: 'media' };
+    const started = Date.now(); const first = await store.detail(args); const elapsed = Date.now() - started;
+    assert.ok(elapsed < 30000, `conversions took ${elapsed}ms`);
+    for (let i = 0; i < formats.length; i++) {
+      const result = first.images[i]; assert.equal(result.previewable, true, result.notice); assert.equal(result.mime_type, formats[i][1]);
+      assert.equal(result.preview_mime_type, 'image/png'); assert.equal(result.width, 1280); assert.equal(result.height, 640);
+      assert.notEqual(result.path, fileURLToPath(result.file_url));
+      assert.deepEqual(await readFile(fileURLToPath(result.file_url)), Buffer.from(sources[i].data, 'base64'));
+      assert.deepEqual((await readFile(result.path)).subarray(0, 8), Buffer.from([137,80,78,71,13,10,26,10]));
+    }
+    assert.match(first.images[1].notice, /first frame/);
+    const second = await store.detail(args); assert.deepEqual(second.images.map(image => image.path), first.images.map(image => image.path));
+    const paths = first.images.map(image => image.path); await store.close();
+    for (const path of paths) await assert.rejects(readFile(path), /ENOENT/);
+  } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('media scanning is bounded and reports when its image or node limit is reached', async () => {
+  const { client, store } = fixture();
+  const image = { type: 'image', mimeType: 'image/png', data: 'a' };
+  let item = { id: 'media', type: 'mcpToolCall', result: { content: Array.from({ length: 50000 }, () => image) } };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.deepEqual(entry.media, { count: 256, has_images: true, omitted: true });
+  client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: 'media', view: 'media', offset: 256 };
+  const result = await store.detail(args); assert.equal(result.count, 256); assert.equal(result.omitted, true); assert.match(result.notice, /scan.*limit/); assert.deepEqual(result.images, []);
+  item = { id: 'media', type: 'mcpToolCall', result: { content: Array.from({ length: 50000 }, () => null) } };
+  const empty = await store.detail(args); assert.equal(empty.count, 0); assert.equal(empty.omitted, true); assert.match(empty.notice, /scan.*limit/);
+  await store.close();
+});
+
+test('bounded display cache preserves returned paths and rejects only new assets', async () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=', 'base64');
+  const { client, store } = fixture({ files: 2, bytes: png.length + 100 });
+  let item = { id: 'media', type: 'mcpToolCall', result: { content: [{ type: 'image', mimeType: 'image/png', data: png.toString('base64') }] } };
+  client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: 'media', view: 'media' };
+  const first = (await store.detail(args)).images[0]; const markdown = await store.exportCommunication('persistent markdown');
+  const changed = Buffer.from(png); changed[changed.length - 1] ^= 1;
+  item = { ...item, result: { content: [{ type: 'image', mimeType: 'image/png', data: changed.toString('base64') }] } };
+  const refused = (await store.detail(args)).images[0]; assert.equal(refused.previewable, false); assert.match(refused.notice, /capacity/); assert.equal(refused.file_url, undefined);
+  await assert.rejects(store.exportCommunication('new markdown'), /capacity/);
+  assert.deepEqual(readFileSync(first.path), png); assert.equal(readFileSync(markdown.file_path, 'utf8'), 'persistent markdown');
+  assert.equal((await store.exportCommunication('persistent markdown')).file_path, markdown.file_path);
+  assert.equal(store.exports.size, 2); await store.close();
+  assert.throws(() => readFileSync(first.path), /ENOENT/); assert.throws(() => readFileSync(markdown.file_path), /ENOENT/);
+
+  const limited = fixture({ files: 10, bytes: png.length - 1 });
+  limited.client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+  const denied = (await limited.store.detail(args)).images[0]; assert.match(denied.notice, /capacity/); assert.equal(limited.store.exports.size, 0);
+  await limited.store.close();
 });

@@ -2,7 +2,7 @@ import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.j
 import { agentIcon, agentVisual, retainIcons, clearIcons, displayLabel, agentDisplayName } from './presentation.js';
 import { toolSections, communicationFailure } from './tool-presentation.js';
 import { activityIcon, contextIndicator, disclosureIcon, copyIcon, jumpIcon } from './tool-icons.js';
-import { normalizeDisplayMath } from './math-markdown.js';
+import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { renderDiff } from './diff-view.js';
 import { nativeRenderBudget } from './render-budget.js';
@@ -12,10 +12,8 @@ const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
 let paneRevision = 0;
 const MAX_DETAILS = 16;
 const VISIBLE_ENTRIES = 500;
-const INLINE_COMMUNICATION_LIMIT = 48000;
 const MAX_COPY_LENGTH = 16 * 1024 * 1024;
 const MAX_COPY_PAGES = 1100;
-const refreshIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#888888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9a7 7 0 0 1 12-2L20 12M4 12l2.5 5a7 7 0 0 0 12-2"/></svg>';
 let copyIntent = 0;
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
@@ -37,6 +35,13 @@ function attachmentName(path, index) {
   let prefix = '', used = 0;
   for (const char of name.slice(0, ext ? -ext.length : undefined)) { const cells = char.charCodeAt(0) > 255 ? 2 : 1; if (used + cells > 24 - width(ext)) break; prefix += char; used += cells; }
   return `${prefix}…${ext}`;
+}
+function imageSize(image, bodyColumns, maxColumns = 24, maxRows = 10) {
+  const available = Number.isFinite(bodyColumns) && bodyColumns > 0 ? Math.max(1, Math.floor(bodyColumns) - 4) : maxColumns;
+  const limit = Math.max(1, Math.min(255, maxColumns, available));
+  const aspect = Number.isFinite(image.width) && image.width > 0 && Number.isFinite(image.height) && image.height > 0 ? image.height / image.width : 0.75;
+  const columns = Math.max(1, Math.min(limit, Math.floor(maxRows * 2 / aspect)));
+  return { columns, rows: Math.max(1, Math.min(255, maxRows, Math.round(columns * aspect / 2))) };
 }
 const integrationOf = (entry) => {
   if (!['mcpToolCall', 'dynamicToolCall'].includes(entry.type)) return '';
@@ -428,12 +433,24 @@ async function chooseAttachments($, id, source = 'file') {
     finally { page.historyLoading = false; }
   }
   async function select($, id) {
-    state.selected = id; state.generation++;
+    state.selected = id; state.generation++; state.imagePreview = null;
     const page = pageFor(id);
     state.restore = state.scroll.has(id) && !page.followTail;
     page.detailRequests.clear();
     await poll($);
     await invalidate($);
+  }
+  async function showImagePreview($, id, preview) {
+    if (!state.opened || state.selected !== id || !state.folds.has(preview.foldKey)) return;
+    const page = pageFor(id); page.scrollGeneration++; holdWindow(page);
+    state.imagePreview = { ...preview, agentId: id }; await invalidate($);
+  }
+  async function closeImagePreview($, id) {
+    const preview = state.imagePreview, gen = state.generation;
+    if (!preview || preview.agentId !== id) return;
+    state.imagePreview = null; await invalidate($);
+    const restore = async () => { if (state.opened && state.selected === id && state.generation === gen && !state.imagePreview) await $.ui.scroll({ in: PANE, to: { key: `row_item_${preview.foldKey}` }, block: 'nearest' }).catch(() => {}); };
+    if (typeof $.clock.after === 'function') $.clock.after(0, restore); else await restore();
   }
   export async function openAgent($, id) {
     state.opened = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
@@ -456,12 +473,6 @@ async function chooseAttachments($, id, source = 'file') {
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false, view) {
     const page = pageFor(id), key = detailKey(entry, filePath, view), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailSequence;
-    const snapshot = page.details.get(key);
-    if (view === 'communication') {
-      const cached = snapshot, shown = cached?.error ? cached.previous : cached;
-      const expected = cached?.error ? cached.offset : shown ? shown.next_offset : 0;
-      if (page.detailRequests.has(key) || expected == null || offset !== expected || shown?.external) return;
-    }
     page.detailRequests.set(key, request);
     while (page.detailRequests.size > MAX_DETAILS) page.detailRequests.delete(page.detailRequests.keys().next().value);
     const fetch = async () => {
@@ -470,13 +481,8 @@ async function chooseAttachments($, id, source = 'file') {
       if (request !== page.detailRequests.get(key)) return;
       page.detailRequests.delete(key);
       if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
-      const previous = view === 'communication' ? snapshot : page.details.get(key);
-      if (result.error || result.offline || (result.next_offset != null && (!Number.isInteger(result.next_offset) || result.next_offset <= offset))) cacheDetail(page, key, { text: `无法读取内容：${result.error || result.offline ? failureText(result) : '读取位置未推进'}`, error: true, next_offset: null, offset, ...(view === 'communication' ? { previous: previous?.previous ?? previous } : {}) });
-      else if (view === 'communication') {
-        const text = (offset ? (previous?.error ? previous.previous?.text : previous?.text) || '' : '') + (result.text || '');
-        const end = /[\uD800-\uDBFF]/.test(text[INLINE_COMMUNICATION_LIMIT - 1] || '') ? INLINE_COMMUNICATION_LIMIT - 1 : INLINE_COMMUNICATION_LIMIT;
-        cacheDetail(page, key, { text: text.slice(0, end), next_offset: result.next_offset, offset, format: result.format, external: text.length > INLINE_COMMUNICATION_LIMIT || (result.next_offset != null && text.length >= INLINE_COMMUNICATION_LIMIT) });
-      } else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
+      if (result.error || result.offline || (result.next_offset != null && (!Number.isInteger(result.next_offset) || result.next_offset <= offset))) cacheDetail(page, key, { text: `无法读取内容：${result.error || result.offline ? failureText(result) : '读取位置未推进'}`, error: true, next_offset: null, offset });
+      else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
       await invalidate($);
     };
     if (background) $.clock.after(0, fetch);
@@ -508,15 +514,39 @@ async function chooseAttachments($, id, source = 'file') {
       if (valid()) { page.copyError = null; await invalidate($); }
     } catch (error) { if (valid()) { page.copyError = { key, text: `复制失败：${failureText(error)}` }; await invalidate($); } }
   }
-  async function exportCommunication($, id, entry, foldKey) {
-    const page = pageFor(id), key = detailKey(entry, undefined, 'communication'), gen = state.generation, snapshot = page.details.get(key);
+  async function expandBody($, id, entry, view, foldKey) {
+    const page = pageFor(id), key = detailKey(entry, undefined, view), gen = state.generation, historyGen = page.historyGeneration;
+    if (page.detailRequests.has(key)) return;
+    const request = ++page.detailSequence;
+    page.detailRequests.set(key, request);
+    while (page.detailRequests.size > MAX_DETAILS) page.detailRequests.delete(page.detailRequests.keys().next().value);
+    await invalidate($);
     try {
-      const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view: 'communication', export: true });
-      if (!state.opened || state.selected !== id || state.generation !== gen || !state.folds.has(foldKey)) return;
-      if (result.error || result.offline || typeof result.file_url !== 'string') throw new Error(failureText(result));
-      cacheDetail(page, key, { ...(page.details.get(key) ?? snapshot), file_url: result.file_url, exportError: '' });
-    } catch (error) { if (state.opened && state.selected === id && state.generation === gen && state.folds.has(foldKey)) cacheDetail(page, key, { ...(page.details.get(key) ?? snapshot), exportError: `无法打开完整正文：${failureText(error)}` }); }
-    if (state.opened && state.selected === id && state.generation === gen) await invalidate($);
+      const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view, expand: true, offset: 0 });
+      if (page.detailRequests.get(key) !== request || !state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
+      if (result.error || result.offline || typeof result.text !== 'string' || (result.external && typeof result.file_url !== 'string')) throw new Error(failureText(result));
+      cacheDetail(page, key, result);
+    } catch (error) {
+      if (page.detailRequests.get(key) === request && state.opened && state.selected === id && state.generation === gen && state.folds.has(foldKey)) cacheDetail(page, key, { error: true, text: `无法读取内容：${failureText(error)}` });
+    } finally {
+      if (page.detailRequests.get(key) === request) { page.detailRequests.delete(key); await invalidate($); }
+    }
+  }
+  async function loadMedia($, id, entry, foldKey, offset = 0) {
+    const page = pageFor(id), key = detailKey(entry, undefined, 'media'), gen = state.generation, historyGen = page.historyGeneration;
+    if (page.detailRequests.has(key)) return;
+    const request = ++page.detailSequence, previous = page.details.get(key);
+    page.detailRequests.set(key, request);
+    try {
+      const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view: 'media', offset });
+      if (page.detailRequests.get(key) !== request || !state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
+      if (result.error || result.offline || !Array.isArray(result.images) || (result.next_offset != null && (!Number.isSafeInteger(result.next_offset) || result.next_offset <= offset))) throw new Error(failureText(result));
+      cacheDetail(page, key, { images: result.images, offset, next_offset: result.next_offset, ...(typeof result.notice === 'string' ? { notice: result.notice } : {}) });
+    } catch (error) {
+      if (page.detailRequests.get(key) === request && state.opened && state.selected === id && state.generation === gen && state.folds.has(foldKey)) cacheDetail(page, key, { ...previous, error: `无法读取图片：${failureText(error)}`, retryOffset: offset });
+    } finally {
+      if (page.detailRequests.get(key) === request) { page.detailRequests.delete(key); await invalidate($); }
+    }
   }
 export function registerUI(on) {
   on('command.run', { command: 'codex-stop' }, async ($) => stopAllAgents($));
@@ -535,7 +565,7 @@ export function registerUI(on) {
     return {};
   });
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; }
+    if (e.id === PANE) { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; }
     return next(e);
   });
   on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
@@ -579,6 +609,10 @@ export function registerUI(on) {
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     if (!state.opened || !state.selected) return next(e);
+    const preview = controlFor(state.selected).imageActions?.get(e.element);
+    if (preview && e.data?.action === 'preview' && state.folds.has(preview.foldKey) && !state.imagePreview) {
+      await showImagePreview($, state.selected, preview); return {};
+    }
     const disclosure = controlFor(state.selected).iconActions?.get(e.element);
     if (disclosure && e.data?.action === disclosure.action) {
       if (disclosure.expanded === e.data.expanded) await disclosure.onPress(e);
@@ -602,9 +636,31 @@ function renderPane($, e, next, attempt = {}) {
     if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
     const page = pageFor(id), control = controlFor(id);
     control.iconActions = new Map();
+    control.imageActions = new Map();
+    if (state.imagePreview?.agentId === id) {
+      const preview = state.imagePreview, columns = e.props?.bodyColumns, rows = e.props?.scroll?.bodyRows;
+      const maxColumns = Number.isFinite(columns) && columns > 0 ? Math.max(1, Math.floor(columns) - 4) : 48;
+      const maxRows = Number.isFinite(rows) && rows > 0 ? Math.max(1, Math.floor(rows) - 4) : 18;
+      const size = imageSize(preview.image, columns, Math.min(255, maxColumns), Math.min(255, maxRows));
+      return Box({ key: 'codex_image_preview', flexDirection: 'column', gap: 'sm', children: [
+        Box({ key: 'codex_image_preview_header', flexDirection: 'row', justifyContent: 'flex-end', children: [Button({ key: 'codex_image_preview_close', role: 'dismiss', label: '关闭图片预览', onPress: () => closeImagePreview($, id) })] }),
+        Image({ key: 'codex_image_preview_image', source: { file: preview.image.path, format: 'png' }, ...size, alt: safe(preview.image.alt || '图片') }),
+        ...(preview.image.file_url ? [Markdown({ key: 'codex_image_preview_original', text: `[打开原图](${preview.image.file_url})` })] : []),
+        ...(preview.image.notice ? [Text({ key: 'codex_image_preview_notice', size: 'caption', children: [safe(preview.image.notice)] })] : []),
+      ] });
+    }
     const view = timelineWindow(page, attempt.count, attempt.start), entries = view.entries;
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
+    const previewImage = (key, image, foldKey) => {
+      const size = imageSize(image, e.props?.bodyColumns), actionKey = `image_action_${key}`;
+      control.imageActions.set(actionKey, { image, foldKey });
+      const imageNode = Image({ key: `image_view_${key}`, source: { file: image.path, format: 'png' }, ...size, alt: safe(image.alt || '图片') });
+      if (typeof Client !== 'function') return Box({ key: `image_region_${key}`, flexDirection: 'column', children: [imageNode, Button({ key: actionKey, plain: true, label: '查看大图', onPress: () => showImagePreview($, id, { image, foldKey }) })] });
+      return Box({ key: `image_region_${key}`, position: 'relative', width: size.columns, height: size.rows, children: [imageNode,
+        Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key: actionKey, module: './image-control.js', width: size.columns, height: size.rows, props: { rows: size.rows } })] }),
+      ] });
+    };
     const hint = (key, child, label, width = 18, left = 0) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
     const iconFor = (key, icon) => e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key, source: icon.source, alt: icon.alt, width: 14, height: 14, ...(icon.animated ? { isInteractive: true } : {}) }) : caption(key, icon.glyph);
     const agentMark = (key, agentId) => {
@@ -692,12 +748,15 @@ function renderPane($, e, next, attempt = {}) {
         if (entry.type === 'contextCompaction') { itemRows.push(Box({ key: `activity_${id}:${entryKey(entry)}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${id}:${entryKey(entry)}`, activityIcon(entry)), caption(`activity_label_${id}:${entryKey(entry)}`, description(entry))] })); continue; }
         const key = `${id}:${entryKey(entry)}`, expanded = state.folds.has(key);
         if (['agentMessage', 'userMessage', 'parentMessage', 'directUserMessage', 'plan'].includes(entry.type)) {
-          const loaded = detailFor(page, entry);
+          const view = 'message', cacheKey = detailKey(entry, undefined, view), bodyKey = `${key}:body`, bodyOpen = state.folds.has(bodyKey);
+          const loaded = detailFor(page, entry, undefined, view), local = String(entry.id).startsWith('action:');
+          const rawBody = body(entry), truncated = Boolean(entry.message?.truncated || entry.deferred || (entry.preview?.length ?? 0) >= 4096 || (local && rawBody.length > 4096));
           const message = [];
           if (['userMessage', 'parentMessage'].includes(entry.type)) message.push(caption(`author_${key}`, 'Claude'));
           const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
-          const text = safe(loaded?.text ?? body(entry));
-          message.push(entry.type === 'directUserMessage' ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: e.surface === 'desktop' ? normalizeDisplayMath(text) : text }));
+          const shown = bodyOpen && loaded && !loaded.error ? loaded : null;
+          const text = safe(shown?.text ?? (local && truncated && !bodyOpen ? rawBody.slice(0, 4096) : rawBody));
+          message.push(shown?.external ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: normalizeMessageMarkdown(text, { displayMath: e.surface === 'desktop' }) }));
           if (entry.type === 'agentMessage' && entry.message?.is_final) {
             const copy = (press = {}) => copyMessage($, id, entry, press.surface ?? e.surface);
             const action = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function' ? hint(`message_copy_hint_${key}`, iconButton(`message_copy_${key}`, { source: copyIcon, label: '复制回复', size: 14, onPress: copy }), '复制回复', 12, -10) : Button({ key: `message_copy_${key}`, plain: true, label: '⧉', onPress: copy });
@@ -705,9 +764,19 @@ function renderPane($, e, next, attempt = {}) {
             if (page.copyError?.key === entryKey(entry)) message.push(caption(`message_copy_error_${key}`, page.copyError.text));
           }
           const attachments = Array.isArray(entry.data?.attachments) ? entry.data.attachments : Array.isArray(entry.data?.content) ? entry.data.content.filter((part) => ['localImage', 'mention'].includes(part?.type)) : [];
-          if (attachments.length) message.push(caption(`attachments_${key}`, attachments.map((part) => `附件：${part?.name || (typeof part?.path === 'string' ? part.path.split(/[\\/]/).at(-1) : '') || '文件'}`).join('  ')));
-          if (loaded?.offset > 0) message.push(disclosure(`message_prev_${key}`, '上一页正文', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
-          if (!String(entry.id).startsWith('action:') && ((!loaded && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) || loaded?.next_offset != null)) message.push(disclosure(`item_${key}`, loaded ? '下一页正文' : '展开全文', () => { state.folds.add(key); return detail($, id, entry, loaded?.next_offset ?? 0); }));
+          if (attachments.length) message.push(Box({ key: `attachments_${key}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: attachments.map((part, index) => {
+            const path = part?.path, name = part?.name || (typeof path === 'string' ? path.split(/[\\/]/).at(-1) : '') || '文件';
+            return Box({ key: `sent_attachment_${key}_${index}`, flexDirection: 'column', children: [...(typeof Image === 'function' && typeof path === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(path) && /\.png$/i.test(path) ? [Image({ key: `sent_image_${key}_${index}`, source: { file: path, format: 'png' }, columns: 12, rows: 5, alt: safe(name) })] : []), caption(`sent_name_${key}_${index}`, `附件：${safe(attachmentName(name, index))}`)] });
+          }) }));
+          if (bodyOpen && loaded?.error) message.push(caption(`message_error_${key}`, loaded.text));
+          if (bodyOpen && shown?.external) message.push(Markdown({ key: `message_link_${key}`, text: `[打开完整正文](${shown.file_url})` }));
+          const bodyActive = bodyOpen && (local || Boolean(loaded) || page.detailRequests.has(cacheKey));
+          if (truncated) message.push(disclosure(`item_${key}`, bodyActive && !loaded?.error ? '收起' : loaded?.error && bodyOpen ? '重试读取正文' : '展开全文', () => {
+            if (bodyActive && !loaded?.error) { state.folds.delete(bodyKey); page.detailRequests.delete(cacheKey); return invalidate($); }
+            state.folds.add(bodyKey);
+            if (local || (loaded && !loaded.error)) return invalidate($);
+            return expandBody($, id, entry, view, bodyKey);
+          }));
           const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { alignSelf: 'flex-end', minWidth: 0, borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: e.surface === 'desktop' ? 0.8 : 1 }), children: message });
           const bounded = incoming ? Box({ key: `message_limit_${key}`, width: '85%', flexDirection: 'column', alignItems: 'flex-end', children: [content] }) : content;
           itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', justifyContent: incoming ? 'flex-end' : 'flex-start', children: [bounded] }));
@@ -750,21 +819,19 @@ function renderPane($, e, next, attempt = {}) {
         const toolStart = itemRows.length;
         if (entry.communication && typeof entry.communication.text === 'string') {
           const view = 'communication', cacheKey = detailKey(entry, undefined, view);
-          const load = (offset) => detail($, id, entry, offset, key, undefined, false, view);
+          const bodyKey = `${key}:body`, bodyOpen = state.folds.has(bodyKey);
           itemRows.push(disclosure(`item_${key}`, safe(description(entry)).slice(0, 120), async () => {
             toggle(key);
-            if (expanded) page.detailRequests.delete(cacheKey);
+            if (expanded) { page.detailRequests.delete(cacheKey); state.folds.delete(bodyKey); }
             await invalidate($);
           }, entry, false, expanded));
           if (expanded) {
-            const loaded = detailFor(page, entry, undefined, view), shown = loaded?.error ? loaded.previous : loaded;
+            const loaded = detailFor(page, entry, undefined, view), shown = bodyOpen && loaded && !loaded.error ? loaded : null;
             const text = safe(shown?.text ?? entry.communication.text);
-            const markdown = shown ? shown.next_offset == null && !shown.external : !entry.communication.truncated;
-            const contents = [markdown ? Markdown({ key: `communication_${key}`, text: e.surface === 'desktop' ? normalizeDisplayMath(text) : text }) : Text({ key: `communication_${key}`, size: 'body', children: [text] })];
+            const contents = [shown?.external ? Text({ key: `communication_${key}`, size: 'body', children: [text] }) : Markdown({ key: `communication_${key}`, text: normalizeMessageMarkdown(text, { displayMath: e.surface === 'desktop' }) })];
             const failure = communicationFailure(entry);
             if (failure) contents.push(caption(`communication_failure_${key}`, `发送异常：${failure}`));
-            if (loaded?.error) contents.push(caption(`communication_error_${key}`, loaded.text));
-            if (shown?.exportError) contents.push(caption(`communication_export_error_${key}`, shown.exportError));
+            if (bodyOpen && loaded?.error) contents.push(caption(`communication_error_${key}`, loaded.text));
             if (page.copyError?.key === entryKey(entry)) contents.push(caption(`communication_copy_error_${key}`, page.copyError.text));
             const rawKey = `${key}:raw`, sections = toolSections(entry);
             if (sections.length) {
@@ -772,33 +839,35 @@ function renderPane($, e, next, attempt = {}) {
               if (state.folds.has(rawKey)) sections.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
             }
             itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: contents }));
-            const loading = page.detailRequests.has(cacheKey);
-            if (!loading && !shown?.external && (loaded?.error || (!shown && entry.communication.truncated) || shown?.next_offset != null)) itemRows.push(disclosure(`communication_detail_${key}`, loaded?.error ? '重试读取正文' : shown ? '继续展开' : '展开全文', () => load(loaded?.error ? loaded.offset : shown?.next_offset ?? 0)));
+            const bodyActive = bodyOpen && (Boolean(loaded) || page.detailRequests.has(cacheKey));
+            if (entry.communication.truncated) itemRows.push(disclosure(`communication_detail_${key}`, bodyActive && !loaded?.error ? '收起' : bodyOpen && loaded?.error ? '重试读取正文' : '展开全文', () => {
+              if (bodyActive && !loaded?.error) { state.folds.delete(bodyKey); page.detailRequests.delete(cacheKey); return invalidate($); }
+              state.folds.add(bodyKey);
+              if (loaded && !loaded.error) return invalidate($);
+              return expandBody($, id, entry, view, bodyKey);
+            }));
             if (shown?.external) {
-              if (shown.file_url) {
-                const refresh = () => exportCommunication($, id, entry, key);
-                const refreshControl = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function' ? hint(`communication_refresh_hint_${key}`, iconButton(`communication_refresh_${key}`, { source: refreshIcon, label: '重新生成完整正文', onPress: refresh }), '重新生成完整正文', 22, -10) : Button({ key: `communication_refresh_${key}`, plain: true, label: '↻', onPress: refresh });
-                itemRows.push(Box({ key: `communication_link_row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [Markdown({ key: `communication_link_${key}`, text: `[打开完整正文](${shown.file_url})` }), refreshControl] }));
-              }
-              else itemRows.push(disclosure(`communication_export_${key}`, '打开完整正文', () => exportCommunication($, id, entry, key)));
-              itemRows.push(disclosure(`communication_copy_${key}`, '复制完整正文', () => copyMessage($, id, entry, e.surface, 'communication')));
+              itemRows.push(Markdown({ key: `communication_link_${key}`, text: `[打开完整正文](${shown.file_url})` }));
             }
           }
           itemRows.push(Box({ key: `tool_entry_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.5 : 'sm', children: itemRows.splice(toolStart) }));
           continue;
         }
         itemRows.push(disclosure(`item_${key}`, safe(description(entry)).slice(0, 120), async () => {
-          toggle(key); if (expanded) page.detailRequests.delete(detailKey(entry));
+          toggle(key); if (expanded) { page.detailRequests.delete(detailKey(entry)); page.detailRequests.delete(detailKey(entry, undefined, 'media')); }
+          if (!expanded && (entry.media?.has_images || entry.media?.omitted || (entry.deferred && ['mcpToolCall', 'dynamicToolCall', 'functionCallOutput'].includes(entry.type))) && !detailFor(page, entry, undefined, 'media')) loadMedia($, id, entry, key);
           if (!expanded && entry.deferred && outputTypes.has(entry.type) && !detailFor(page, entry)) return detail($, id, entry, 0, key, undefined, true);
           await invalidate($);
         }, entry));
         if (expanded) {
           const loaded = detailFor(page, entry), loading = page.detailRequests.has(detailKey(entry));
           const sections = toolSections(entry);
+          const mediaState = detailFor(page, entry, undefined, 'media'), mediaLoading = page.detailRequests.has(detailKey(entry, undefined, 'media'));
+          const hasMedia = entry.media?.has_images || mediaState?.images?.length;
           const output = loaded && !loaded.error ? [{ label: '输出', source: loaded.text }] : sections.filter((section) => ['输出', '错误'].includes(section.label));
           const raw = sections.filter((section) => !['输出', '错误'].includes(section.label));
           const contents = loaded?.error ? [caption(`tool_error_${key}`, loaded.text)] : output.filter((section) => section.source).map((section, index) => sourceCode(`tool_source_${key}:${index}`, section.source));
-          if (!contents.length && !loading) contents.push(sections.length || loaded ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
+          if (!contents.length && !loading && !hasMedia && !mediaLoading) contents.push(sections.length || loaded ? caption(`tool_empty_${key}`, '暂无输出') : sourceCode(`tool_source_${key}`, body(entry)));
           if (raw.length) {
             const rawKey = `${key}:raw`;
             const rawToggle = Box({ key: `tool_raw_row_${key}`, flexDirection: 'row', children: [hint(`tool_raw_hover_${key}`, disclosure(`tool_raw_${key}`, '‹/›', () => { toggle(rawKey); return invalidate($); }), state.folds.has(rawKey) ? '收起原始调用' : '显示原始调用', 16)] });
@@ -806,10 +875,25 @@ function renderPane($, e, next, attempt = {}) {
             if (state.folds.has(rawKey)) raw.forEach((section, index) => contents.push(...(section.compact ? [caption(`tool_status_${key}:${index}`, section.source)] : [caption(`tool_label_${key}:${index}`, section.label), sourceCode(`tool_raw_source_${key}:${index}`, section.source)])));
           }
           itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: contents }));
+          if (entry.media?.has_images || mediaState?.images?.length || mediaState?.error || mediaState?.notice) {
+            const media = mediaState;
+            const images = (media?.images || []).map(img => {
+              const children = [];
+              if (img.previewable && typeof Image === 'function' && typeof img.path === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(img.path) && /\.png$/i.test(img.path)) children.push(previewImage(`tool_media_${key}_${img.index}`, img, key));
+              else if (img.file_url) children.push(Markdown({ key: `tool_media_link_${key}_${img.index}`, text: `[${safe(img.notice || '打开图片')}](${img.file_url})` }));
+              else if (img.notice) children.push(caption(`tool_media_notice_${key}_${img.index}`, safe(img.notice)));
+              if (img.previewable && img.notice) children.push(caption(`tool_media_notice_${key}_${img.index}`, safe(img.notice)));
+              return Box({ key: `tool_media_cell_${key}_${img.index}`, flexDirection: 'column', children });
+            });
+            if (images.length) itemRows.push(Box({ key: `tool_media_gallery_${key}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'xs', children: images }));
+            if (media?.notice) itemRows.push(caption(`tool_media_scan_notice_${key}`, media.notice));
+            if (!mediaLoading && media?.offset > 0) itemRows.push(disclosure(`tool_media_prev_${key}`, '上一页图片', () => loadMedia($, id, entry, key, Math.max(0, media.offset - 8))));
+            if (!mediaLoading && (media?.error || media?.next_offset != null)) itemRows.push(disclosure(`tool_media_more_${key}`, media.error ? '重试读取图片' : '更多图片', () => loadMedia($, id, entry, key, media.error ? media.retryOffset : media.next_offset)));
+          }
           const imagePath = entry.data?.path || entry.data?.savedPath || entry.data?.saved_path;
           const localImage = typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(imagePath);
-          if (['imageView', 'imageGeneration'].includes(entry.type) && localImage) {
-            if (typeof Image === 'function' && /\.png$/i.test(imagePath)) itemRows.push(Image({ key: `image_${key}`, source: { file: imagePath, format: 'png' }, columns: 48, rows: 18, alt: `图片：${safe(imagePath)}` }));
+          if (['imageView', 'imageGeneration'].includes(entry.type) && localImage && !entry.media?.has_images) {
+            if (typeof Image === 'function' && /\.png$/i.test(imagePath)) itemRows.push(previewImage(`legacy_${key}`, { ...entry.data, path: imagePath, alt: `图片：${imagePath}` }, key));
             itemRows.push(disclosure(`copy_${key}`, '复制图片路径', press => $.ui.copy({ text: imagePath, surface: press.surface })));
           }
           if (loaded?.offset > 0) itemRows.push(disclosure(`detail_prev_${key}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
@@ -825,7 +909,9 @@ function renderPane($, e, next, attempt = {}) {
       } else groupRows.push(...itemRows);
       rows.push(groupBox(groupRows));
     }
-    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => Box({ key: `attachment_hover_${id}_${index}`, position: 'relative', children: [disclosure(`attachment_${id}_${index}`, `${safe(attachmentName(path, index))} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); }), Box({ position: 'absolute', top: -2, left: 0, width: 40, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [safe(displayLabel(path.split(/[\\/]/).at(-1) || path))] })] })] })) }));
+    if (control.attachments.length) composer.push(Box({ key: `codex_attachments_${id}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: control.attachments.map((path, index) => Box({ key: `attachment_hover_${id}_${index}`, position: 'relative', flexDirection: 'column', children: [
+      ...(typeof Image === 'function' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(path) && /\.png$/i.test(path) ? [Image({ key: `attachment_image_${id}_${index}`, source: { file: path, format: 'png' }, columns: 12, rows: 5, alt: safe(attachmentName(path, index)) })] : []),
+      disclosure(`attachment_${id}_${index}`, `${safe(attachmentName(path, index))} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); }), Box({ position: 'absolute', top: -2, left: 0, width: 40, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [safe(displayLabel(path.split(/[\\/]/).at(-1) || path))] })] })] })) }));
     if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; return invalidate($); } }));
     if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
     composer.push(Box({ key: `codex_input_${id}`, flexDirection: 'column', width: '100%', alignItems: 'stretch', children: [Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, ...(e.surface === 'desktop' ? {} : { submitLabel: '发送' }), onInput: control.actions.input, onSubmit: control.actions.submit })] }));
@@ -884,7 +970,7 @@ function renderPane($, e, next, attempt = {}) {
     page.windowStart = view.start; page.windowSize = attempt.count ?? page.windowSize ?? VISIBLE_ENTRIES; page.windowEnd = null;
     return tree;
 }
-export function closeUI() { state.opened = false; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
+export function closeUI() { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
 export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);

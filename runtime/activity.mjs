@@ -1,13 +1,19 @@
 // Read-only presentation of the controller's own root threads. The controller's
 // delivery queue is deliberately independent of this bounded live cache.
 import { toolOutputText } from '../shared/tool-output.mjs';
+import { collectImages, sanitizeMedia } from '../shared/tool-media.mjs';
+import { materializeImage, pngDimensions } from './tool-media-files.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { communication, safeBoundary } from '../shared/communication.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, writeFile, rename, unlink, rmdir, access } from 'node:fs/promises';
+import { mkdtemp, writeFile, rename, unlink, rmdir, access, open, stat } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+const runFile = promisify(execFile);
+const previewScript = fileURLToPath(new URL('../scripts/image-preview.ps1', import.meta.url));
 const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const PREVIEW_BUDGET = 8192;
@@ -26,7 +32,7 @@ function clean(value, limit = PREVIEW_BUDGET) {
     }
     if (!v || typeof v !== 'object') { remaining -= 8; return v; }
     if (depth >= 6) return '[nested data omitted]';
-    if (/^(?:image|blob|audio)$/i.test(v.type ?? '')) return { type: v.type, path: typeof v.path === 'string' ? visit(v.path, depth + 1) : undefined, ...(typeof v.name === 'string' ? { name: visit(v.name, depth + 1) } : {}) };
+    if (/^(?:image|blob|audio)$/i.test(v.type ?? '')) return { type: v.type, ...(v.media_omitted === true ? { media_omitted: true } : {}), ...(typeof v.mimeType === 'string' ? { mimeType: visit(v.mimeType, depth + 1) } : {}), path: typeof v.path === 'string' ? visit(v.path, depth + 1) : undefined, ...(typeof v.name === 'string' ? { name: visit(v.name, depth + 1) } : {}) };
     if (Array.isArray(v)) return v.slice(0, 40).map((x) => visit(x, depth + 1));
     const out = {};
     for (const [k, x] of Object.entries(v).slice(0, 40)) {
@@ -71,7 +77,7 @@ const binaryString = (value) => typeof value === 'string' && /^data:[^,]*;base64
 const textValue = (value) => {
   if (binaryString(value)) return '[binary omitted]';
   if (typeof value === 'string') return value;
-  return JSON.stringify(value, (key, v) => BINARY.test(key) && typeof v === 'string' || binaryString(v) ? '[binary omitted]' : v && typeof v === 'object' && /^(?:image|blob|audio)$/i.test(v.type ?? '') ? { type: v.type, path: v.path } : v, 2) ?? '';
+  return JSON.stringify(sanitizeMedia(value), (key, v) => BINARY.test(key) && typeof v === 'string' || binaryString(v) ? '[binary omitted]' : v && typeof v === 'object' && /^(?:image|blob|audio)$/i.test(v.type ?? '') ? { type: v.type, path: v.path } : v, 2) ?? '';
 };
 const outputValue = (value) => toolOutputText(value, { serialize: textValue, formatPart: (part) => ['text', 'inputText', 'outputText', 'input_text', 'output_text'].includes(part?.type) && typeof part.text === 'string' ? textValue(part.text) : '[non-text content omitted]' });
 const OUTPUT_TYPES = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'functionCallOutput']);
@@ -116,13 +122,14 @@ const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) 
       ...(success !== undefined ? { success: clean(success, 128) } : {}),
       ...(error !== undefined ? { error: clean(errorValue, 512) } : {}), ...rest };
   }
-  const data = clean({ ...(stage ? { stage } : {}), ...projected }, PREVIEW_BUDGET / 2);
+  const { images, omitted } = collectImages(item);
+  const data = clean(sanitizeMedia({ ...(stage ? { stage } : {}), ...projected }), PREVIEW_BUDGET / 2);
   const end = message ? Math.min(message.text.length, 2048) : 0;
   const safeEnd = message && end < message.text.length && safeBoundary(message.text, end) !== end ? end - 1 : end;
   const communicationPreview = message && { title: message.title, text: message.text.slice(0, safeEnd), truncated: safeEnd < message.text.length };
   const phase = ['final_answer', 'commentary', 'partial_answer'].includes(item.phase) ? item.phase : null;
   const messageMeta = item.type === 'agentMessage' ? { phase, complete: stage === 'completed', truncated: typeof item.text === 'string' && data.text !== item.text, is_final: phase === 'final_answer' && stage === 'completed' } : null;
-  return { ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
+  return { ...(images.length || omitted ? { media: { count: images.length, has_images: images.length > 0, ...(omitted ? { omitted: true } : {}) } } : {}), ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
@@ -151,10 +158,10 @@ function removeGuidance(item, guidance) {
 
 export class ActivityStore {
   static attach(client, controller) { return new ActivityStore({ client, controller }); }
-  constructor({ client, controller }) {
+  constructor({ client, controller, cacheLimits = { bytes: 256 * 1024 * 1024, files: 512 } }) {
     this.client = client; this.controller = controller; this.live = new Map(); this.nextRevision = 1;
-    this.agentNames = new Map(); this.turnStates = new Map(); this.lastMessages = new Map();
-    this.exportDir = null; this.exports = new Map(); this.exportQueue = Promise.resolve(); this.closed = false;
+    this.agentNames = new Map(); this.turnStates = new Map();
+    this.exportDir = null; this.exports = new Map(); this.exportSizes = new Map(); this.exportBytes = 0; this.cacheLimits = cacheLimits; this.exportQueue = Promise.resolve(); this.closed = false;
     this.notification = (message) => this.observe(message);
     this.action = (action) => this.recordAction(action);
     client.on('notification', this.notification);
@@ -164,20 +171,30 @@ export class ActivityStore {
     this.client.off('notification', this.notification);
     this.controller.off('agentAction', this.action);
     this.live.clear();
-    this.agentNames.clear(); this.turnStates.clear(); this.lastMessages.clear();
+    this.agentNames.clear(); this.turnStates.clear();
     this.closed = true;
     // Serialize cleanup behind in-flight writes; close remains safe for callers
     // that do not await it, and only files created by this store are removed.
     const cleanup = this.exportQueue.then(async () => {
       for (const file of this.exports.values()) { try { await unlink(file); } catch { /* Best effort for files currently in use. */ } }
       if (this.exportDir) { try { await rmdir(this.exportDir); } catch { /* Never remove unknown files. */ } }
-      this.exports.clear(); this.exportDir = null;
+      this.exports.clear(); this.exportSizes.clear(); this.exportBytes = 0; this.exportDir = null;
     });
     this.exportQueue = cleanup.catch(() => {});
     return cleanup;
   }
+  ensureExportCapacity(key, size) {
+    if (!this.exports.has(key) && (this.exports.size >= this.cacheLimits.files || this.exportBytes + size > this.cacheLimits.bytes)) {
+      const error = new Error('Display cache capacity reached for this session.');
+      error.code = 'DISPLAY_CACHE_FULL'; throw error;
+    }
+  }
+  registerExport(key, path, size) {
+    if (!this.exports.has(key)) { this.exportSizes.set(key, size); this.exportBytes += size; }
+    this.exports.set(key, path);
+  }
   exportCommunication(text) {
-    // A single queue prevents eviction, recreation and close from racing with
+    // A single queue prevents capacity checks, recreation and close from racing with
     // each other, including simultaneous requests for the same content.
     const operation = this.exportQueue.then(async () => {
       if (this.closed) throw new Error('Activity store is closed.');
@@ -185,26 +202,91 @@ export class ActivityStore {
       if (this.closed) throw new Error('Activity store is closed.');
       const hash = createHash('sha256').update(text).digest('hex');
       const filePath = join(this.exportDir, `${hash}.md`);
+      const size = Buffer.byteLength(text);
       let exists = false;
       if (this.exports.has(hash)) {
         try { await access(filePath); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
       }
       if (!exists) {
+        this.ensureExportCapacity(hash, size);
         const temporary = join(this.exportDir, `${randomUUID()}.tmp`);
         try { await writeFile(temporary, text, { encoding: 'utf8', flag: 'wx' }); await rename(temporary, filePath); }
         finally { try { await unlink(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
-        this.exports.set(hash, filePath);
-      }
-      if (this.closed) throw new Error('Activity store is closed.');
-      // Keep the most recently accessed snapshots, capped at 32 per store.
-      this.exports.delete(hash); this.exports.set(hash, filePath);
-      if (this.exports.size > 32) {
-        const oldest = this.exports.keys().next().value;
-        await unlink(this.exports.get(oldest)).catch(error => { if (error.code !== 'ENOENT') throw error; });
-        this.exports.delete(oldest);
+        this.registerExport(hash, filePath, size);
       }
       if (this.closed) throw new Error('Activity store is closed.');
       return { file_path: filePath, file_url: pathToFileURL(filePath).href };
+    });
+    this.exportQueue = operation.catch(() => {});
+    return operation;
+  }
+  exportImage(buffer, mime) {
+    const operation = this.exportQueue.then(async () => {
+      if (this.closed) throw new Error('Activity store is closed.');
+      if (!this.exportDir) this.exportDir = await mkdtemp(join(tmpdir(), 'codex-subagents-display-'));
+      const hash = `image:${createHash('sha256').update(buffer).digest('hex')}:${mime}`;
+      const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/webp': 'webp' }[mime];
+      const filePath = join(this.exportDir, `${hash.split(':')[1]}.${extension}`);
+      let exists = false;
+      if (this.exports.has(hash)) { try { await access(filePath); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+      if (!exists) {
+        this.ensureExportCapacity(hash, buffer.length);
+        const temporary = join(this.exportDir, `${randomUUID()}.tmp`);
+        try { await writeFile(temporary, buffer, { flag: 'wx' }); await rename(temporary, filePath); }
+        finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+        this.registerExport(hash, filePath, buffer.length);
+      }
+      if (this.closed) throw new Error('Activity store is closed.');
+      return filePath;
+    });
+    this.exportQueue = operation.catch(() => {});
+    return operation;
+  }
+  exportPreview(sourcePath) {
+    if (process.platform !== 'win32') return Promise.resolve(null);
+    // The same queue serializes conversion, capacity accounting, and close. Snapshot
+    // at most 10 MiB so a changing source cannot bypass the byte limit.
+    const operation = this.exportQueue.then(async () => {
+      if (this.closed) throw new Error('Activity store is closed.');
+      const handle = await open(sourcePath, 'r');
+      let bytes;
+      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.size <= 0 || info.size > 10 * 1024 * 1024) throw new Error('Image exceeds the preview size limit.');
+        bytes = Buffer.alloc(info.size);
+        let offset = 0;
+        while (offset < bytes.length) { const result = await handle.read(bytes, offset, bytes.length - offset, offset); if (!result.bytesRead) throw new Error('Image changed during preview.'); offset += result.bytesRead; }
+      } finally { await handle.close(); }
+      if (!this.exportDir) this.exportDir = await mkdtemp(join(tmpdir(), 'codex-subagents-display-'));
+      const digest = createHash('sha256').update(bytes).digest('hex');
+      const key = `preview:${digest}`, path = join(this.exportDir, `preview-${digest}.png`);
+      let exists = false;
+      if (this.exports.has(key)) { try { await access(path); exists = true; } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+      if (!exists) {
+        const input = join(this.exportDir, `${randomUUID()}.source`), temporary = join(this.exportDir, `${randomUUID()}.png`);
+        try {
+          await writeFile(input, bytes, { flag: 'wx' });
+          await runFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', previewScript], {
+            windowsHide: true, timeout: 15000, maxBuffer: 16384,
+            env: { ...process.env, CODEX_SUBAGENTS_IMAGE_SOURCE: input, CODEX_SUBAGENTS_IMAGE_PREVIEW: temporary },
+          });
+          const size = (await stat(temporary)).size;
+          this.ensureExportCapacity(key, size);
+          await rename(temporary, path);
+          this.registerExport(key, path, size);
+        } finally {
+          const cleanup = await Promise.allSettled([input, temporary].map(file => unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; })));
+          const failure = cleanup.find(result => result.status === 'rejected');
+          if (failure) throw failure.reason;
+        }
+      }
+      const previewHandle = await open(path, 'r');
+      let dimensions;
+      try { const header = Buffer.alloc(24); const result = await previewHandle.read(header, 0, header.length, 0); dimensions = result.bytesRead === 24 && pngDimensions(header); }
+      finally { await previewHandle.close(); }
+      if (!dimensions || dimensions.width > 1280 || dimensions.height > 1280) throw new Error('Invalid converted preview.');
+      if (this.closed) throw new Error('Activity store is closed.');
+      return { path, ...dimensions };
     });
     this.exportQueue = operation.catch(() => {});
     return operation;
@@ -277,8 +359,9 @@ export class ActivityStore {
       this.remember(this.turnStates, `${p.threadId}:${p.turn.id}`, p.turn.status);
       if (p.turn.status === 'completed') {
         const bucket = this.bucket(agent.id);
-        const last = [...bucket.entries].reverse().find(entry => entry.turn_id === p.turn.id && entry.type === 'agentMessage');
-        if (last?.message?.phase === null) this.put(agent, { ...last, message: { ...last.message, complete: true, is_final: true } });
+        for (const entry of [...bucket.entries]) {
+          if (entry.turn_id === p.turn.id && entry.message?.phase === 'final_answer') this.put(agent, { ...entry, message: { ...entry.message, complete: true, is_final: true } });
+        }
       }
     }
     if (message.method === 'thread/compacted') {
@@ -333,19 +416,13 @@ export class ActivityStore {
         else if (!turnsCursor) done = true;
         continue;
       }
-      const firstItemsPage = !itemsCursor;
       const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit: limit - entries.length, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
       requests++;
       if ((page.data?.length ?? 0) > limit - entries.length) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
-      if (firstItemsPage) this.remember(this.lastMessages, `${agent.threadId}:${turnId}`, null);
       entries.push(...(page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => {
-        const actualTurn = entry.turnId ?? turnId, key = `${agent.threadId}:${actualTurn}`;
+        const actualTurn = entry.turnId ?? turnId;
         const result = simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), actualTurn, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, actualTurn, entry), entry.startedAtMs ?? entry.item.startedAtMs, agent.threadId);
-        if (result.message) {
-          if (this.lastMessages.has(key) && this.lastMessages.get(key) === null) this.remember(this.lastMessages, key, result.id);
-          if (result.message.phase === null && this.turnStates.get(key) === 'completed' && this.lastMessages.get(key) === result.id) result.message.is_final = true;
-        }
         return result;
       }));
       if (!itemsCursor) {
@@ -356,30 +433,40 @@ export class ActivityStore {
     const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
     return { agent: this.summary(agent), entries: orderWaits(entries.reverse()), next_cursor };
   }
-  async detail({ target, turn_id, item_id, offset = 0, file_path, view, export: exportMessage, bulk } = {}) {
+  async detail({ target, turn_id, item_id, offset = 0, file_path, view, export: exportMessage, bulk, expand } = {}) {
     const agent = this.find(target);
     if (typeof turn_id !== 'string' || !turn_id || typeof item_id !== 'string' || !item_id) throw new TypeError('turn_id and item_id are required.');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid detail offset.');
     if (file_path !== undefined && (typeof file_path !== 'string' || !file_path)) throw new TypeError('Invalid file path.');
-    if (view !== undefined && view !== 'output' && view !== 'communication' && view !== 'message') throw new TypeError('Invalid detail view.');
+    if (view !== undefined && view !== 'output' && view !== 'communication' && view !== 'message' && view !== 'media') throw new TypeError('Invalid detail view.');
+    if (view === 'media' && (file_path !== undefined || bulk !== undefined || expand !== undefined || exportMessage !== undefined)) throw new TypeError('Invalid media request.');
     if (exportMessage !== undefined && (view !== 'communication' || exportMessage !== true)) throw new TypeError('Invalid export request.');
     if (bulk !== undefined && (bulk !== true || !['message', 'communication'].includes(view) || exportMessage)) throw new TypeError('Invalid bulk request.');
     if (exportMessage && (file_path !== undefined || offset !== 0)) throw new TypeError('Invalid export request.');
+    if (expand !== undefined && (expand !== true || !['message', 'communication'].includes(view) || offset !== 0 || file_path !== undefined || bulk !== undefined || exportMessage !== undefined)) throw new TypeError('Invalid expand request.');
     const pageSize = bulk ? 524288 : 16000;
     const page = await this.client.request('thread/items/read', { threadId: agent.threadId, turnId: turn_id, itemIds: [item_id] });
     const record = page.data?.[0];
     const item = record?.item;
+    if (view === 'media') {
+      if (item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id)) throw new Error('Media item is unavailable.');
+      const { images, omitted } = collectImages(removeGuidance(item, this.controller.guidance));
+      const batch = await Promise.all(images.slice(offset, offset + 8).map(image => materializeImage(image, (buffer, mime) => this.exportImage(buffer, mime), path => this.exportPreview(path))));
+      return { images: batch, count: images.length, next_offset: offset + 8 < images.length ? offset + 8 : null, ...(omitted ? { omitted: true, notice: 'Image scan reached its limit; additional images may not be listed.' } : {}) };
+    }
     if (view === 'communication') {
       if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id)) throw new Error('Communication item is unavailable.');
       const message = communication(item, agent.threadId);
       if (!message) throw new Error('Communication item is unavailable.');
       if (exportMessage) return this.exportCommunication(message.text);
+      if (expand) return this.expandText(message.text);
       const text = message.text, next_offset = offset + pageSize < text.length ? offset + pageSize : null;
       return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + pageSize)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text', total_length: text.length };
     }
     if (view === 'message') {
       if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id) || !['agentMessage', 'parentMessage', 'directUserMessage', 'userMessage'].includes(item.type)) throw new Error('Message item is unavailable.');
       const text = formatItem(removeGuidance(item, this.controller.guidance));
+      if (expand) return this.expandText(text);
       const next_offset = offset + pageSize < text.length ? offset + pageSize : null;
       return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + pageSize)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text', total_length: text.length };
     }
@@ -390,5 +477,11 @@ export class ActivityStore {
     const text = change ? change.diff ?? '' : (outputOnly ? formatItemOutput : formatItem)(removeGuidance(item, this.controller.guidance));
     const next_offset = offset + 16000 < text.length ? offset + 16000 : null;
     return { text: text.slice(offset, offset + 16000), next_offset, ...(change ? { file_path, format: offset === 0 && next_offset === null && /^@@ -\d+(?:,\d+)? \+\d+/m.test(text) ? 'diff' : 'source' } : outputOnly ? { format: 'source' } : {}) };
+  }
+  async expandText(text) {
+    const total_length = text.length;
+    if (total_length <= 48000) return { text, format: 'markdown', total_length, external: false };
+    const end = safeBoundary(text, 48000) === 48000 ? 48000 : 47999;
+    return { text: text.slice(0, end), format: 'text', total_length, external: true, ...await this.exportCommunication(text) };
   }
 }

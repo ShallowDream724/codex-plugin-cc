@@ -9,7 +9,7 @@ async function setup(handler) {
   const hooks = [], timers = [], afters = [], scrolls = [], calls = [];
   const $ = {
     ui: {
-      resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map((type) => [type, (props) => ({ type, props })])),
+      resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client', 'Image'].map((type) => [type, (props) => ({ type, props })])),
       invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { scrolls.push(args); },
     },
     clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn, cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
@@ -47,12 +47,12 @@ test('first open starts at the end and reopening restores the saved reading posi
 test('live messages continue while an MCP group and cached tool output remain expanded', async (t) => {
   t.after(closeUI);
   const tool = { id: 'tool', turn_id: 'turn', type: 'mcpToolCall', deferred: true, data: { server: 'fastctx', tool: 'grep' } };
-  let revision = 1, entries = [tool], details = 0;
-  const ui = await setup(async (op) => {
+  let revision = 1, entries = [tool]; const details = [];
+  const ui = await setup(async (op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
     if (op === 'ui_revision') return { revision, entries };
     if (op === 'ui_history') return { entries: [], next_cursor: null };
-    if (op === 'ui_detail') { details++; return { text: 'cached tool output', next_offset: null }; }
+    if (op === 'ui_detail') { details.push(args.view); return args.view === 'media' ? { images: [{ path: 'C:/tmp/image.png', previewable: true, index: 0 }], next_offset: null } : { text: 'cached tool output', next_offset: null }; }
     throw new Error(`Unexpected operation: ${op}`);
   });
   const group = await ui.item('group_');
@@ -62,6 +62,7 @@ test('live messages continue while an MCP group and cached tool output remain ex
   for (const timer of ui.afters.splice(0)) if (!timer.cancelled) await timer.fn();
   assert.deepEqual(ui.scrolls.at(-1), { in: 'codex_subagent_activity', to: { key: 'row_item_a:turn:tool' }, block: 'nearest' });
   assert.match(JSON.stringify(await ui.draw()), /cached tool output/);
+  assert.ok(nodes(await ui.draw()).some(node => node.type === 'Image' && node.props.source.file === 'C:/tmp/image.png'));
   const scrollCount = ui.scrolls.length;
   entries = [tool, entry('user', 'directUserMessage', 'continue please'), entry('progress', 'agentMessage', 'working now')]; revision++;
   await ui.tick();
@@ -73,7 +74,11 @@ test('live messages continue while an MCP group and cached tool output remain ex
   assert.match(rendered, /finished answer/); assert.match(rendered, /cached tool output/);
   assert.match((await ui.item('group_')).props.label, /⌄/);
   assert.doesNotMatch((await ui.item('item_a:turn:tool')).props.label, /[▸▾›⌄]/);
-  assert.equal(details, 1); assert.equal(ui.scrolls.length, scrollCount);
+  assert.deepEqual(details.sort(), ['media', 'output']); assert.equal(ui.scrolls.length, scrollCount);
+  await (await ui.item('item_a:turn:tool')).props.onPress();
+  await (await ui.item('item_a:turn:tool')).props.onPress();
+  await ui.tick();
+  assert.deepEqual(details.sort(), ['media', 'output'], 'reopen and polling reuse both caches');
 });
 
 test('sending while reading history keeps the conversation and shows the subsequent answer', async (t) => {
