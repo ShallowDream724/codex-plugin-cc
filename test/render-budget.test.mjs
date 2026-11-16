@@ -10,22 +10,22 @@ const allStrings = value => typeof value === 'string' ? value.length : value && 
 const audit = tree => { assert.ok(allStrings(tree) < RENDER_LIMIT.chars, 'render fits the shared text allowance'); assert.ok(nodes(tree).length < RENDER_LIMIT.nodes, 'render fits the native node allowance'); };
 
 async function setup(entries, detail = { text: '', next_offset: null }, agent = {}) {
-  const hooks = [], afters = [], calls = [];
+  const hooks = [], afters = [], calls = [], timers = []; let revision = 1, currentEntries = entries;
   const $ = {
     ui: { resolve: () => constructors, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => {}, copy: async () => {} },
-    clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => { afters.push(fn); return { cancel() {} }; } },
+    clock: { every: (_ms, fn) => { timers.push(fn); return { cancel() {} }; }, after: (_ms, fn) => { afters.push(fn); return { cancel() {} }; } },
     state: { get: async () => ({}), set: async () => ({ isSet: true }) },
     session: { id: async () => 'session', cwd: async () => 'C:/work' },
     env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
     process: { run: async (_argv, options) => {
       const request = JSON.parse(options.stdin); calls.push(request.operation);
-      const result = request.operation === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed', ...agent }] } : request.operation === 'ui_revision' ? { revision: 1, entries } : request.operation === 'ui_detail' ? detail : { entries: [], next_cursor: null };
+      const result = request.operation === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed', ...agent }] } : request.operation === 'ui_revision' ? { revision, entries: currentEntries } : request.operation === 'ui_detail' ? detail : { entries: [], next_cursor: null };
       return { stdout: JSON.stringify(result), exitCode: 0 };
     } },
   };
   closeUI(); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
   const draw = () => hooks.find(hook => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  return { draw, calls, flush: async () => { for (const fn of afters.splice(0)) await fn(); } };
+  return { draw, calls, update: async next => { currentEntries = next; revision++; await timers[0](); }, flush: async () => { for (const fn of afters.splice(0)) await fn(); } };
 }
 
 test('unexpectedly long shell metadata leaves the composer and message usable', async () => {
@@ -139,4 +139,7 @@ test('loading a detail keeps its clicked entry when the continuous window shrink
   assert.ok(nodes(after).find(node => node.props.key === 'item_a:turn:tool'), 'the expanded anchor remains visible');
   assert.ok(nodes(after).some(node => node.type === 'Code' && node.props.source.includes('output')));
   assert.ok(nodes(after).filter(node => node.type === 'Markdown').length < nodes(before).filter(node => node.type === 'Markdown').length);
+  assert.ok(nodes(await ui.draw()).some(node => node.props.key === 'item_a:turn:tool'), 'the anchor survives another redraw');
+  await ui.update([...entries, { id: 'new', turn_id: 'turn', type: 'agentMessage', data: { text: 'latest activity' } }]);
+  assert.ok(nodes(await ui.draw()).some(node => node.type === 'Markdown' && node.props.text === 'latest activity'), 'new activity restores the tail window');
 });

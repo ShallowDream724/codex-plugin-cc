@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hooks/ui.js';
+import { fileChangePage } from '../shared/file-changes.mjs';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
 // Native Box dimensions accept cells or percentages, not CSS unit strings.
@@ -290,7 +291,7 @@ test('desktop file changes show a basename and diff rows with one icon copy acti
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
   const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
   const file = nodes(await draw()).find(node => node.props.key === 'file_a:t:file:file:0');
-  assert.equal(file.props.label, '已编辑 example.cpp +1 -0');
+  assert.equal(file.props.label, '已更改 example.cpp +1 -0');
   await file.props.onPress();
   const tree = await draw(), all = nodes(tree);
   assertNativeDimensions(tree);
@@ -1113,4 +1114,37 @@ test('media traversal limit notice remains visible when no images were found', a
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   await (await draw()).find(n => n.props.key === 'item_a:t:limited').props.onPress(); await new Promise(setImmediate);
   assert.ok((await draw()).some(n => n.props.key === 'tool_media_scan_notice_a:t:limited' && n.props.children[0] === 'More media was not scanned.'));
+});
+
+test('file changes present native kinds, source additions, moves and paged diff rows', async (t) => {
+  const hooks = [], copies = [], requests = [];
+  const changes = [
+    { path: 'C:/p/new.md', kind: 'add', content: `# List
+- one
+- two
+` },
+    { path: 'C:/p/old.txt', kind: 'delete', content: `gone
+` },
+    { path: 'C:/p/oldname.txt', kind: { type: 'update', move_path: 'C:/p/newname.txt' }, unified_diff: `@@ -1 +1 @@
+-a
++b
+` },
+    { path: 'C:/p/large.txt', kind: 'add', content: Array.from({ length: 250 }, (_, i) => `line ${i}
+`).join('') },
+    { path: 'C:/p/unknown.txt', diff: 'opaque content' },
+  ];
+  const entries = changes.map((change, i) => ({ id: `file${i}`, turn_id: 't', type: 'fileChange', ...(i === 3 ? { deferred: true } : {}), data: { changes: [change] } }));
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), copy: async value => { copies.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries }; if (op === 'ui_detail') { requests.push(args); return fileChangePage(changes[3], args.offset); } return { entries: [], next_cursor: null }; });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
+  const click = async key => (await draw()).find(n => n.props.key === key).props.onPress();
+  let tree = await draw(); assert.equal(tree.find(n => n.props.key === 'file_a:t:file0:file:0').props.label.replace(/ ›$/, ''), '已创建 new.md +3 -0'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file1:file:0').props.label.replace(/ ›$/, ''), '已删除 old.txt +0 -1'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file2:file:0').props.label.replace(/ ›$/, ''), '已编辑 oldname.txt → newname.txt +1 -1'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file4:file:0').props.label.replace(/ ›$/, ''), '已更改 unknown.txt');
+  await click('file_a:t:file0:file:0'); tree = await draw(); const added = tree.filter(n => n.type === 'Box' && n.props.backgroundColor?.includes('46,160,67')); assert.equal(added.length, 3); assert.ok(!tree.some(n => n.type === 'Box' && n.props.backgroundColor?.includes('248,81,73')));
+  await click('file_a:t:file1:file:0'); tree = await draw(); assert.ok(tree.some(n => n.type === 'Box' && n.props.backgroundColor?.includes('248,81,73')));
+  await click('file_a:t:file4:file:0'); assert.ok((await draw()).some(n => n.props.key === 'file_code_a:t:file4:file:0' && n.props.format === 'source'));
+  await click('file_a:t:file3:file:0'); await new Promise(setImmediate); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0')); assert.ok(tree.some(n => n.props.label === '复制当前页差异'));
+  await tree.find(n => n.props.key === 'diff_copy_a:t:file3:file:0').props.onPress(); assert.equal(copies[0], fileChangePage(changes[3], 0).text);
+  await click('file_detail_a:t:file3:file:0'); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0')); assert.ok(tree.some(n => n.props.key === 'file_prev_a:t:file3:file:0'));
+  await click('file_prev_a:t:file3:file:0'); assert.equal(requests.at(-1).offset, 0);
 });

@@ -239,3 +239,39 @@ test('10,000 cached records remain reachable while moving through render windows
   for (let i = 0; i < saved.length; i++) assert.ok(seen.has(`message ${i}`), `message ${i} remains reachable`);
   assert.equal(ui.calls.filter(call => call.operation === 'ui_history').length, 1);
 });
+
+test('new activity follows the bottom, pauses for reading, and resumes after returning', async (t) => {
+  t.after(closeUI);
+  const tool = { id: 'tool', turn_id: 'turn', type: 'commandExecution', data: { command: 'test', aggregatedOutput: 'output' } };
+  let revision = 1, entries = [tool];
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'running' }] } : op === 'ui_revision' ? { revision, entries } : op === 'ui_history' ? { entries: [], next_cursor: null } : { text: '', next_offset: null });
+  await (await ui.item('item_a:turn:tool')).props.onPress();
+  const countEnd = () => ui.scrolls.filter(s => s.to === 'end').length;
+  let count = countEnd();
+  entries = [...entries, entry('one', 'agentMessage', 'first')]; revision++; await ui.tick(); await flushTimers(ui);
+  assert.equal(countEnd(), ++count, 'opening a tool at the bottom does not disable following');
+  entries = [...entries, entry('two', 'agentMessage', 'second')]; revision++; await ui.tick();
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 12, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
+  assert.equal(countEnd(), count, 'a pending follow is cancelled by a user scroll');
+  entries = [...entries, entry('three', 'agentMessage', 'third')]; revision++; await ui.tick(); await flushTimers(ui);
+  assert.equal(countEnd(), count, 'new activity does not interrupt reading');
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: 1, offset: 80, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
+  count = countEnd(); entries = [...entries, entry('four', 'agentMessage', 'fourth')]; revision++; await ui.tick(); await flushTimers(ui);
+  assert.equal(countEnd(), count + 1, 'reaching the bottom resumes following');
+});
+
+test('a user scroll during an in-flight send refresh cancels the pending jump', async (t) => {
+  t.after(closeUI); let release, block = false, revision = 1;
+  const ui = await setup(async op => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
+    if (op === 'ui_history') return { entries: [], next_cursor: null };
+    if (op === 'ui_send') { block = true; return { agent_id: 'a', status: 'steered' }; }
+    if (op === 'ui_revision') { if (block) return new Promise(resolve => { release = resolve; }); return { revision, entries: [] }; }
+  });
+  const before = ui.scrolls.filter(s => s.to === 'end').length;
+  const sending = (await ui.item('codex_message_a')).props.onSubmit('hello');
+  while (!release) await new Promise(setImmediate);
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 10, contentRows: 100, bodyRows: 20 });
+  revision++; release({ revision, entries: [entry('sent', 'directUserMessage', 'hello')] }); await sending; await flushTimers(ui);
+  assert.equal(ui.scrolls.filter(s => s.to === 'end').length, before);
+});

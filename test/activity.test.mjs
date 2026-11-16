@@ -392,11 +392,27 @@ test('user source and stop status survive the display projection without consumi
 
 test('file change counts use the full native diff before display truncation', () => {
   const { store, client } = fixture();
-  const diff = '--- a/file.js\n+++ b/file.js\n@@ -1,1 +1,300 @@\n-old\n' + '+new content\n'.repeat(900);
+  const diff = '--- a/file.js\n+++ b/file.js\n@@ -1,1 +1,900 @@\n-old\n' + '+new content\n'.repeat(900);
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: { id: 'edit', type: 'fileChange', changes: [{ path: 'src/file.js', diff }, { path: 'image.png' }] } } });
   const entry = store.revision({ target: 'a' }).entries[0];
-  assert.deepEqual(entry.data.fileSummary, [{ path: 'src/file.js', added: 900, removed: 1 }, { path: 'image.png' }]);
+  assert.deepEqual(entry.data.fileSummary, [{ path: 'src/file.js', kind: 'unknown', added: 900, removed: 1 }, { path: 'image.png', kind: 'unknown' }]);
   assert.ok(entry.data.changes[0].diff.length < diff.length);
+});
+
+test('file detail pages retain normalized diff rows and exact previous offsets', async () => {
+  const { store, client } = fixture();
+  const item = { id: 'files', type: 'fileChange', changes: [{ path: 'notes.md', kind: { type: 'add' }, diff: '- item\n'.repeat(350) }] };
+  client.request = async () => ({ data: [{ item }] });
+  const args = { target: 'a', turn_id: 't', item_id: 'files', file_path: 'notes.md' };
+  const pages = []; let offset = 0;
+  do { const page = await store.detail({ ...args, offset }); pages.push(page); offset = page.next_offset; } while (offset !== null);
+  assert.ok(pages.length > 2); assert.ok(pages.every(p => p.format === 'diff' && p.rows.length <= 120));
+  assert.equal(pages.flatMap(p => p.rows).filter(r => r.kind === 'added').length, 350);
+  for (let i = 1; i < pages.length; i++) {
+    const previous = await store.detail({ ...args, offset: pages[i].previous_offset });
+    assert.equal(previous.text, pages[i - 1].text);
+  }
+  store.close();
 });
 
 test('root lifecycle rows distinguish compaction stages and keep only child identity and status', () => {
@@ -554,7 +570,8 @@ test('output-only detail preserves safe binary omission and existing non-tool vi
   client.request = async () => ({ data: [{ item: { id: 'message', type: 'agentMessage', text: 'Ordinary message' } }] });
   assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'message', view: 'output' }), { text: 'Ordinary message', next_offset: null });
   client.request = async () => ({ data: [{ item: { id: 'files', type: 'fileChange', changes: [{ path: 'a.js', diff: '@@ -1 +1 @@\n-old\n+new' }] } }] });
-  assert.deepEqual(await store.detail({ target: 'a', turn_id: 't', item_id: 'files', view: 'output', file_path: 'a.js' }), { text: '@@ -1 +1 @@\n-old\n+new', next_offset: null, file_path: 'a.js', format: 'diff' });
+  const file = await store.detail({ target: 'a', turn_id: 't', item_id: 'files', view: 'output', file_path: 'a.js' });
+  assert.equal(file.text, '@@ -1 +1 @@\n-old\n+new'); assert.equal(file.format, 'diff'); assert.equal(file.previous_offset, null); assert.equal(file.next_offset, null); assert.equal(file.rows.length, 3);
 });
 
 

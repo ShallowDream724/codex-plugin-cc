@@ -5,6 +5,7 @@ import { collectImages, sanitizeMedia } from '../shared/tool-media.mjs';
 import { materializeImage, pngDimensions } from './tool-media-files.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { communication, safeBoundary } from '../shared/communication.mjs';
+import { fileChanges, fileChangeSummary, fileChangePage } from '../shared/file-changes.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, writeFile, rename, unlink, rmdir, access, open, stat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
@@ -50,18 +51,7 @@ const delegationFields = (item) => {
   return { id: item.id, type: item.type, tool: item.tool, status: item.status, receiverThreadIds: ids, agents, names: agents.map(a => a.name ?? a.id), name: item.name ?? item.agentName };
 };
 const subagentFields = (item) => ({ id: item.id, type: item.type, kind: item.kind, agentThreadId: item.agentThreadId, agentPath: item.agentPath, name: item.name, display_name: item.display_name, model: item.model, reasoningEffort: item.reasoningEffort });
-const fileSummary = (item) => (item.changes ?? []).map((change) => {
-  const summary = { path: change.path };
-  if (typeof change.diff === 'string') {
-    let added = 0, removed = 0;
-    for (const line of change.diff.matchAll(/^[+-].*$/gm)) {
-      if (line[0].startsWith('+++ ') || line[0].startsWith('--- ')) continue;
-      if (line[0][0] === '+') added++; else removed++;
-    }
-    Object.assign(summary, { added, removed });
-  }
-  return summary;
-});
+const fileSummary = (item) => fileChanges(item).map(fileChangeSummary);
 const titleText = (value) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 256) : '';
 function toolFields(item) {
   const server = typeof item.server === 'string' ? item.server : item.namespace;
@@ -97,7 +87,7 @@ export function formatItem(item) {
     case 'parentMessage': case 'directUserMessage': case 'agentMessage': return d.text ?? '';
     case 'userMessage': return (d.content ?? []).map((part) => part.text ?? '').filter(Boolean).join('\n\n');
     case 'commandExecution': return [`Command: ${d.command ?? ''}`, d.cwd && `Directory: ${d.cwd}`, d.exitCode != null && `Exit code: ${d.exitCode}`, d.status && `Status: ${d.status}`, d.aggregatedOutput != null && `Output:\n${d.aggregatedOutput}`].filter(Boolean).join('\n');
-    case 'fileChange': return (d.changes ?? []).map((change) => `${change.path ?? 'File'}${change.kind ? ` (${typeof change.kind === 'string' ? change.kind : change.kind.type ?? 'change'})` : ''}\n${change.diff ?? ''}`).join('\n\n');
+    case 'fileChange': return fileChanges(d).map((change) => `${change.path ?? 'File'}${change.kind ? ` (${typeof change.kind === 'string' ? change.kind : change.kind.type ?? 'change'})` : ''}\n${change.diff ?? change.unified_diff ?? change.content ?? ''}`).join('\n\n');
     case 'mcpToolCall': case 'dynamicToolCall': return [`Tool: ${d.server ? d.server + '/' : ''}${d.tool ?? ''}`, d.arguments != null && `Input:\n${textValue(d.arguments)}`, d.result != null && `Output:\n${outputValue(d.result)}`, d.contentItems != null && `Output:\n${outputValue(d.contentItems)}`, d.error != null && `Error:\n${textValue(d.error)}`].filter(Boolean).join('\n');
     case 'imageGeneration': case 'imageView': return [`Image: ${d.savedPath ?? d.saved_path ?? d.path ?? ''}`, d.status && `Status: ${d.status}`, d.failure && `Error: ${textValue(d.failure)}`].filter(Boolean).join('\n');
     case 'collabAgentToolCall': case 'collabToolCall': return `Delegation: ${[d.name, ...(d.names ?? [])].filter(Boolean).join(', ') || d.tool || 'agent'}`;
@@ -471,12 +461,13 @@ export class ActivityStore {
       return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + pageSize)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text', total_length: text.length };
     }
     if (!visible(item)) return { text: '', next_offset: null };
-    const change = file_path !== undefined && item.type === 'fileChange' ? item.changes?.find(change => change.path === file_path) : null;
+    const change = file_path !== undefined && item.type === 'fileChange' ? fileChanges(item).find(change => change.path === file_path) : null;
     if (file_path !== undefined && !change) throw new Error('File is not part of this recorded change.');
+    if (change) return { ...fileChangePage(change, offset), file_path };
     const outputOnly = view === 'output' && OUTPUT_TYPES.has(item.type);
-    const text = change ? change.diff ?? '' : (outputOnly ? formatItemOutput : formatItem)(removeGuidance(item, this.controller.guidance));
+    const text = (outputOnly ? formatItemOutput : formatItem)(removeGuidance(item, this.controller.guidance));
     const next_offset = offset + 16000 < text.length ? offset + 16000 : null;
-    return { text: text.slice(offset, offset + 16000), next_offset, ...(change ? { file_path, format: offset === 0 && next_offset === null && /^@@ -\d+(?:,\d+)? \+\d+/m.test(text) ? 'diff' : 'source' } : outputOnly ? { format: 'source' } : {}) };
+    return { text: text.slice(offset, offset + 16000), next_offset, ...(outputOnly ? { format: 'source' } : {}) };
   }
   async expandText(text) {
     const total_length = text.length;

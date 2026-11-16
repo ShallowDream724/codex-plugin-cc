@@ -56,3 +56,18 @@ test('paging reaches every line, clamps the index and keeps nodes bounded', () =
   last.find(n => n.type === 'Button' && n.props.label === '上一页').props.onPress();
   assert.equal(calls.at(-1), 1);
 });
+
+test('supplied paged rows render without reparsing partial patch text', () => {
+  const rows = [{ kind: 'added', text: '+new item', new: 121 }, { kind: 'removed', text: '-old item', old: 119 }];
+  const tree = render('partial patch page', { rows });
+  const all = nodes(tree); assert.equal(all.filter(n => n.type === 'Box' && n.props.backgroundColor).length, 2);
+  assert.ok(all.some(n => n.type === 'Text' && n.props.children.includes('121')));
+  assert.ok(all.some(n => n.type === 'Text' && n.props.children.includes('119')));
+});
+
+test('internal diff page copies only its visible rows', () => {
+  const source = '@@ -1,250 +1,250 @@' + String.fromCharCode(10) + Array.from({ length: 250 }, (_, i) => ` line ${i + 1}`).join(String.fromCharCode(10)) + String.fromCharCode(10);
+  let copied; const tree = render(source, { page: 1, onCopy: value => { copied = value; } });
+  nodes(tree).find(n => n.type === 'Button' && n.props.key.endsWith(':copy')).props.onPress();
+  assert.ok(copied.includes(' line 120')); assert.ok(!copied.includes(' line 119' + String.fromCharCode(10))); assert.ok(!copied.includes(' line 241' + String.fromCharCode(10)));
+});

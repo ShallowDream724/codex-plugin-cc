@@ -5,6 +5,7 @@ import { activityIcon, contextIndicator, disclosureIcon, copyIcon, jumpIcon } fr
 import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { renderDiff } from './diff-view.js';
+import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
 import { nativeRenderBudget } from './render-budget.js';
 
 const PANE = 'codex_subagent_activity';
@@ -79,38 +80,11 @@ function delegationDescription(data) {
   return action ? `${action}${name === '子代理' ? '' : `：${name}`}` : `${name}已更新`;
 }
 function changeLabel(change) {
-  const diff = typeof change.diff === 'string' && change.diff.length < 4096 && !change.diff.includes('[truncated]') ? change.diff : null;
-  const lines = diff === null ? [] : diff.split('\n');
-  const added = lines.filter((line) => line.startsWith('+') && !line.startsWith('+++')).length;
-  const removed = lines.filter((line) => line.startsWith('-') && !line.startsWith('---')).length;
   const hasCounts = Number.isInteger(change.added) && Number.isInteger(change.removed);
-  return `已编辑 ${safe(typeof change.path === 'string' ? change.path.split(/[\\/]/).at(-1) : '文件')}${hasCounts ? ` +${change.added} -${change.removed}` : lines.length ? ` +${added} -${removed}` : ''}`;
-}
-// Only complete unified hunks are passed as diffs; bounded previews and output
-// pages may end mid-hunk and are still readable as ordinary code.
-function isUnifiedDiff(text) {
-  if (typeof text !== 'string' || !text) return false;
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
-  let oldLeft = 0, newLeft = 0, hunks = 0, inHunk = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i], header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/.exec(line);
-    if (header) {
-      if (inHunk && (oldLeft !== 0 || newLeft !== 0)) return false;
-      oldLeft = Number(header[2] ?? 1); newLeft = Number(header[4] ?? 1); inHunk = true; hunks++; continue;
-    }
-    if (!inHunk) {
-      if (/^(?:diff |index |--- |\+\+\+ |new file |deleted file |similarity |rename |Binary files )/.test(line) || line === '') continue;
-      return false;
-    }
-    if (line === '' && i === lines.length - 1) continue;
-    if (line.startsWith('\\ No newline at end of file')) continue;
-    if (line.startsWith(' ')) { oldLeft--; newLeft--; }
-    else if (line.startsWith('-')) oldLeft--;
-    else if (line.startsWith('+')) newLeft--;
-    else return false;
-    if (oldLeft < 0 || newLeft < 0) return false;
-  }
-  return hunks > 0 && oldLeft === 0 && newLeft === 0;
+  const filename = path => safe(typeof path === 'string' ? path.split(/[\\/]/).at(-1) : '文件');
+  const name = filename(change.path), move = typeof change.move_path === 'string' ? ` → ${filename(change.move_path)}` : '';
+  const verb = { add: '已创建', delete: '已删除', update: '已编辑' }[change.kind] || '已更改';
+  return `${verb} ${name}${move}${hasCounts ? ` +${change.added} -${change.removed}` : ''}`;
 }
 const description = (entry) => {
   const d = entry.data || {};
@@ -215,7 +189,9 @@ function conversationEntries(all) {
 }
 function timelineWindow(page, count = page.windowSize ?? VISIBLE_ENTRIES, from) {
   const all = page.timeline ??= conversationEntries(page.live), lastStart = Math.max(0, all.length - count);
-  const start = page.followTail ? lastStart : Math.max(0, Math.min(from ?? (page.windowEnd != null ? page.windowEnd - count : page.windowStart), Math.max(0, all.length - 1)));
+  const anchor = page.windowAnchor ? all.findIndex(entry => entryKey(entry) === page.windowAnchor) : -1;
+  const preferred = from ?? (page.followTail ? (anchor >= 0 ? Math.max(0, Math.min(anchor - Math.floor(count / 2), lastStart)) : lastStart) : (page.windowEnd != null ? page.windowEnd - count : page.windowStart));
+  const start = Math.max(0, Math.min(preferred, Math.max(0, all.length - 1)));
   return { entries: all.slice(start, page.windowEnd != null && !page.followTail ? page.windowEnd : start + count), start, total: all.length };
 }
 function holdWindow(page) { page.windowStart = timelineWindow(page).start; page.followTail = false; }
@@ -360,7 +336,7 @@ async function chooseAttachments($, id, source = 'file') {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
     const page = pageFor(id), control = controlFor(id), mutationEpoch = control.mutationEpoch;
-    if (afterSend) { page.afterSendGeneration = gen; page.followTail = true; page.scrollGeneration++; }
+    if (afterSend) { page.afterSendGeneration = gen; page.followTail = true; page.awayFromBottom = false; page.windowAnchor = null; page.scrollGeneration++; page.afterSendScrollGeneration = page.scrollGeneration; }
     if (page.busy) { if (afterSend) page.refreshAfterPoll = true; return; }
     page.busy = true;
     try {
@@ -370,12 +346,21 @@ async function chooseAttachments($, id, source = 'file') {
       const changed = result.agent && control.mutationEpoch === mutationEpoch && !control.stopping && !control.sending && updateAgent(id, result.agent);
       let dirty = changed || Boolean(page.liveError);
       page.liveError = '';
+      let entriesChanged = false, appended = false; const hadRevision = page.revision !== undefined;
       if (result.entries && result.revision !== page.revision) {
-        const entriesChanged = mergeLive(page, result.entries);
+        const known = new Set(page.live.map(entryKey));
+        appended = result.entries.some(entry => !known.has(entryKey(entry)));
+        entriesChanged = mergeLive(page, result.entries);
         page.revision = result.revision;
         dirty ||= entriesChanged;
       }
+      if (appended && page.followTail) page.windowAnchor = null;
       if (dirty) await invalidate($);
+      if (entriesChanged && hadRevision && page.followTail && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
+        const scrollGen = page.scrollGeneration;
+        const follow = async () => { if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail && !state.imagePreview) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); };
+        if (typeof $.clock.after === 'function') $.clock.after(0, follow); else await follow();
+      }
       const selected = state.agents.find((agent) => idOf(agent) === id);
       if (selected && selected.status !== 'starting' && !page.historyChecked) await latestHistory($, id);
     } catch (error) {
@@ -392,7 +377,7 @@ async function chooseAttachments($, id, source = 'file') {
       } else if (page.afterSendGeneration !== undefined) {
         const sentGeneration = page.afterSendGeneration;
         delete page.afterSendGeneration;
-        if (sentGeneration === gen && state.opened && state.selected === id && state.generation === gen) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
+        if (sentGeneration === gen && state.opened && state.selected === id && state.generation === gen && page.followTail && page.afterSendScrollGeneration === page.scrollGeneration && !state.imagePreview) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
       }
     }
   }
@@ -442,7 +427,7 @@ async function chooseAttachments($, id, source = 'file') {
   }
   async function showImagePreview($, id, preview) {
     if (!state.opened || state.selected !== id || !state.folds.has(preview.foldKey)) return;
-    const page = pageFor(id); page.scrollGeneration++; holdWindow(page);
+    const page = pageFor(id); page.scrollGeneration++; if (!page.followTail) holdWindow(page);
     state.imagePreview = { ...preview, agentId: id }; await invalidate($);
   }
   async function closeImagePreview($, id) {
@@ -482,7 +467,7 @@ async function chooseAttachments($, id, source = 'file') {
       page.detailRequests.delete(key);
       if (state.selected !== id || !state.opened || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
       if (result.error || result.offline || (result.next_offset != null && (!Number.isInteger(result.next_offset) || result.next_offset <= offset))) cacheDetail(page, key, { text: `无法读取内容：${result.error || result.offline ? failureText(result) : '读取位置未推进'}`, error: true, next_offset: null, offset });
-      else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, offset, format: result.format, startLine: result.start_line });
+      else cacheDetail(page, key, { text: result.text || '', next_offset: result.next_offset, previous_offset: result.previous_offset, rows: result.rows, offset, format: result.format, startLine: result.start_line });
       await invalidate($);
     };
     if (background) $.clock.after(0, fetch);
@@ -676,7 +661,7 @@ function renderPane($, e, next, attempt = {}) {
     };
     const disclosure = (key, label, onPress, entry, integration = false, expanded) => {
       const activate = entry ? (...args) => {
-        page.scrollGeneration++; holdWindow(page); page.windowAnchor = entryKey(entry);
+        page.scrollGeneration++; if (!page.followTail) holdWindow(page); page.windowAnchor = entryKey(entry);
         // Request the reading anchor without blocking the visible disclosure.
         $.ui.scroll({ in: PANE, to: { key: `row_${key}` }, block: 'nearest' }).catch(() => {});
         return onPress(...args);
@@ -786,10 +771,12 @@ function renderPane($, e, next, attempt = {}) {
         if (entry.type === 'fileChange' && Array.isArray(fileList) && fileList.length) {
           fileList.forEach((change, index) => {
             const fileKey = `${key}:file:${index}`, open = state.folds.has(fileKey);
-            const diff = entry.data?.changes?.find((item) => item.path === change.path)?.diff ?? change.diff;
+            const rawChange = entry.data?.changes?.find((item) => item.path === change.path) ?? change;
+            const diff = rawChange.content ?? rawChange.unified_diff ?? rawChange.diff;
             const filePath = typeof change.path === 'string' ? change.path : '';
             const deferred = entry.deferred || typeof diff !== 'string' || diff.length >= 4096 || diff.includes('[truncated]');
-            itemRows.push(disclosure(`file_${fileKey}`, changeLabel(change), () => {
+            const summary = entry.data?.fileSummary?.length ? change : fileChangeSummary(deferred ? { ...rawChange, diff: undefined, content: undefined, unified_diff: undefined } : rawChange);
+            itemRows.push(disclosure(`file_${fileKey}`, changeLabel(summary), () => {
               toggle(fileKey);
               if (open) page.detailRequests.delete(detailKey(entry, filePath));
               else if (deferred && !detailFor(page, entry, filePath)) return detail($, id, entry, 0, fileKey, filePath, true);
@@ -797,20 +784,25 @@ function renderPane($, e, next, attempt = {}) {
             }, entry, false, open));
             if (open) {
               const loaded = detailFor(page, entry, filePath);
-              const source = safe((loaded && !loaded.error ? loaded.text : diff) ?? '请查看完整内容');
-              const complete = !loaded ? !deferred : !loaded.error && loaded.offset === 0 && loaded.next_offset == null && loaded.format !== 'source';
-              const copy = (press = {}) => $.ui.copy({ text: source, surface: press.surface ?? e.surface });
-              const copyControl = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
-                ? hint(`diff_copy_hint_${fileKey}`, iconButton(`diff_copy_${fileKey}`, { source: copyIcon, label: '复制差异', size: 14, onPress: copy }), '复制差异', 12, -10)
-                : Button({ key: `diff_copy_${fileKey}`, plain: true, label: '⧉', onPress: copy });
-              const diffView = e.surface === 'desktop' && complete ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
+              const inline = !deferred ? fileChangeSource(rawChange) : { text: diff, format: 'source' };
+              const source = safe((loaded && !loaded.error ? loaded.text : inline.text) ?? '请查看完整内容');
+              const format = loaded && !loaded.error ? loaded.format : inline.format;
+              const paged = loaded && !loaded.error && (loaded.previous_offset != null || loaded.next_offset != null);
+              const copyControl = (copyText, localPaged) => {
+                const label = paged || localPaged ? '复制当前页差异' : '复制差异';
+                const copy = (press = {}) => $.ui.copy({ text: copyText, surface: press.surface ?? e.surface });
+                return e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
+                  ? hint(`diff_copy_hint_${fileKey}`, iconButton(`diff_copy_${fileKey}`, { source: copyIcon, label, size: 14, onPress: copy }), label, 18, -10)
+                  : Button({ key: `diff_copy_${fileKey}`, plain: true, label, onPress: copy });
+              };
+              const diffView = e.surface === 'desktop' && format === 'diff' ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source, rows: loaded && !loaded.error ? loaded.rows : undefined, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
                 page.diffPages ??= new Map(); page.diffPages.set(fileKey, value);
                 if (page.diffPages.size > 64) page.diffPages.delete(page.diffPages.keys().next().value);
                 return invalidate($);
               } }) : null;
-              itemRows.push(diffView ?? (typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath.split(/[\\/]/).at(-1) } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: complete && isUnifiedDiff(source) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] })));
+              itemRows.push(diffView ?? (typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath.split(/[\\/]/).at(-1) } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: format === 'diff' && (!loaded || (loaded.offset === 0 && loaded.next_offset == null)) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] })));
               if (loaded?.error) itemRows.push(caption(`file_error_${fileKey}`, loaded.text));
-              if (loaded?.offset > 0) itemRows.push(disclosure(`file_prev_${fileKey}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000), fileKey, filePath)));
+              if (loaded?.previous_offset != null) itemRows.push(disclosure(`file_prev_${fileKey}`, '上一页输出', () => detail($, id, entry, loaded.previous_offset, fileKey, filePath)));
               if (!page.detailRequests.has(detailKey(entry, filePath)) && !String(entry.id).startsWith('action:') && ((!loaded && deferred) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`file_detail_${fileKey}`, loaded?.error ? '重试获取内容' : loaded ? '下一页输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0, fileKey, filePath)));
             }
           });
