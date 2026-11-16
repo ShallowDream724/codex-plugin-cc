@@ -1,5 +1,17 @@
 # 验证记录
 
+## 未安装：原生滚动契约与图片恢复（2026-11-16）
+
+只读检查 Claude Desktop 5.11492.5.0 的实际 renderer：`Lv` 只测量带有效 `data-press-key` 的节点，普通 Box key 不在定位表中；`Rv` 以原生滚动容器测量行数。原生滚动发生后才异步通知插件，内容过短或到硬边界时不能依赖额外滚轮通知。公开组件没有 fixed/sticky 或独立滚动容器，删除了按 offset 重画位置的伪悬浮按钮，采用静态历史边界入口。
+
+完整回归 **414 项通过、2 项环境相关跳过**，元数据/语法检查及原生插件校验通过。证据：`artifacts/test-native-navigation-full.log`、`artifacts/check-native-navigation.log`、`artifacts/validate-native-navigation.log`。相关生成树通过提取的宿主 Box 属性校验（`artifacts/host-native-navigation.log`）。测试改为模拟真实已绘制 Button key 和异步绘制，不再把不存在的 Box 定位、滚轮等待 I/O 或无限制绘制当作成功。
+
+Edge 几何测试直接加载产品 `pane-scroll.js` 和提取的原生测量函数，覆盖前插/追加、两阶段裁剪、延迟绘制、真实滚轮、窄窗口和长短段落混排。测试捕获并修复了一次 116 px 的迟到回复拉回；修复后该场景偏差为宿主行数换算导致的 4 px。重复双向循环的锚点偏差为 −4 px。记录在 `artifacts/edge-navigation.log` 和 `artifacts/edge-variable-navigation.log`。夹具复现了外围节点和通知调度，不能代替完整 Claude GUI 验收；裁剪后内容不足以填满视口时，浏览器仍会限制滚动范围。
+
+侧栏行为回归覆盖空页、短页、预算缩窗、前后历史可达、迟到读取不覆盖后续阅读，以及导航测量期间的并发实时更新。测量期间固定呈现快照，实时内容继续写入缓存，测量结束后恢复显示。滚轮回调不等待读取、state 写入或二次定位。
+
+实际线程记录证实原生事件内的图片 Base64 含截断标记，同一轮次和调用的 `function_call_output` 保留完整图片。只读恢复核验成功获取一张 JPEG 与三页 PDF 图片；未运行模型或修改该线程。50 项活动测试涵盖截断恢复、身份不符、文件替换、RPC 失败回退及索引淘汰重找。未修改 Claude 程序、已安装 rc.14 或 `.claude.json`，未发布 GitHub。
+
 ## rc.14 本地验收修复（2026-11-16）
 
 完整本地回归 **409 项通过、2 项环境相关跳过**，元数据/语法检查与 Claude 原生插件校验均通过。日志为 `artifacts/test-rc14-full.log`、`artifacts/check-rc14.log`、`artifacts/validate-rc14.log`。从当前测试生成的宿主 Box 属性检查覆盖差异、图片、最终回复复制及复制反馈，结果见 `artifacts/host-box-rc14-current.log`。

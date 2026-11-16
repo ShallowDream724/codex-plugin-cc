@@ -576,55 +576,6 @@ test('only adjacent same-type calls within a turn group and retain items', () =>
   assert.deepEqual(groupEntries(calls).map((g) => g.items.length), [3]);
 });
 
-test('history remains reachable across many pages alongside live updates; closed observation never redraws', async () => {
-  const hooks = [], timers = []; let invalidations = 0, live = 'live-100';
-  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { invalidations++; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(ms, fn) { const t = { fn, cancel() {} }; timers.push(t); return t; } } };
-  const entry = (id) => ({ id, turn_id: 't', type: 'agentMessage', data: { text: id } });
-  const agents = [{ agent_id: 'a', name: 'A', status: 'running', pending_requests: [{ payload: 'private' }] }];
-  const bridge = async (_$, op, args) => {
-    if (op === 'ui_list') return { agents };
-    if (op === 'ui_revision') return { revision: live === 'live-100' ? 1 : 2, entries: [entry(live)] };
-    const n = args.cursor ? Number(args.cursor.turns_cursor) : 0;
-    return { entries: [entry(`history-${n}`)], next_cursor: { turns_cursor: String(n + 1) } };
-  };
-  closeUI(); connect($, bridge); registerUI(on);
-  observeUI($, { agents }); assert.equal(invalidations, 0);
-  await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
-  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  live = 'live-200'; timers[0].fn(); await new Promise((r) => setImmediate(r));
-  let tree = await draw(); assert.ok(JSON.stringify(tree).includes('live-200')); assert.ok(JSON.stringify(tree).includes('live-100'));
-  const scroll = hooks.find((h) => h.event === 'ui.scroll').fn;
-  for (let i = 0; i < 57; i++) await scroll($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
-  tree = await draw();
-  for (const text of ['history-0', 'history-57', 'live-100', 'live-200']) assert.ok(JSON.stringify(tree).includes(text));
-  assert.equal(nodes(tree).find((x) => ['codex_older', 'codex_latest'].includes(x.props.key)), undefined);
-  await hooks.find((h) => h.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e);
-  const count = invalidations; observeUI($, { agents: [{ ...agents[0], status: 'completed', name: 'Changed' }] }); assert.equal(invalidations, count);
-});
-
-test('older history is prepended while live updates continue to append', async () => {
-  const hooks = [], timers = [];
-  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(ms, fn) { const t = { fn, cancel() {} }; timers.push(t); return t; } } };
-  const entry = (id) => ({ id, turn_id: 't', type: 'agentMessage', data: { text: id } });
-  const bridge = async (_$, op, args) => {
-    if (op === 'ui_list') return { agents: [{ agent_id: 'a', name: 'The full agent name' }] };
-    if (op === 'ui_history') return args.cursor ? { entries: [entry('old')], next_cursor: null } : { entries: [entry('new')], next_cursor: { turns_cursor: 'old' } };
-    return { revision: 1, entries: [entry('live')] };
-  };
-  closeUI(); connect($, bridge); registerUI(on);
-  await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
-  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  let tree = await draw();
-  assert.ok(JSON.stringify(tree).includes('The full agent name'));
-  await hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
-  tree = await draw(); assert.ok(nodes(tree).some((x) => x.props.key?.includes('t:old')));
-  timers[0].fn(); await new Promise((r) => setImmediate(r));
-  tree = await draw();
-  assert.deepEqual(nodes(tree).filter((x) => x.type === 'Markdown').map((x) => x.props.text), ['old', 'new', 'live']);
-});
-
 test('late details from a previous selection are discarded', async () => {
   const hooks = [], deferred = {};
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
@@ -815,62 +766,6 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   closeUI();
 });
 
-test('an empty live cache restores saved latest history once and skips a newly starting agent', async () => {
-  const hooks = [], timers = [], afters = [], historyCalls = [], writes = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
-  const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async (_ref, value) => { writes.push(value); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
-  const agents = [{ agent_id: 'saved', status: 'completed' }, { agent_id: 'new', status: 'starting' }];
-  connect($, async (_$, op, args) => {
-    if (op === 'ui_list') return { agents };
-    if (op === 'ui_revision') return { revision: 1, entries: [] };
-    if (op === 'ui_history') { historyCalls.push(args); return { entries: [{ id: args.cursor ? 'older' : 'recent', type: 'agentMessage', turn_id: 't', data: { text: args.cursor ? 'older saved message' : 'recent saved message' } }], next_cursor: args.cursor ? null : { turns_cursor: 'older' } }; }
-  });
-  $.clock.after = (_ms, fn) => { afters.push(fn); return { cancel() {} }; };
-  closeUI(); registerUI(on); await openAgent($, 'saved');
-  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  assert.match(JSON.stringify(await draw()), /recent saved message/);
-  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_attach_saved').props.label, '+');
-  assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_paste_saved').props.label, '📎︎');
-  writes.length = 0;
-  for (let i = 0; i < 3; i++) { await timers[0](); await observeUI($, { agents }); }
-  assert.equal(historyCalls.length, 1); assert.equal(writes.length, 0);
-  assert.match(JSON.stringify(await draw()), /recent saved message/);
-  afters.shift()(); await new Promise(setImmediate);
-  assert.deepEqual(historyCalls[1].cursor, { turns_cursor: 'older' });
-  assert.doesNotMatch(JSON.stringify(await draw()), /older saved message/);
-  await hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
-  await afters.shift()();
-  assert.match(JSON.stringify(await draw()), /older saved message/);
-  assert.match(JSON.stringify(await draw()), /recent saved message/);
-  await openAgent($, 'new'); assert.equal(historyCalls.length, 2);
-  closeUI();
-});
-
-test('history scrolling schedules its refresh while input and polling await pane refresh', async () => {
-  const hooks = [], timers = [], afters = [], pending = []; let delay = false, revision = 1;
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
-  const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async () => { if (delay) await new Promise((resolve) => pending.push(resolve)); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
-  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [{ id: args.cursor ? 'old' : 'saved', turn_id: 't', type: 'agentMessage', data: { text: 'saved history' } }], next_cursor: args.cursor ? null : { turns_cursor: 'older' } } : { revision, entries: [{ id: 'm', turn_id: 't', type: 'agentMessage', data: { text: `live message ${revision}` } }] });
-  $.clock.after = (_ms, fn) => { afters.push(fn); return { cancel() {} }; };
-  closeUI(); registerUI(on); await openAgent($, 'a');
-  const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
-  delay = true; let completed = false;
-  const action = hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e).then(() => { completed = true; });
-  await new Promise((r) => setImmediate(r)); assert.equal(completed, false); assert.equal(pending.length, 1);
-  pending.shift()(); await action; assert.equal(completed, true);
-  afters.shift()(); await new Promise(setImmediate);
-  const history = afters.shift()(); await new Promise(setImmediate);
-  assert.equal(pending.length, 2, 'announce the pending history read and then its completion'); pending.splice(0).forEach(resolve => resolve()); await history;
-  assert.match(JSON.stringify(await draw()), /saved history/);
-  completed = false;
-  const input = nodes(await draw()).find((node) => node.type === 'Input').props.onInput('x').then(() => { completed = true; });
-  await new Promise((r) => setImmediate(r)); assert.equal(completed, false); pending.shift()(); await input;
-  revision = 2; completed = false;
-  const tick = timers[0]().then(() => { completed = true; });
-  await new Promise((r) => setImmediate(r)); assert.equal(completed, false); pending.shift()(); await tick;
-  closeUI();
-});
-
 test('cold history merges with live deltas, updates duplicates and retains more than 200 messages', async () => {
   const hooks = [], timers = []; let revision = 1, recent = [];
   const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
@@ -888,7 +783,7 @@ test('cold history merges with live deltas, updates duplicates and retains more 
   assert.deepEqual(messages, ['cold-one', 'cold-two', 'new-one updated']);
   recent = Array.from({ length: 260 }, (_, i) => entry(`new-${i + 2}`)); revision++; await timers[0]();
   messages = nodes(await draw()).filter((node) => node.type === 'Markdown').map((node) => node.props.text);
-  assert.equal(messages.length, 263); assert.equal(messages[0], 'cold-one'); assert.equal(messages.at(-1), 'new-261');
+  assert.equal(messages.length, 120); assert.equal(messages.at(-1), 'new-261');
   assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_older'), undefined);
   closeUI();
 });
@@ -1072,17 +967,17 @@ test('tool gallery wraps bounded images without duplication or filtering literal
 });
 
 test('image preview routes the rendered image, restores the tool, and rejects stale agent events', async (t) => {
-  const hooks = [], scrolls = [], entry = { id: 'img', turn_id: 't', type: 'imageView', media: { count: 1, has_images: true }, data: { path: 'C:/tmp/original.jpg' } };
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Image', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async args => { scrolls.push(args); return {}; } }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => fn() } };
+  const hooks = [], scrolls = [], afters = []; let painted = []; const entry = { id: 'img', turn_id: 't', type: 'imageView', media: { count: 1, has_images: true }, data: { path: 'C:/tmp/original.jpg' } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Image', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async args => { if (args.to?.key && !painted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted'); scrolls.push(args); return {}; } }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => { afters.push(fn); return { cancel() {} }; } } };
   connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }, { agent_id: 'b' }] } : op === 'ui_revision' ? { revision: 1, entries: args.target === 'a' ? [entry] : [] } : op === 'ui_detail' ? { images: [{ index: 0, path: 'C:/tmp/preview.png', previewable: true, width: 400, height: 200, file_url: 'file:///C:/tmp/original.jpg' }], next_offset: null } : { entries: [], next_cursor: null });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
-  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns: 50, scroll: { bodyRows: 20 } } }, () => null));
+  const draw = async () => painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns: 50, scroll: { bodyRows: 20 } } }, () => null));
   const message = hooks.find(h => h.event === 'ui.message').fn;
   await (await draw()).find(n => n.props.key === 'item_a:t:img').props.onPress(); await new Promise(setImmediate);
   let tree = await draw(); const action = tree.find(n => n.type === 'Client' && n.props.module === './image-control.js'); assert.ok(action); assert.equal(JSON.stringify(action.props).includes('C:/'), false);
   await message($, { element: action.props.key, data: { action: 'preview', path: 'C:/evil.png' } }, () => ({})); tree = await draw();
   const image = tree.find(n => n.props.key === 'codex_image_preview_image'); assert.equal(image.props.source.file, 'C:/tmp/preview.png'); assert.ok(image.props.columns <= 46 && image.props.rows <= 16); assert.ok(tree.some(n => n.props.key === 'codex_image_preview_original' && n.props.text.includes('original.jpg')));
-  await tree.find(n => n.props.key === 'codex_image_preview_close').props.onPress(); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'tool_media_gallery_a:t:img')); assert.ok(scrolls.some(s => s.to?.key === 'row_item_a:t:img'));
+  await tree.find(n => n.props.key === 'codex_image_preview_close').props.onPress(); tree = await draw(); while (afters.length) await afters.shift()(); assert.ok(tree.some(n => n.props.key === 'tool_media_gallery_a:t:img')); assert.ok(scrolls.some(s => s.to?.key === 'item_a:t:img'));
   await openAgent($, 'b'); await message($, { element: action.props.key, data: { action: 'preview' } }, () => ({})); assert.ok(!(await draw()).some(n => n.props.key === 'codex_image_preview_image'));
 });
 
@@ -1147,4 +1042,15 @@ test('file changes present native kinds, source additions, moves and paged diff 
   await tree.find(n => n.props.key === 'diff_copy_a:t:file3:file:0').props.onPress(); assert.equal(copies[0], fileChangePage(changes[3], 0).text);
   await click('file_detail_a:t:file3:file:0'); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0')); assert.ok(tree.some(n => n.props.key === 'file_prev_a:t:file3:file:0'));
   await click('file_prev_a:t:file3:file:0'); assert.equal(requests.at(-1).offset, 0);
+});
+
+test('closed observation never redraws and starting agents do not read saved history', async () => {
+  const hooks = [], calls = []; let invalidations = 0;
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() { invalidations++; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  const agents = [{ agent_id: 'new', status: 'starting' }];
+  connect($, async (_$, op) => { calls.push(op); return op === 'ui_list' ? { agents } : op === 'ui_revision' ? { revision: 1, entries: [] } : { entries: [], next_cursor: null }; });
+  closeUI(); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) }));
+  await openAgent($, 'new'); assert.ok(!calls.includes('ui_history'));
+  await hooks.find(h => h.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, e => e);
+  const count = invalidations; await observeUI($, { agents: [{ ...agents[0], status: 'completed' }] }); assert.equal(invalidations, count);
 });

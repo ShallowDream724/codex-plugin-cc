@@ -7,12 +7,13 @@ import { orderWaits } from '../shared/activity-order.mjs';
 import { renderDiff } from './diff-view.js';
 import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
 import { nativeRenderBudget } from './render-budget.js';
+import { paneScroll } from './pane-scroll.js';
 
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
 let paneRevision = 0;
 const MAX_DETAILS = 16;
-const VISIBLE_ENTRIES = 500;
+const VISIBLE_ENTRIES = 120;
 const MAX_COPY_LENGTH = 16 * 1024 * 1024;
 const MAX_COPY_PAGES = 1100;
 let copyIntent = 0;
@@ -189,20 +190,82 @@ function conversationEntries(all) {
   }));
 }
 function timelineWindow(page, count = page.windowSize ?? VISIBLE_ENTRIES, from) {
-  const all = page.timeline ??= conversationEntries(page.live), lastStart = Math.max(0, all.length - count);
+  const all = page.navigationTimeline ?? (page.timeline ??= conversationEntries(page.live)), lastStart = Math.max(0, all.length - count);
   const anchor = page.windowAnchor ? all.findIndex(entry => entryKey(entry) === page.windowAnchor) : -1;
   // Budget retries shrink the count and pass the previous start. In tail mode
   // recalculate from the end for each retry, unless an expanded item is held.
-  const preferred = page.followTail && anchor < 0 ? lastStart : (from ?? (page.followTail ? Math.max(0, Math.min(anchor - Math.floor(count / 2), lastStart)) : (page.windowEnd != null ? page.windowEnd - count : page.windowStart)));
+  const preferred = page.followTail && anchor < 0 ? lastStart : (from ?? (page.followTail ? Math.max(0, Math.min(anchor - Math.floor(count / 2), lastStart)) : page.windowStart));
   const start = Math.max(0, Math.min(preferred, Math.max(0, all.length - 1)));
-  return { entries: all.slice(start, page.windowEnd != null && !page.followTail ? page.windowEnd : start + count), start, total: all.length };
+  return { entries: all.slice(start, page.windowEnd != null && !page.followTail ? Math.min(page.windowEnd, start + count) : start + count), start, total: all.length };
 }
-function holdWindow(page) { page.windowStart = timelineWindow(page).start; page.followTail = false; }
-function anchorAfterRender($, id, page, gen, scrollGen, entry, block) {
-  if (!entry) return;
-  $.clock.after(0, async () => {
-    if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen) await $.ui.scroll({ in: PANE, to: { key: `activity_group_${id}:${entryKey(entry)}` }, block }).catch(() => {});
+function drawnWindow(page) { return page.renderedWindow && page.renderedWindow.timeline === (page.navigationTimeline ?? page.timeline) ? page.renderedWindow : timelineWindow(page); }
+function holdWindow(page) {
+  const view = drawnWindow(page);
+  page.windowStart = view.start; page.windowEnd = view.start + view.entries.length;
+  page.windowSize = Math.max(1, view.entries.length); page.followTail = false;
+}
+const historyKey = (id, page) => `codex_history_${id}_${page.layoutRevision ?? 0}`;
+function scrollController($, id, page) {
+  return page.scroller ??= paneScroll({
+    scroll: args => $.ui.scroll({ in: PANE, ...args }), later: (ms, fn) => $.clock.after(ms, fn),
+    valid: () => state.opened && state.selected === id && state.pages.get(id) === page,
+    position: offset => state.scroll.set(id, offset),
   });
+}
+async function resizeWindow($, id, page, start, end, above) {
+  // Height differences must describe this navigation only. Polls may keep
+  // merging into the data cache, but cannot append/resize a different record
+  // in the middle of our two measured frames.
+  page.navigationTimeline ??= page.timeline ??= conversationEntries(page.live);
+  const scroller = scrollController($, id, page), gen = state.generation, intent = scroller.intent;
+  const before = await scroller.measure(historyKey(id, page));
+  if (!before || !state.opened || state.selected !== id || gen !== state.generation || scroller.intent !== intent) return false;
+  const expanded = new Set(groupEntries(drawnWindow(page).entries).flatMap(group => state.folds.has(`${id}:${entryKey(group.items[0])}:group`) ? group.items.map(entryKey) : []));
+  for (const group of groupEntries(page.navigationTimeline.slice(start, end))) {
+    if (group.items.some(entry => expanded.has(entryKey(entry)))) state.folds.add(`${id}:${entryKey(group.items[0])}:group`);
+  }
+  page.followTail = false; page.windowAnchor = null;
+  page.windowStart = start; page.windowEnd = end; page.windowSize = Math.max(1, end - start);
+  page.layoutRevision = (page.layoutRevision ?? 0) + 1;
+  await invalidate($);
+  const after = await scroller.measure(historyKey(id, page), before, above);
+  return !!after && state.opened && state.selected === id && gen === state.generation && scroller.intent === intent;
+}
+async function browseHistory($, id, direction) {
+  const page = pageFor(id), gen = state.generation;
+  if (page.navigating || state.imagePreview) return;
+  page.navigating = true; holdWindow(page);
+  const scrollGen = page.scrollGeneration;
+  try {
+    let view = drawnWindow(page);
+    if (direction < 0 && view.start === 0 && page.cursor) {
+      await history($, id);
+      if (gen !== state.generation || state.selected !== id || scrollGen !== page.scrollGeneration) return;
+      view = drawnWindow(page);
+    }
+    const available = () => direction < 0 ? view.start > 0 : view.start + view.entries.length < view.total;
+    if (!available()) return;
+    // Trim only the opposite, off-screen side, then measure that frame before
+    // adding anything. Mixing a prepend and a tail eviction in one redraw
+    // makes total-height compensation incorrect.
+    while (view.entries.length > 60 || (view.entries.length > 1 && page.renderCost?.chars > 44000)) {
+      const keep = Math.max(1, Math.min(60, Math.floor(view.entries.length / 2)));
+      const start = direction < 0 ? view.start : view.start + view.entries.length - keep;
+      if (!await resizeWindow($, id, page, start, start + keep, direction > 0)) return;
+      view = drawnWindow(page);
+    }
+    const end = view.start + view.entries.length;
+    page.adding = { direction, start: view.start, end };
+    await resizeWindow($, id, page, direction < 0 ? Math.max(0, view.start - 30) : view.start, direction > 0 ? Math.min(view.total, end + 30) : end, direction < 0);
+  } finally {
+    const previous = drawnWindow(page), first = previous.entries[0], last = previous.entries.at(-1);
+    page.navigationTimeline = null; page.adding = null; page.navigating = false;
+    if (!page.followTail && first && last) {
+      const all = page.timeline ??= conversationEntries(page.live), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
+      if (start >= 0 && end >= start) { page.windowStart = start; page.windowEnd = end + 1; page.windowSize = end - start + 1; }
+    }
+    if (state.opened && state.selected === id && gen === state.generation) void invalidate($);
+  }
 }
 let actionSequence = 0;
 let stoppingAll;
@@ -257,6 +320,7 @@ async function sendAgent($, id) {
   let accepted = false;
   const selected = state.agents.find((agent) => idOf(agent) === id);
   if (!selected || control.sending || control.stopping || selected.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
+  const page = pageFor(id); page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel(); page.scrollGeneration++;
   control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; await invalidate($);
   try {
     const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
@@ -324,7 +388,7 @@ async function chooseAttachments($, id, source = 'file') {
       const result = await bridge($, 'ui_history', { target: id });
       if (!state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen) return;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
-      const before = timelineWindow(page), first = before.entries[0] && entryKey(before.entries[0]);
+      const before = drawnWindow(page), first = before.entries[0] && entryKey(before.entries[0]);
       const changed = mergeLive(page, result.entries, true), cursorChanged = JSON.stringify(page.cursor) !== JSON.stringify(result.next_cursor ?? null);
       if (changed && !page.followTail && first) {
         const index = timelineWindow(page).total && page.timeline.findIndex(entry => entryKey(entry) === first);
@@ -364,7 +428,7 @@ async function chooseAttachments($, id, source = 'file') {
       }
       if (appended && page.followTail) page.windowAnchor = null;
       if (dirty) await invalidate($);
-      if (entriesChanged && hadRevision && page.followTail && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
+      if (entriesChanged && hadRevision && page.followTail && !page.navigating && !page.scroller?.pending && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
         const scrollGen = page.scrollGeneration;
         const follow = async () => { if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail && !state.imagePreview) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); };
         $.clock.after(0, follow);
@@ -405,7 +469,7 @@ async function chooseAttachments($, id, source = 'file') {
   async function history($, id) {
     const page = pageFor(id), gen = state.generation, cursor = page.cursor;
     if (!cursor || page.historyLoading) return;
-    const scrollGen = page.scrollGeneration, anchor = timelineWindow(page).entries[0], request = {};
+    const scrollGen = page.scrollGeneration, request = {};
     let continueHistory = false, changed = false, loaded = false;
     page.historyLoading = true; page.historyRequest = request;
     void invalidate($);
@@ -415,15 +479,21 @@ async function chooseAttachments($, id, source = 'file') {
       page.historyPrefetch = null;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
       if (result.next_cursor && JSON.stringify(result.next_cursor) === JSON.stringify(cursor)) throw new Error('历史读取位置未推进');
-      const previous = timelineWindow(page), first = previous.entries[0] && entryKey(previous.entries[0]);
+      const previous = drawnWindow(page), first = previous.entries[0] && entryKey(previous.entries[0]);
       changed = mergeLive(page, result.entries, true);
       if (changed && !page.followTail && first) {
         timelineWindow(page);
         const index = page.timeline.findIndex(entry => entryKey(entry) === first);
         if (index >= 0) {
-          if (page.scrollGeneration === scrollGen) { const size = page.windowSize ?? VISIBLE_ENTRIES; page.windowEnd = page.timeline.length <= size ? page.timeline.length : index + 1; page.windowStart = Math.max(0, page.windowEnd - size); }
-          else { const delta = index - previous.start; page.windowStart += delta; if (page.windowEnd != null) page.windowEnd += delta; }
+          const delta = index - previous.start;
+          page.windowStart = previous.start + delta; page.windowEnd = previous.start + previous.entries.length + delta;
+          page.windowSize = Math.max(1, previous.entries.length);
         }
+      } else if (changed && !page.followTail && !first) {
+        // There was no readable anchor to preserve (for example a page of
+        // filtered reasoning records). Do not retain an empty [0, 0) window.
+        const count = Math.min(VISIBLE_ENTRIES, timelineWindow(page).total);
+        page.windowStart = 0; page.windowEnd = count; page.windowSize = Math.max(1, count);
       }
       page.cursor = result.next_cursor ?? null; page.historyError = '';
       continueHistory = !changed && Boolean(page.cursor) && page.scrollGeneration === scrollGen;
@@ -434,8 +504,6 @@ async function chooseAttachments($, id, source = 'file') {
         page.historyLoading = false; page.historyRequest = null;
         if (state.opened && state.selected === id && state.generation === gen) {
           await invalidate($);
-          // Restore the anchor after the loading indicator has disappeared.
-          if (changed) anchorAfterRender($, id, page, gen, scrollGen, anchor, 'start');
           if (loaded) queueHistoryPrefetch($, id);
           if (continueHistory && page.scrollGeneration === scrollGen) $.clock.after(0, () => history($, id));
         }
@@ -443,6 +511,7 @@ async function chooseAttachments($, id, source = 'file') {
     }
   }
   async function select($, id) {
+    const previous = state.pages.get(state.selected); previous?.scroller?.cancel(); if (previous) { previous.scroller = null; previous.browseTimer?.cancel(); }
     state.selected = id; state.generation++; state.imagePreview = null;
     const page = pageFor(id); page.historyLoading = false; page.historyRequest = null;
     state.restore = state.scroll.has(id) && !page.followTail;
@@ -452,14 +521,14 @@ async function chooseAttachments($, id, source = 'file') {
   }
   async function showImagePreview($, id, preview) {
     if (!state.opened || state.selected !== id || !state.folds.has(preview.foldKey)) return;
-    const page = pageFor(id); page.scrollGeneration++; if (!page.followTail) holdWindow(page);
+    const page = pageFor(id); page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel(); page.scrollGeneration++; if (!page.followTail) holdWindow(page);
     state.imagePreview = { ...preview, agentId: id }; await invalidate($);
   }
   async function closeImagePreview($, id) {
     const preview = state.imagePreview, gen = state.generation;
     if (!preview || preview.agentId !== id) return;
     state.imagePreview = null; await invalidate($);
-    const restore = async () => { if (state.opened && state.selected === id && state.generation === gen && !state.imagePreview) await $.ui.scroll({ in: PANE, to: { key: `row_item_${preview.foldKey}` }, block: 'nearest' }).catch(() => {}); };
+    const restore = async () => { if (state.opened && state.selected === id && state.generation === gen && !state.imagePreview) await $.ui.scroll({ in: PANE, to: { key: `item_${preview.foldKey}` }, block: 'nearest' }).catch(() => {}); };
     $.clock.after(0, restore);
   }
   export async function openAgent($, id) {
@@ -597,19 +666,20 @@ export function registerUI(on) {
     return {};
   });
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; }
+    if (e.id === PANE) { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; for (const page of state.pages.values()) { page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel(); } }
     return next(e);
   });
-  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+  on('ui.scroll', { requestId: PANE }, ($, e, next) => {
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
-    const view = page && (page.renderedWindow?.timeline === page.timeline ? page.renderedWindow : timelineWindow(page));
+    const view = page && drawnWindow(page);
     const atBottom = Number.isFinite(e.contentRows) && Number.isFinite(e.bodyRows) && e.offset >= e.contentRows - e.bodyRows - 1;
-    const wasAway = page?.awayFromBottom;
-    let scrollGen;
+    const controller = page && scrollController($, id, page);
+    if (controller?.pending && e.origin.kind === 'plugin') return next(controller.observe(e));
+    controller?.observe(e);
     if (e.origin.kind === 'person' && id) {
+      page.browseTimer?.cancel();
       state.scroll.set(id, e.offset); page.scrollGeneration++;
-      scrollGen = page.scrollGeneration;
       page.windowAnchor = null;
       holdWindow(page);
       if (page.windowEnd == null) page.windowStart = view.start;
@@ -618,33 +688,22 @@ export function registerUI(on) {
     }
     if (e.origin.kind === 'plugin' && state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(state.selected) || 0 }); }
     if (e.origin.kind === 'plugin' && state.selected) state.scroll.set(state.selected, e.offset);
-    const result = await next(e);
-    if (e.origin.kind === 'person' && id && state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen) {
-      if (Boolean(wasAway) !== page.awayFromBottom) await invalidate($);
-      if (!state.opened || state.selected !== id || state.generation !== gen || page.scrollGeneration !== scrollGen) return result;
-      if (e.by < 0 && view.start === 0 && e.offset <= Math.max(2, (e.bodyRows || 12) * 2)) prefetchHistory($, id);
-      if (e.by < 0 && e.offset <= 1) {
-        if (view.start > 0) {
-          page.renderedWindow = null;
-          page.windowEnd = view.start + (view.entries.length > 1 ? 1 : 0);
-          page.windowSize = Math.min(VISIBLE_ENTRIES, Math.max(2, view.entries.length * 2)); page.followTail = false; page.windowAnchor = null;
-          await invalidate($);
-          anchorAfterRender($, id, page, gen, page.scrollGeneration, view.entries[0], 'start');
-        } else $.clock.after(0, async () => { if (state.opened && state.selected === id && state.generation === gen) await history($, id); });
-      } else if (e.by > 0 && atBottom && view.start + view.entries.length < view.total) {
-        page.renderedWindow = null;
-        page.windowEnd = null; page.windowStart = view.start + Math.max(1, view.entries.length - 1);
-        page.windowSize = Math.min(VISIBLE_ENTRIES, Math.max(2, view.entries.length * 2)); page.windowAnchor = null;
-        await invalidate($);
-        anchorAfterRender($, id, page, gen, page.scrollGeneration, view.entries.at(-1), 'end');
-      } else if (e.by > 0 && atBottom && page.followTail) {
+    // Return the wheel dispatch immediately. History, state writes and paint
+    // barriers run outside the host's scroll request chain.
+    if (e.origin.kind === 'person' && id && state.opened && !page.navigating) {
+      const threshold = Math.max(2, (e.bodyRows || 12) * 2);
+      if (e.by < 0 && e.offset <= threshold && page.cursor) prefetchHistory($, id);
+      const needsTrim = view.entries.length > 60 || page.renderCost?.chars > 44000;
+      const earlier = e.by < 0 && e.offset <= (needsTrim ? 1 : threshold) && (view.start > 0 || page.cursor);
+      const later = e.by > 0 && e.offset >= e.contentRows - e.bodyRows - (needsTrim ? 1 : threshold) && view.start + view.entries.length < view.total;
+      if (earlier || later) {
         const scrollGen = page.scrollGeneration;
-        $.clock.after(0, async () => {
-          if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
+        page.browseTimer = $.clock.after(32, () => {
+          if (state.opened && state.selected === id && gen === state.generation && scrollGen === page.scrollGeneration) return browseHistory($, id, earlier ? -1 : 1);
         });
       }
     }
-    return result;
+    return next(e);
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     if (!state.opened || !state.selected) return next(e);
@@ -695,6 +754,12 @@ function renderPane($, e, next, attempt = {}) {
       ] });
     }
     const view = timelineWindow(page, attempt.count, attempt.start), entries = view.entries;
+    const jump = async () => {
+      page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel();
+      const gen = state.generation; page.followTail = true; page.awayFromBottom = false; const scrollGen = ++page.scrollGeneration; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
+      await invalidate($);
+      $.clock.after(0, async () => { if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); });
+    };
     const rows = [], navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
     const previewImage = (key, image, foldKey) => {
@@ -731,7 +796,7 @@ function renderPane($, e, next, attempt = {}) {
       const activate = entry ? (...args) => {
         page.scrollGeneration++; if (!page.followTail) holdWindow(page); page.windowAnchor = entryKey(entry);
         // Request the reading anchor without blocking the visible disclosure.
-        $.ui.scroll({ in: PANE, to: { key: `row_${key}` }, block: 'nearest' }).catch(() => {});
+        if (!page.scroller?.pending) $.ui.scroll({ in: PANE, to: { key }, block: 'nearest' }).catch(() => {});
         return onPress(...args);
       } : onPress;
       const vector = typeof expanded === 'boolean' && e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function';
@@ -775,9 +840,19 @@ function renderPane($, e, next, attempt = {}) {
     navigation.push(Box({ key: `codex_title_row_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [agentMark(`codex_title_icon_${id}`, id), Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [safe(agentDisplayName(selected.name || 'Codex'))] })] }));
     const sourceLabel = ({ new: '新建', claude: '继承 Claude', codex: 'Codex 历史', unknown: '来源未记录' })[selected.context_source];
     if (sourceLabel) navigation.push(caption(`codex_origin_${id}`, sourceLabel));
-    if (page.historyLoading) navigation.push(Box({ key: `codex_history_loading_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [
-      ...(e.surface === 'desktop' && typeof Svg === 'function' ? [Svg({ key: `codex_history_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 14, height: 14, isInteractive: true })] : []),
-      caption(`codex_history_loading_label_${id}`, '正在加载历史消息…'),
+    const hasEarlier = view.start > 0 || !!page.cursor;
+    const jumpControl = suffix => e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
+      ? hint(`codex_jump_hint_${id}_${suffix}`, iconButton(`codex_jump_${id}_${suffix}`, { source: jumpIcon, label: '回到最新消息', size: 28, width: 4, height: 2, onPress: jump }), '回到最新消息', 18, -7)
+      : Button({ key: `codex_jump_${id}_${suffix}`, plain: true, label: '↓ 最新消息', onPress: jump });
+    // Native Pane has no fixed overlay slot. Keep navigation in stable rows,
+    // never emulate fixed positioning by repainting offset + viewport height.
+    navigation.push(Box({ key: `codex_history_bar_${id}`, height: 2, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', children: [
+      Box({ flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [
+        Button({ key: historyKey(id, page), plain: true, dimColor: true, label: hasEarlier ? '加载更早消息' : '回到最新消息', onPress: hasEarlier ? () => browseHistory($, id, -1) : jump }),
+        Box({ key: `codex_history_loading_${id}`, width: 2, height: 1, children: page.historyLoading || page.navigating ? [e.surface === 'desktop' && typeof Svg === 'function'
+          ? Svg({ key: `codex_history_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 14, height: 14, isInteractive: true })
+          : caption(`codex_history_loading_label_${id}`, '…')] : [] }),
+      ] }), ...(hasEarlier ? [jumpControl('top')] : []),
     ] }));
     if (state.error) navigation.push(caption('codex_open_error', state.error));
     if (state.error || page.liveError || page.historyError) {
@@ -997,24 +1072,26 @@ function renderPane($, e, next, attempt = {}) {
     if (control.sendResult) composer.push(caption(`codex_send_result_${id}`, control.sendResult));
     const bodyRows = e.surface === 'desktop' ? e.props?.scroll?.bodyRows : undefined;
     const fillPane = Number.isFinite(bodyRows) && bodyRows > 0;
-    const jump = async () => {
-      const gen = state.generation; page.followTail = true; page.awayFromBottom = false; const scrollGen = ++page.scrollGeneration; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
-      await invalidate($);
-      $.clock.after(0, async () => { if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); });
-    };
-    const overlay = [];
-    const offset = e.props?.scroll?.offset;
-    if (page.awayFromBottom && fillPane && Number.isFinite(offset) && typeof Svg === 'function' && typeof Client === 'function') {
-      // Pane re-queries on scroll; use its viewport coordinates, no scroll timer.
-      overlay.push(Box({ key: `codex_jump_position_${id}`, position: 'absolute', top: Math.max(0, Math.floor(offset + bodyRows - 3)), left: 0, width: '100%', flexDirection: 'row', justifyContent: 'center', children: [hint(`codex_jump_hint_${id}`, iconButton(`codex_jump_${id}`, { source: jumpIcon, label: '回到最新消息', size: 32, width: 4, height: 2, onPress: jump }), '回到最新消息', 18, -7)] }));
-    } else if (page.awayFromBottom && e.surface !== 'desktop') composer.push(Button({ key: `codex_jump_${id}`, plain: true, label: '↓ 最新消息', onPress: jump }));
+    const hasLater = view.start + entries.length < view.total;
+    const historyEnd = Box({ key: `codex_history_end_${id}`, height: 2, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', children: hasLater ? [
+      Button({ key: `codex_history_next_${id}`, plain: true, dimColor: true, label: '加载后续消息', onPress: () => browseHistory($, id, 1) }), jumpControl('bottom'),
+    ] : [] });
     const timeline = Box({ key: `codex_timeline_${id}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 1 : 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows });
-    const root = content => Box({ key: 'codex_conversation', position: 'relative', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), ...content, Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer }), ...overlay] });
+    const root = content => Box({ key: 'codex_conversation', position: 'relative', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), ...content, ...(hasLater ? [historyEnd] : []), Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer })] });
     let tree = root([timeline]);
     if (!budget.fits(tree) && entries.length > 1) {
+      if (page.adding) {
+        const retained = page.adding.end - page.adding.start;
+        const added = entries.length - retained;
+        if (added > 0) {
+          const keep = retained + Math.floor(added / 2);
+          const start = page.adding.direction < 0 ? page.adding.end - keep : page.adding.start;
+          return renderPane($, e, next, { count: keep, start });
+        }
+      }
       const count = Math.max(1, Math.floor(entries.length / 2));
-      const anchor = page.windowAnchor && page.timeline.findIndex(entry => entryKey(entry) === page.windowAnchor);
-      const start = page.windowEnd != null ? Math.max(0, page.windowEnd - count) : Number.isInteger(anchor) && anchor >= view.start && anchor < view.start + entries.length
+      const anchor = page.windowAnchor && (page.navigationTimeline ?? page.timeline).findIndex(entry => entryKey(entry) === page.windowAnchor);
+      const start = page.windowEnd != null && page.adding?.direction < 0 ? Math.max(0, page.windowEnd - count) : Number.isInteger(anchor) && anchor >= view.start && anchor < view.start + entries.length
         ? Math.max(view.start, Math.min(anchor - Math.floor(count / 2), view.start + entries.length - count)) : view.start;
       return renderPane($, e, next, { count, start });
     }
@@ -1032,10 +1109,11 @@ function renderPane($, e, next, attempt = {}) {
       ] });
       tree = root([parts[current], pager]);
     }
-    page.renderedWindow = { ...view, entries, timeline: page.timeline };
+    page.renderedWindow = { ...view, entries, timeline: page.navigationTimeline ?? page.timeline }; page.renderCost = budget.cost(tree);
+    if (!page.followTail) { page.windowStart = view.start; page.windowEnd = view.start + entries.length; page.windowSize = Math.max(1, entries.length); }
     return tree;
 }
-export function closeUI() { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
+export function closeUI() { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; for (const page of state.pages.values()) { page.scroller?.cancel(); page.browseTimer?.cancel(); } state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
 export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);
