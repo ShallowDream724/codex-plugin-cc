@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hooks/ui.js';
 import { fileChangePage } from '../shared/file-changes.mjs';
+import { nativeHooks } from './native-hooks.mjs';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
 // Native Box dimensions accept cells or percentages, not CSS unit strings.
@@ -28,7 +29,7 @@ function connect($, handler) {
 
 test('desktop Enter submits without a native button and the footer control routes only the selected agent', async () => {
   const hooks = [], calls = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
@@ -79,7 +80,7 @@ test('mixed rich text keeps native Markdown structure and fenced language labels
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
     return { revision: 1, entries: [{ id: 'rich', turn_id: 't', type: 'agentMessage', data: { text: rich } }], next_cursor: null };
   });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = surface => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null);
   for (const surface of ['desktop', 'terminal']) {
     const blocks = nodes(await draw(surface)).filter(node => node.type === 'Markdown');
@@ -113,7 +114,7 @@ test('keyboard command opens an agent without submitting a prompt or mutating wo
 
 test('direct controls preserve per-agent drafts and scope late results', async () => {
   const hooks = [], requests = [], pending = {};
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const agents = [{ agent_id: 'a', name: 'A', status: 'running' }, { agent_id: 'b', name: 'B', status: 'completed' }];
   connect($, async (_$, op, args, request) => {
@@ -154,7 +155,7 @@ test('direct controls preserve per-agent drafts and scope late results', async (
 
 test('uncertain send retains draft and stop distinguishes unconfirmed from stopped', async () => {
   const hooks = [], calls = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   connect($, async (_$, op, args) => {
     calls.push(op);
@@ -180,7 +181,7 @@ test('uncertain send retains draft and stop distinguishes unconfirmed from stopp
 
 test('attachments stay scoped to drafts and uncertain or edited sends preserve them', async () => {
   const hooks = [], requests = []; let resolveSend, pickerCount = 0;
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const agents = [{ agent_id: 'a', status: 'running', permissions_mode: 'full-access', context_used_tokens: 500, context_limit_tokens: 1000 }, { agent_id: 'b', status: 'running' }];
   connect($, async (_$, op, args) => {
@@ -212,7 +213,7 @@ test('attachments stay scoped to drafts and uncertain or edited sends preserve t
 
 test('unchanged revision does not redraw and stopping blocks submit while allowing retry', async () => {
   const hooks = [], timers = []; let invalidations = 0, sends = 0;
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() { invalidations++; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
   const agent = { agent_id: 'a', status: 'running', user_paused: false, user_control_status: null };
   connect($, async (_$, op) => {
@@ -239,7 +240,7 @@ test('unchanged revision does not redraw and stopping blocks submit while allowi
 
 test('activity deduplication matches origin, turn and exact content one-to-one', async () => {
   const hooks = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entry = (id, type, data) => ({ id, type, data, turn_id: 't' });
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries: [
@@ -264,7 +265,7 @@ test('activity deduplication matches origin, turn and exact content one-to-one',
 
 test('conversation shows prose and expandable file changes with authoritative counts', async () => {
   const hooks = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const diff = '@@ -1,1 +1,1 @@\n-old\n+one\n';
   const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', deferred: true, data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff }] } }];
@@ -288,7 +289,7 @@ test('desktop file changes show a basename and diff rows with one icon copy acti
   const source = '@@ -4,2 +4,3 @@\n one\n+<literal html>\n two\n';
   const entry = { id: 'file', turn_id: 't', type: 'fileChange', data: { changes: [{ path: 'C:/project/src/example.cpp', diff: source }] } };
   connect($, async (_$, op) => { calls.push(op); return op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : { entries: [], next_cursor: null }; });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
   const file = nodes(await draw()).find(node => node.props.key === 'file_a:t:file:file:0');
   assert.equal(file.props.label, '已更改 example.cpp +1 -0');
@@ -311,7 +312,7 @@ test('long message expands once and caches across collapse', async (t) => {
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   const entry = { id: 'm', type: 'agentMessage', turn_id: 't', preview: '摘要', deferred: true };
   connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : op === 'ui_detail' ? (requests.push(args), { text: '**全文**', format: 'markdown', external: false }) : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   const click = async () => (await draw()).find(n => n.props.key === 'item_a:t:m').props.onPress();
   await click(); assert.equal((await draw()).find(n => n.props.key === 'message_a:t:m').props.text, '**全文**');
@@ -321,7 +322,7 @@ test('long message expands once and caches across collapse', async (t) => {
 
 test('open file retains its detail while new live entries continue to appear', async () => {
   const hooks = [], timers = []; let revision = 1;
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
   connect($, async (_$, op) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] };
@@ -344,7 +345,7 @@ test('open file retains its detail while new live entries continue to appear', a
 });
 
 test('native activity types render readable tool, search, plan and lifecycle details', async () => {
-  const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const hooks = [], on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entry = (id, type, data) => ({ id, type, turn_id: 't', data });
   const entries = [entry('a', 'mcpToolCall', { server: 'fastctx', tool: 'inspect_local_file' }), entry('a2', 'mcpToolCall', { server: 'fastctx', tool: 'inspect_local_file' }), entry('b', 'mcpToolCall', { server: 'fastctx', tool: 'grep' }), entry('search', 'webSearch', { action: { query: '中文查询', url: 'https://example.com/' } }), entry('plan', 'plan', { text: '检查结果' }), entry('compact', 'contextCompaction', { stage: 'started' }), entry('child', 'subAgentActivity', { name: '研究', kind: 'completed', agentThreadId: 'child' }), entry('spawn', 'collabAgentToolCall', { name: '撰写', tool: 'spawnAgent', stage: 'completed', agents: [{ id: 'child2', status: 'running' }] }), entry('future', 'futureItem', { opaque: 4 })];
@@ -366,7 +367,7 @@ test('native activity types render readable tool, search, plan and lifecycle det
 });
 
 test('expanded local PNG uses native image; other paths never load as files', async () => {
-  const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const hooks = [], on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Image'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entries = [{ id: 'png', type: 'imageView', turn_id: 't', data: { path: 'C:\\images\\plot.png' } }, { id: 'web', type: 'imageView', turn_id: 't', data: { path: 'https://example.com/a.png' } }, { id: 'unc', type: 'imageView', turn_id: 't', data: { path: '//server/share/a.png' } }, { id: 'jpg', type: 'imageView', turn_id: 't', data: { path: '/tmp/a.jpg' } }];
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : { revision: 1, entries });
@@ -381,7 +382,7 @@ test('expanded local PNG uses native image; other paths never load as files', as
 });
 
 test('desktop tool expansion keeps the pane valid through output and raw-call disclosure', async (t) => {
-  const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const hooks = [], on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entries = [
     { id: 'task', turn_id: 't', type: 'parentMessage', data: { text: '创建并核对文件' } },
@@ -437,7 +438,7 @@ test('final response copy retrieves raw pages and ignores commentary and stale r
     if (op === 'ui_detail') { calls.push(args); if (deferred) return new Promise(resolve => { deferred.resolve = resolve; }); return args.offset ? { text: '\\[raw\\]', next_offset: null } : { text: '**full**\r\n', next_offset: 524288 }; }
     return { entries: [], next_cursor: null };
   });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null);
   let tree = nodes(await draw());
   assert.deepEqual(tree.filter(n => n.props.key?.startsWith('message_copy_')).map(n => n.props.key), ['message_copy_a:t:final']);
@@ -454,7 +455,7 @@ test('copy reports stalled cursors without writing to clipboard', async (t) => {
   const entry = { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => copied.push(value), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : op === 'ui_detail' ? { text: 'part', next_offset: 0 } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
   (await draw()).find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
   await new Promise(setImmediate);
@@ -467,7 +468,7 @@ test('copy reports a rejected clipboard result', async (t) => {
   const entry = { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'answer' }, message: { is_final: true, truncated: false } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async () => ({ isCopied: false, reason: 'clipboard unavailable' }), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
   await (await draw()).find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
   assert.match((await draw()).find(n => n.props.key === 'message_copy_error_a:t:final').props.children[0], /复制失败.*clipboard unavailable/);
@@ -478,7 +479,7 @@ test('copy immediately preserves short raw text and stops an unending sequence',
   const entries = [{ id: 'short', turn_id: 't', type: 'agentMessage', data: { text: '**raw**\r\n\\[x\\]' }, message: { is_final: true, truncated: false } }, { id: 'long', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } }];
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => { copied.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries } : op === 'ui_detail' ? (reads++, { text: 'x', next_offset: args.offset + 1 }) : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
   let tree = await draw(); await tree.find(n => n.props.key === 'message_copy_a:t:short').props.onPress();
   assert.deepEqual(copied, ['**raw**\r\n\\[x\\]']); assert.equal(reads, 0);
@@ -498,7 +499,7 @@ test('communication cancels late reads and external files arrive in one request'
     if (op === 'ui_detail') { calls.push(args); return new Promise(resolve => { resolveDetail = resolve; }); }
     return { entries: [], next_cursor: null };
   });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
   const click = async key => (await draw()).find(n => n.props.key === key).props.onPress();
   await click('item_a:t:comm');
@@ -522,7 +523,7 @@ test('expanding a tool paints existing output without waiting for scrolling or a
     if (op === 'ui_detail') { detailCalls++; return new Promise(resolve => { resolveDetail = resolve; }); }
     return { entries: [], next_cursor: null };
   });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   $.ui.scroll = () => new Promise(() => {});
   const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
   const button = () => draw().then(tree => nodes(tree).find(node => node.props.key === 'item_a:t:run'));
@@ -552,7 +553,7 @@ test('merged lifecycle entries use recorded wait starts, short names and indepen
     { id: 'math', turn_id: 't', type: 'agentMessage', data: { text: '\\[\nE=mc^2\n\\]' } },
   ];
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = surface => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null);
   const tree = await draw('desktop'), all = nodes(tree);
   assert.deepEqual(all.filter(node => node.props.key?.startsWith('activity_group_')).map(node => node.props.key), ['activity_group_a:t:start', 'activity_group_a:t:wait', 'activity_group_a:t:end', 'activity_group_a:t:math']);
@@ -643,7 +644,7 @@ test('agents have independent entries and polling ends when pane closes', async 
 });
 
 test('tool details separate protocol commands and output into wrapped source panels', async () => {
-  const hooks = [], on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const hooks = [], on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entries = [{ id: 'run', turn_id: 't', type: 'mcpToolCall', preview: 'Tool: fastctx/run Input: shortened preview [truncated]', data: { server: 'fastctx', tool: 'run', arguments: { command: 'printf "one\\ntwo"', cwd: 'C:/work', timeout_ms: 1000 }, result: { content: [{ type: 'text', text: 'one\ntwo\n<html>literal</html>' }], structuredContent: { exit_code: 0 } } } }];
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_detail' ? { text: 'full raw page\nnext line', next_offset: null } : { revision: 1, entries });
@@ -695,7 +696,7 @@ test('unchanged completed polling and observations never refresh; changes target
 
 test('clipboard attachments are read only by the explicit action and preserve useful failures', async () => {
   const hooks = []; let reads = 0, clipboard = { paths: ['C:/screenshots/capture.png'] };
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : { revision: 1, entries: [] });
   const run = $.process.run;
@@ -717,7 +718,7 @@ test('clipboard attachments are read only by the explicit action and preserve us
 
 test('conversation keeps incoming line breaks in right bubbles and composer refreshes only at empty boundaries', async () => {
   const hooks = [], writes = [], requests = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async (ref, value) => { writes.push({ ref, value }); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entries = [{ id: 'parent', type: 'parentMessage', turn_id: 't', data: { text: 'line one\r\nline two' } }, { id: 'direct', type: 'directUserMessage', turn_id: 't', data: { text: 'user\nmessage' } }, { id: 'reply', type: 'agentMessage', turn_id: 't', data: { text: '**reply**' } }, { id: 'tool', type: 'mcpToolCall', turn_id: 't', data: { server: 'fastctx', tool: 'run', arguments: { command: 'test' }, result: { content: [{ type: 'text', text: 'complete short output' }] } } }];
   connect($, async (_$, op, args) => {
@@ -768,7 +769,7 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
 
 test('cold history merges with live deltas, updates duplicates and retains more than 200 messages', async () => {
   const hooks = [], timers = []; let revision = 1, recent = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
   const entry = (id, text = id) => ({ id, type: 'agentMessage', turn_id: 't', data: { text } });
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('cold-one'), entry('cold-two')], next_cursor: null } : { revision, entries: recent });
@@ -790,7 +791,7 @@ test('cold history merges with live deltas, updates duplicates and retains more 
 
 test('failed discovery has a recovery action without an untargeted composer and read failures keep visible messages', async () => {
   const hooks = [], timers = [], afters = [], panes = []; let discoveryFails = true, historyFails = true, pollFails = false;
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async (options) => { panes.push(options); return { isPlaced: true }; }, scroll: async () => ({}) }, clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; } } };
   const entry = (id) => ({ id, type: 'agentMessage', turn_id: 't', data: { text: id } });
   connect($, async (_$, op) => {
@@ -799,7 +800,7 @@ test('failed discovery has a recovery action without an untargeted composer and 
     return historyFails ? { error: { message: 'saved history unavailable' } } : { entries: [entry('saved reply')], next_cursor: { turns_cursor: 'older' } };
   });
   $.clock.after = (_ms, fn) => { afters.push(fn); return { cancel() {} }; };
-  closeUI(); registerUI(on); await openAgent($, 'a');
+  closeUI(); const host = nativeHooks(hooks, $); registerUI(host.on); await openAgent($, 'a');
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
   let tree = await draw(); assert.equal(panes[0].title, 'Codex'); assert.match(JSON.stringify(tree), /helper version mismatch/);
   assert.equal(nodes(tree).find((node) => node.type === 'Input'), undefined); assert.equal(nodes(tree).find((node) => node.props.key === 'codex_older'), undefined);
@@ -811,7 +812,7 @@ test('failed discovery has a recovery action without an untargeted composer and 
   historyFails = false; await nodes(tree).find((node) => node.props.key === 'codex_retry_conversation').props.onPress();
   tree = await draw(); assert.match(JSON.stringify(tree), /saved reply/); assert.match(JSON.stringify(tree), /live reply/);
   historyFails = true; while (afters.length) await afters.shift()();
-  await hooks.find((h) => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by: -1, offset: 0 }, async (e) => e);
+  await host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: -1, offset: 0, contentRows: 100, bodyRows: 10 });
   while (afters.length) await afters.shift()();
   tree = await draw(); assert.match(JSON.stringify(tree), /saved history unavailable/); assert.match(JSON.stringify(tree), /saved reply/);
   pollFails = true; await timers[0](); tree = await draw(); assert.match(JSON.stringify(tree), /broker offline/); assert.match(JSON.stringify(tree), /live reply/);
@@ -820,7 +821,7 @@ test('failed discovery has a recovery action without an untargeted composer and 
 
 test('deferred tools load output automatically, retain raw inputs and expose a readable retry', async () => {
   const hooks = [], details = []; let fails = true;
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const entry = { id: 'tool', turn_id: 't', type: 'mcpToolCall', deferred: true, data: { server: 'fastctx', tool: 'run', arguments: { command: 'read-file' }, result: { content: null, structuredContent: null, isError: null } } };
   connect($, async (_$, op, args) => {
@@ -848,7 +849,7 @@ test('deferred tools load output automatically, retain raw inputs and expose a r
 
 test('attachment chips shorten UUID images and long names while preserving full names and send paths', async () => {
   const hooks = [], sends = [];
-  const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+  const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const paths = ['C:/tmp/codex-clipboard-12345678-1234-1234-1234-123456789abc.png', 'C:/docs/这是一个很长的中文文件名称用于布局检查和后缀保留.docx'];
   connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] }; if (op === 'ui_send') { sends.push(args); return { agent_id: 'a', status: 'steered' }; } return { revision: 1, entries: [], next_cursor: null }; });
@@ -870,7 +871,7 @@ test('attachment chips shorten UUID images and long names while preserving full 
 test('independent deferred tool details retain both results in either completion order and reuse cached pages', async () => {
   for (const order of [['run', 'inspect'], ['inspect', 'run']]) {
     const hooks = [], requests = [], pending = new Map();
-    const on = (...args) => hooks.push({ event: args[0], fn: args.at(-1) });
+    const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
     const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
     const entries = ['run', 'inspect'].map((id) => ({ id, turn_id: 't', type: 'mcpToolCall', deferred: true, data: { server: 'fastctx', tool: id === 'run' ? 'run' : 'inspect_local_file', arguments: id === 'run' ? { command: 'test' } : { file_path: '/tmp/result.txt' } } }));
     connect($, async (_$, op, args) => {
@@ -906,7 +907,7 @@ test('tool images load on expansion and attachment PNGs have compact previews', 
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Image'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries: [entry] }; if (op === 'ui_detail') { calls.push(args); return { images: [{ path, previewable: true, index: 0 }], next_offset: null }; } return { entries: [], next_cursor: null }; });
   const run = $.process.run; $.process.run = async (argv, options) => argv.includes('--clipboard') ? { stdout: JSON.stringify({ paths: [path] }), exitCode: 0 } : run(argv, options);
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   assert.equal(calls.length, 0); await (await draw()).find(n => n.props.key === 'item_a:t:image').props.onPress(); await new Promise(setImmediate);
   let tree = await draw(); assert.equal(calls[0].view, 'media'); assert.ok(tree.some(n => n.type === 'Image' && n.props.source.file === path)); assert.ok(!JSON.stringify(tree).includes('secret'));
@@ -919,7 +920,7 @@ test('failed image read offers retry without exposing image data', async (t) => 
   const entry = { id: 'imagefail', turn_id: 't', type: 'dynamicToolCall', media: { count: 1, has_images: true }, data: { tool: 'image', result: { content: [{ type: 'image', data: 'secret', mimeType: 'image/png' }] } } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Image'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : op === 'ui_detail' ? (fail ? { error: { message: 'offline' } } : { images: [{ path: 'C:/tmp/a.png', previewable: true, index: 0 }], next_offset: null }) : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   await (await draw()).find(n => n.props.key === 'item_a:t:imagefail').props.onPress(); await new Promise(setImmediate);
   let tree = await draw(); assert.ok(tree.some(n => n.props.label === '重试读取图片')); assert.ok(!tree.some(n => n.type === 'Code' && !n.props.source)); assert.ok(!JSON.stringify(tree).includes('secret'));
@@ -931,7 +932,7 @@ test('body read errors retry and evicted expanded bodies can be loaded again', a
   const entries = Array.from({ length: 17 }, (_, i) => ({ id: `m${i}`, turn_id: 't', type: 'agentMessage', preview: `preview${i}`, deferred: true }));
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries }; if (op === 'ui_detail') { calls.push(args.item_id); return fail ? { error: { message: 'offline' } } : { text: `full${args.item_id}`, format: 'markdown', external: false }; } return { entries: [], next_cursor: null }; });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   const click = async id => (await draw()).find(n => n.props.key === `item_a:t:${id}`).props.onPress();
   await click('m0'); assert.ok((await draw()).some(n => n.props.key === 'message_error_a:t:m0')); fail = false; await click('m0');
@@ -944,7 +945,7 @@ test('communication renders Markdown and keeps raw details separately disclosed'
   const hooks = [], entry = { id: 'short', turn_id: 't', type: 'collabToolCall', communication: { title: '发送', text: '**正文**', truncated: false }, data: { tool: 'sendMessage', arguments: { message: 'raw argument' }, result: 'receipt', error: { message: 'offline' } } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   await (await draw()).find(n => n.props.key === 'item_a:t:short').props.onPress(); let tree = await draw();
   assert.ok(tree.some(n => n.type === 'Markdown' && n.props.text === '**正文**')); assert.ok(tree.some(n => n.props.key === 'communication_failure_a:t:short')); assert.ok(!tree.some(n => n.props.key === 'communication_detail_a:t:short')); assert.ok(!tree.some(n => n.type === 'Code'));
@@ -958,7 +959,7 @@ test('tool gallery wraps bounded images without duplication or filtering literal
   ];
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Image'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : op === 'ui_revision' ? { revision: 1, entries } : op === 'ui_detail' ? { images: [{ path: 'C:/tmp/a.png', previewable: true, index: 0, width: 100, height: 100 }, { path: 'C:/tmp/b.png', previewable: true, index: 1, width: 100, height: 400 }], next_offset: null } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', props: { bodyColumns: 16 } }, () => null));
   await (await draw()).find(n => n.props.key === 'item_a:t:view').props.onPress(); await new Promise(setImmediate); let tree = await draw();
   const gallery = tree.find(n => n.props.key === 'tool_media_gallery_a:t:view'); assert.equal(gallery.props.flexDirection, 'row'); assert.equal(gallery.props.flexWrap, 'wrap');
@@ -970,7 +971,7 @@ test('image preview routes the rendered image, restores the tool, and rejects st
   const hooks = [], scrolls = [], afters = []; let painted = []; const entry = { id: 'img', turn_id: 't', type: 'imageView', media: { count: 1, has_images: true }, data: { path: 'C:/tmp/original.jpg' } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Image', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async args => { if (args.to?.key && !painted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted'); scrolls.push(args); return {}; } }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => { afters.push(fn); return { cancel() {} }; } } };
   connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }, { agent_id: 'b' }] } : op === 'ui_revision' ? { revision: 1, entries: args.target === 'a' ? [entry] : [] } : op === 'ui_detail' ? { images: [{ index: 0, path: 'C:/tmp/preview.png', previewable: true, width: 400, height: 200, file_url: 'file:///C:/tmp/original.jpg' }], next_offset: null } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns: 50, scroll: { bodyRows: 20 } } }, () => null));
   const message = hooks.find(h => h.event === 'ui.message').fn;
   await (await draw()).find(n => n.props.key === 'item_a:t:img').props.onPress(); await new Promise(setImmediate);
@@ -995,7 +996,7 @@ test('complete text-only tool output does not request media', async (t) => {
   const hooks = [], calls = [], entry = { id: 'textonly', turn_id: 't', type: 'mcpToolCall', data: { tool: 'read', result: 'ordinary output' } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries: [entry] }; if (op === 'ui_detail') calls.push(args); return { entries: [], next_cursor: null }; });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   await (await draw()).find(n => n.props.key === 'item_a:t:textonly').props.onPress(); await new Promise(setImmediate);
   assert.ok((await draw()).some(n => n.type === 'Code' && n.props.source === 'ordinary output')); assert.deepEqual(calls, []);
@@ -1005,7 +1006,7 @@ test('media traversal limit notice remains visible when no images were found', a
   const hooks = [], entry = { id: 'limited', turn_id: 't', type: 'mcpToolCall', media: { count: 0, has_images: false, omitted: true }, data: { tool: 'read' } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }), after: (_ms, fn) => fn() } };
   connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : op === 'ui_detail' ? args.view === 'media' ? { images: [], next_offset: null, omitted: true, notice: 'More media was not scanned.' } : { text: 'output', next_offset: null } : { entries: [], next_cursor: null });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
   await (await draw()).find(n => n.props.key === 'item_a:t:limited').props.onPress(); await new Promise(setImmediate);
   assert.ok((await draw()).some(n => n.props.key === 'tool_media_scan_notice_a:t:limited' && n.props.children[0] === 'More media was not scanned.'));
@@ -1031,7 +1032,7 @@ test('file changes present native kinds, source additions, moves and paged diff 
   const entries = changes.map((change, i) => ({ id: `file${i}`, turn_id: 't', type: 'fileChange', ...(i === 3 ? { deferred: true } : {}), data: { changes: [change] } }));
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), copy: async value => { copies.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries }; if (op === 'ui_detail') { requests.push(args); return fileChangePage(changes[3], args.offset); } return { entries: [], next_cursor: null }; });
-  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
   const click = async key => (await draw()).find(n => n.props.key === key).props.onPress();
   let tree = await draw(); assert.equal(tree.find(n => n.props.key === 'file_a:t:file0:file:0').props.label.replace(/ ›$/, ''), '已创建 new.md +3 -0'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file1:file:0').props.label.replace(/ ›$/, ''), '已删除 old.txt +0 -1'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file2:file:0').props.label.replace(/ ›$/, ''), '已编辑 oldname.txt → newname.txt +1 -1'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file4:file:0').props.label.replace(/ ›$/, ''), '已更改 unknown.txt');
@@ -1049,7 +1050,7 @@ test('closed observation never redraws and starting agents do not read saved his
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() { invalidations++; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   const agents = [{ agent_id: 'new', status: 'starting' }];
   connect($, async (_$, op) => { calls.push(op); return op === 'ui_list' ? { agents } : op === 'ui_revision' ? { revision: 1, entries: [] } : { entries: [], next_cursor: null }; });
-  closeUI(); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) }));
+  closeUI(); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) }));
   await openAgent($, 'new'); assert.ok(!calls.includes('ui_history'));
   await hooks.find(h => h.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, e => e);
   const count = invalidations; await observeUI($, { agents: [{ ...agents[0], status: 'completed' }] }); assert.equal(invalidations, count);

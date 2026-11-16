@@ -1,18 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerUI, openAgent, closeUI } from '../hooks/ui.js';
+import { nativeHooks } from './native-hooks.mjs';
+import navigationSync from '../hooks/navigation-sync.js';
 
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 const entry = (id, type, text) => ({ id, turn_id: 'turn', type, data: { text } });
 
 async function setup(handler) {
-  const hooks = [], timers = [], afters = [], scrolls = [], calls = []; let painted = [], draw;
+  const hooks = [], timers = [], afters = [], scrolls = [], calls = []; let painted = [], draw; const surfacePending = new Set();
+  const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
+    const promise = new Promise(resolve => setImmediate(resolve)).then(() => host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data })));
+    surfacePending.add(promise); promise.finally(() => surfacePending.delete(promise));
+  } };
   const $ = {
     ui: {
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client', 'Image'].map((type) => [type, (props) => ({ type, props })])),
-      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { if (args.to?.key && !painted.some(node => node.type === 'Button' && node.props.key === args.to.key)) throw Error('key not painted'); scrolls.push(args); if (args.to?.key) await hooks.find(h => h.event === 'ui.scroll').fn($, { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 }, e => e); },
+      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { if (args.to?.key && !painted.some(node => node.type === 'Button' && node.props.key === args.to.key)) throw Error('key not painted'); scrolls.push(args); if (args.to?.key) await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 }); },
     },
-    clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn, cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
+    clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn: () => host.callback(fn), cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
     state: { get: async () => ({}), set: async () => ({ isSet: true }) },
     session: { id: async () => 'session', cwd: async () => 'C:/work' },
     env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
@@ -23,13 +29,18 @@ async function setup(handler) {
     } },
   };
   closeUI();
-  registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) }));
+  const host = nativeHooks(hooks, $); registerUI(host.on);
   await openAgent($, 'a');
-  draw = async (options = {}) => { const tree = await hooks.find((hook) => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', ...options }, () => null); painted = nodes(tree); return tree; };
+  draw = async (options = {}) => {
+    const tree = await hooks.find((hook) => hook.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', ...options }, () => null); painted = nodes(tree);
+    const sync = painted.find(node => node.type === 'Client' && node.props.module === './navigation-sync.js');
+    if (sync) navigationSync(sync.props.props, surface);
+    return tree;
+  };
   const item = async (key) => nodes(await draw()).find((node) => node.props.key?.startsWith(key));
-  const scroll = (by = -1, offset = 0) => hooks.find((hook) => hook.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, by, offset, contentRows: 100, bodyRows: 10 }, async (e) => e);
-  const scrollEvent = (event) => hooks.find((hook) => hook.event === 'ui.scroll').fn($, event, async (e) => e);
-  return { draw, item, tick: async () => { await timers[0](); await draw(); }, scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e), message: (e) => hooks.find((hook) => hook.event === 'ui.message').fn($, e, async () => ({})) };
+  const scroll = (by = -1, offset = 0) => host.dispatch('ui.scroll', { origin: { kind: 'person' }, by, offset, contentRows: 100, bodyRows: 10 });
+  const scrollEvent = (event) => host.dispatch('ui.scroll', event);
+  return { draw, item, surfacePending, tick: async () => { await timers[0](); await draw(); }, scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e), message: (e) => hooks.find((hook) => hook.event === 'ui.message').fn($, e, async () => ({})) };
 }
 
 test('first open starts at the end and reopening restores the saved reading position', async (t) => {
@@ -138,7 +149,7 @@ const flushTimers = async (ui) => {
       pending.add(promise); promise.finally(() => pending.delete(promise));
     }
     await new Promise(resolve => setImmediate(resolve));
-    if (!pending.size && !ui.afters.length) return;
+    if (!pending.size && !ui.afters.length && !ui.surfacePending.size) { await ui.draw(); if (!ui.surfacePending.size) return; }
   }
   throw Error('timers did not settle');
 };
@@ -151,7 +162,7 @@ test('jump control returns to the latest message', async (t) => {
   const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: saved, next_cursor: null } : { revision: 1, entries: [] });
   await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 30, contentRows: 130, bodyRows: 10 });
   const before = ui.scrolls.length;
-  const jump = nodes(await ui.draw()).find(node => node.type === 'Button' && node.props.key === 'codex_jump_a_top');
+  const jump = nodes(await ui.draw()).find(node => node.type === 'Button' && node.props.key === 'codex_jump_a_viewport');
   assert.ok(jump); await jump.props.onPress(); await flushTimers(ui);
   assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: 'end' }]);
   assert.match(JSON.stringify(await ui.draw()), /message 149/);
@@ -216,4 +227,34 @@ test('switching or closing discards a delayed history result', async t => {
     const rendered = JSON.stringify(await ui.draw());
     assert.match(rendered, /b recent/); assert.doesNotMatch(rendered, /a late/);
   }
+});
+
+test('viewport jump remains one stable hover target while scroll frames reuse the transcript', async t => {
+  t.after(closeUI);
+  const saved = Array.from({ length: 150 }, (_, i) => entry(String(i), 'agentMessage', 'message ' + i));
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: saved, next_cursor: null } : { revision: 1, entries: [] });
+  const frame = offset => ui.draw({ surface: 'desktop', props: { bodyColumns: 80, scroll: { offset, bodyRows: 10, contentRows: 160 } } });
+  const one = nodes(await frame(30)), timerCount = ui.afters.length;
+  const two = nodes(await frame(45));
+  const overlay = tree => tree.find(node => node.props.key === 'codex_jump_overlay_a');
+  const jump = tree => tree.filter(node => node.props.key === 'codex_jump_a_viewport');
+  assert.equal(overlay(one).props.top, 37); assert.equal(overlay(two).props.top, 52);
+  assert.equal(jump(one).length, 1); assert.equal(jump(two).length, 1);
+  assert.strictEqual(jump(one)[0], jump(two)[0], 'the hover target survives the scroll frame');
+  assert.strictEqual(one.find(node => node.type === 'Markdown'), two.find(node => node.type === 'Markdown'), 'transcript nodes are reused');
+  assert.equal(ui.afters.length, timerCount, 'scroll rendering schedules no new timers');
+  const resized = nodes(await ui.draw({ surface: 'desktop', props: { bodyColumns: 90, scroll: { offset: 45, bodyRows: 10, contentRows: 160 } } }));
+  assert.notStrictEqual(one.find(node => node.type === 'Markdown'), resized.find(node => node.type === 'Markdown'), 'a changed width rebuilds the transcript');
+});
+
+test('scroll frames preserve a draft edited between nonempty values', async t => {
+  t.after(closeUI);
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'running' }] } : op === 'ui_history' ? { entries: [], next_cursor: null } : { revision: 1, entries: [] });
+  const draw = offset => ui.draw({ surface: 'desktop', props: { bodyColumns: 80, scroll: { offset, bodyRows: 10, contentRows: 100 } } });
+  let tree = nodes(await draw(10));
+  await tree.find(node => node.type === 'Input').props.onInput('first');
+  tree = nodes(await draw(10));
+  await tree.find(node => node.type === 'Input').props.onInput('second');
+  tree = nodes(await draw(20));
+  assert.equal(tree.find(node => node.type === 'Input').props.value, 'second');
 });

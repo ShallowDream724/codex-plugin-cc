@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerUI, openAgent, closeUI } from '../hooks/ui.js';
+import { nativeHooks } from './native-hooks.mjs';
 
 const entry = id => ({ id, turn_id: 't', type: 'agentMessage', data: { text: id } });
 
@@ -9,12 +10,12 @@ async function setup() {
   const $ = {
     ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), open: async () => ({ isPlaced: true }), scroll: async args => { scrolls.push(args); } },
     state: { get: async () => ({}), set: async () => ({ isSet: true }) },
-    clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { afters.push(fn); return { cancel() {} }; } },
+    clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { afters.push(() => host.callback(fn)); return { cancel() {} }; } },
     session: { id: async () => 's', cwd: async () => 'C:/work' }, env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
     process: { run: async (_argv, options) => { const { operation } = JSON.parse(options.stdin); return { exitCode: 0, stdout: JSON.stringify(operation === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'running' }] } : operation === 'ui_history' ? { entries: [], next_cursor: null } : { revision, entries }) }; } },
   };
-  closeUI(); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
-  const scroll = (event, next = async e => e) => hooks.find(h => h.event === 'ui.scroll').fn($, { origin: { kind: 'person' }, ...event }, next);
+  closeUI(); const host = nativeHooks(hooks, $); registerUI(host.on); await openAgent($, 'a');
+  const scroll = (event, next = async e => e) => host.dispatch('ui.scroll', { origin: { kind: 'person' }, ...event }, next);
   return { scroll, scrolls, async update() { revision++; entries = [...entries, entry(`message-${revision}`)]; await timers[0](); while (afters.length) await afters.shift()(); } };
 }
 
