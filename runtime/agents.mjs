@@ -813,7 +813,7 @@ export class AgentController extends EventEmitter {
       this.requestTreeInterrupt(a, sourceId, p.turn.id).catch((error) => { a.stopError = error.message; this.updateStopStatus(a); });
     }
     this.updateStopStatus(a);
-    this.persist().catch(() => {});
+    this.persist().then(() => this.emit('state')).catch(() => {});
   }
 
   observe(message) {
@@ -914,7 +914,7 @@ export class AgentController extends EventEmitter {
   turnCompleted(a, turn) {
     if (!turn?.id || a.completedTurns.has(turn.id)) return;
     if (a.terminalEmitted) {
-      if (a.turnId === turn.id) { a.completedTurns.add(turn.id); a.turnId = null; a.lastTurnId = turn.id; this.updateStopStatus(a); this.persist().catch(() => {}); }
+      if (a.turnId === turn.id) { a.completedTurns.add(turn.id); a.turnId = null; a.lastTurnId = turn.id; this.updateStopStatus(a); this.persist().then(() => this.emit('state')).catch(() => {}); }
       return;
     }
     if (a.turnId && a.turnId !== turn.id) return;

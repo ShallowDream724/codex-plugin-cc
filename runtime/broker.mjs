@@ -102,7 +102,12 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
             const listed = await controller.dispatch('list_agents', {});
             const active = controller.hasParentWork ? controller.hasParentWork() : controller.hasActiveWork ? controller.hasActiveWork()
               : listed.agents?.some(agent => activeStatuses.has(agent.status) || agent.pending_requests?.length);
-            if (!batch.busy && !active) return { idle: true, events: [], agents: listed.agents || [] };
+            if (!batch.busy && !active) {
+              // A completion may enter the journal while an empty claim is
+              // saving its lease. Claim it before reporting the tree idle.
+              if (controller.eventsAfter(0).length) continue;
+              return { idle: true, events: [], agents: listed.agents || [] };
+            }
             if (Date.now() >= deadline) return { pending: true };
             await wake;
           } finally { wakeAbort.abort(); signal.removeEventListener('abort', abortWake); }

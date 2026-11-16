@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { request } from 'node:http';
 import { createBroker } from '../runtime/broker.mjs';
+import { AgentController } from '../runtime/agents.mjs';
+import { DeliveryStore } from '../runtime/delivery.mjs';
 
 class FakeController extends EventEmitter {
   constructor() { super(); this.events = []; this.calls = []; this.acks = []; this.status = 'running'; this.nextSeq = 1; }
@@ -144,6 +146,73 @@ test('waiting wakes on an important event and observation cannot steal it', asyn
   assert.deepEqual(controller.acks, []); // Returning a response is not proof that Claude retained it.
   await post({ operation: 'confirm', args: { observations: [{ delivery_id: result.body.delivery_id, sequences: [1], events: result.body.events }] } });
   assert.deepEqual(controller.acks, [[1]]);
+});
+
+test('wait wakes when the last matching descendant turn completes', async t => {
+  class Client extends EventEmitter {
+    async request(method, params) {
+      if (method === 'thread/start') return { thread: { id: 'root' } };
+      if (method === 'turn/start') return { turn: { id: 'root-turn', status: 'inProgress' } };
+      return {};
+    }
+    note(method, params) { this.emit('notification', { method, params }); }
+  }
+  const client = new Client();
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  await controller.init();
+  t.after(() => controller.close());
+  const { post } = await setup(t, { controller, waitTimeoutMs: 1500 });
+  await controller.dispatch('spawn_agent', { message: 'Task', cwd: '/workspace', context_mode: 'none' });
+  for (const id of ['child-1', 'child-2']) {
+    client.note('thread/started', { thread: { id, parentThreadId: 'root' } });
+    client.note('turn/started', { threadId: id, turn: { id: `${id}-turn` } });
+  }
+  client.emit('request', { id: 7, method: 'item/tool/requestUserInput', params: { threadId: 'child-1', turnId: 'child-1-turn', itemId: 'question', questions: [{ id: 'q', header: 'Choice', question: 'Which?' }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  client.note('turn/completed', { threadId: 'root', turn: { id: 'root-turn', status: 'completed' } });
+  const completed = (await post({ operation: 'wait' })).body;
+  assert.ok(completed.events.some(e => e.kind === 'completed'));
+  assert.ok(completed.events.some(e => e.kind === 'question'));
+  await post({ operation: 'confirm', args: { observations: [{ delivery_id: completed.delivery_id, sequences: completed.events.map(e => e.seq), events: completed.events }] } });
+  assert.equal(controller.hasParentWork(), true);
+  const waiting = post({ operation: 'wait' });
+  while (!controller.listenerCount('state')) await new Promise(resolve => setImmediate(resolve));
+  client.note('turn/completed', { threadId: 'child-1', turn: { id: 'wrong-turn', status: 'completed' } });
+  assert.equal(controller.snapshot().agents[0].pending_requests.length, 1);
+  assert.equal(controller.hasParentWork(), true);
+  client.note('turn/completed', { threadId: 'child-1', turn: { id: 'child-1-turn', status: 'completed' } });
+  assert.equal(controller.snapshot().agents[0].pending_requests.length, 0);
+  assert.equal(controller.hasParentWork(), true);
+  assert.equal((await Promise.race([waiting.then(() => 'returned'), new Promise(resolve => setTimeout(() => resolve('waiting'), 80))])), 'waiting');
+  client.note('turn/completed', { threadId: 'child-2', turn: { id: 'child-2-turn', status: 'completed' } });
+  const result = await Promise.race([waiting, new Promise((_, reject) => setTimeout(() => reject(new Error('wait did not wake after descendant completion')), 400))]);
+  assert.equal(result.body.idle, true);
+  assert.deepEqual(result.body.events, []);
+  await controller.dispatch('interrupt_agent', { target: controller.snapshot().agents[0].id });
+  client.note('turn/started', { threadId: 'root', turn: { id: 'late-root-turn' } });
+  const lateWaiting = post({ operation: 'wait' });
+  while (!controller.listenerCount('state')) await new Promise(resolve => setImmediate(resolve));
+  client.note('turn/completed', { threadId: 'root', turn: { id: 'late-root-turn', status: 'interrupted' } });
+  const lateResult = await Promise.race([lateWaiting, new Promise((_, reject) => setTimeout(() => reject(new Error('wait did not wake after late root completion')), 400))]);
+  assert.equal(lateResult.body.idle, true);
+});
+
+test('wait claims completion published while an empty claim is being saved', async t => {
+  const controller = new FakeController();
+  controller.hasParentWork = () => controller.status === 'running';
+  const deliveryStore = new DeliveryStore({ controller });
+  let injected = false;
+  deliveryStore.saveLease = async () => {
+    if (!injected && !deliveryStore.lease) {
+      injected = true;
+      controller.status = 'completed';
+      controller.publish('completed');
+    }
+  };
+  const { post } = await setup(t, { controller, deliveryStore });
+  const result = (await post({ operation: 'wait' })).body;
+  assert.equal(result.events[0]?.kind, 'completed');
+  assert.ok(result.delivery_id);
 });
 
 test('parallel waits return a busy result instead of delivering the same question twice', async t => {
