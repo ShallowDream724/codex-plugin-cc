@@ -52,6 +52,20 @@ const delegationFields = (item) => {
 };
 const subagentFields = (item) => ({ id: item.id, type: item.type, kind: item.kind, agentThreadId: item.agentThreadId, agentPath: item.agentPath, name: item.name, display_name: item.display_name, model: item.model, reasoningEffort: item.reasoningEffort });
 const fileSummary = (item) => fileChanges(item).map(fileChangeSummary);
+// A preview shares one budget across all fields and files, so its length or a
+// trailing ellipsis cannot reliably establish whether a particular diff fits.
+// Keep this flag outside that budget and compare the fields used by file detail.
+function filePreviewComplete(item, data) {
+  const original = fileChanges(item), preview = fileChanges(data);
+  if (original.length !== preview.length) return false;
+  const kind = change => typeof change.kind === 'string' ? change.kind : change.kind?.type ?? change.type;
+  const move = change => change.kind?.move_path ?? change.move_path;
+  return original.every((change, index) => {
+    const shown = preview[index];
+    return change.path === shown.path && kind(change) === kind(shown) && move(change) === move(shown)
+      && ['diff', 'unified_diff', 'content'].every(key => change[key] === shown[key]);
+  });
+}
 const titleText = (value) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 256) : '';
 function toolFields(item) {
   const server = typeof item.server === 'string' ? item.server : item.namespace;
@@ -119,7 +133,7 @@ const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) 
   const communicationPreview = message && { title: message.title, text: message.text.slice(0, safeEnd), truncated: safeEnd < message.text.length };
   const phase = ['final_answer', 'commentary', 'partial_answer'].includes(item.phase) ? item.phase : null;
   const messageMeta = item.type === 'agentMessage' ? { phase, complete: stage === 'completed', truncated: typeof item.text === 'string' && data.text !== item.text, is_final: phase === 'final_answer' && stage === 'completed' } : null;
-  return { ...(images.length || omitted ? { media: { count: images.length, has_images: images.length > 0, ...(omitted ? { omitted: true } : {}) } } : {}), ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
+  return { ...(images.length || omitted ? { media: { count: images.length, has_images: images.length > 0, ...(omitted ? { omitted: true } : {}) } } : {}), ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), ...(item.type === 'fileChange' ? { file_preview: { complete: filePreviewComplete(item, data) } } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
@@ -137,8 +151,10 @@ function removeGuidance(item, guidance) {
     return { ...item, type: 'directUserMessage', text, ...(attachments.length ? { attachments } : {}) };
   }
   const legacyCollaboration = 'Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.';
-  const prefixes = [guidance?.collaboration?.trim(), legacyCollaboration, 'Claude is your parent agent.', guidance?.default?.instructions?.trim()].filter(Boolean);
-  return { ...item, content: item.content.map((part) => {
+  const parentPrefixes = [guidance?.collaboration?.trim(), legacyCollaboration, 'Claude is your parent agent.'].filter(Boolean);
+  const prefixes = [...parentPrefixes, guidance?.default?.instructions?.trim()].filter(Boolean);
+  const parent = item.content.some(part => typeof part.text === 'string' && parentPrefixes.some(prefix => part.text.startsWith(prefix + '\n\n')));
+  return { ...item, ...(parent ? { message_origin: 'parent' } : {}), content: item.content.map((part) => {
     if (typeof part.text !== 'string') return part;
     let text = part.text;
     for (const prefix of prefixes) if (text.startsWith(prefix + '\n\n')) text = text.slice(prefix.length + 2);

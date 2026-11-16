@@ -268,12 +268,12 @@ test('conversation shows prose and expandable file changes with authoritative co
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const diff = '@@ -1,1 +1,1 @@\n-old\n+one\n';
   const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', deferred: true, data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff }] } }];
-  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : op === 'ui_detail' ? { text: diff, next_offset: 16000, format: 'source' } : { revision: 1, entries });
+  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : op === 'ui_detail' ? { text: diff, next_offset: args.offset ? null : 16000, format: 'source' } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = await draw(); assert.ok(nodes(tree).some(node => node.type === 'Markdown' && node.props.text === '正文直接显示'));
   const file = nodes(tree).find(node => node.props.key?.startsWith('file_'));
-  assert.match(file.props.label, /test\.js \+5 -1/); await file.props.onPress();
+  assert.match(file.props.label, /test\.js \+5 -1/); await file.props.onPress(); await new Promise(setImmediate);
   tree = await draw(); const code = nodes(tree).find(node => node.type === 'Code');
   assert.deepEqual(code.props, { key: 'file_code_a:t:f:file:0', source: diff, path: 'test.js', format: 'source', wrap: 'wrap' }, 'a partial detail page is source, not a complete patch');
   await nodes(tree).find((node) => node.props.key?.startsWith('file_detail_')).props.onPress();
@@ -284,7 +284,7 @@ test('conversation shows prose and expandable file changes with authoritative co
 
 test('desktop file changes show a basename and diff rows with one icon copy action', async (t) => {
   const hooks = [], copied = [], calls = [];
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, copy: async value => { copied.push(value); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, copy: async value => { copied.push(value); return { isCopied: true }; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   const source = '@@ -4,2 +4,3 @@\n one\n+<literal html>\n two\n';
   const entry = { id: 'file', turn_id: 't', type: 'fileChange', data: { changes: [{ path: 'C:/project/src/example.cpp', diff: source }] } };
   connect($, async (_$, op) => { calls.push(op); return op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : { entries: [], next_cursor: null }; });
@@ -296,7 +296,7 @@ test('desktop file changes show a basename and diff rows with one icon copy acti
   const tree = await draw(), all = nodes(tree);
   assertNativeDimensions(tree);
   assert.ok(all.some(node => node.props.key === 'file_diff_a:t:file:file:0'));
-  assert.ok(all.some(node => node.type === 'Text' && node.props.children.includes('+<literal html>')));
+  assert.ok(all.some(node => node.type === 'Text' && node.props.children.includes('<literal html>')));
   assert.ok(all.some(node => node.props.backgroundColor === 'rgba(46,160,67,0.16)'));
   assert.ok(!JSON.stringify(tree).includes('复制文件路径'));
   assert.ok(!JSON.stringify(tree).includes('复制当前差异'));
@@ -792,7 +792,7 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:parent').props.text, 'line one\nline two');
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_container_a:t:reply').props.justifyContent, 'flex-start');
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:reply').type, 'Markdown');
-  assert.equal(nodes(tree).filter((node) => node.props.key?.startsWith('author_')).length, 1);
+  assert.deepEqual(nodes(tree).filter((node) => node.props.key?.startsWith('author_')).map(node => node.props.children[0]), ['Claude', 'User']);
   assert.equal(nodes(tree).find((node) => node.props.key === 'codex_back'), undefined);
   assert.equal(nodes(await draw()).find((node) => node.props.key === 'codex_action_a').props.label, '■');
   writes.length = 0;
@@ -860,7 +860,7 @@ test('history scrolling schedules its refresh while input and polling await pane
   pending.shift()(); await action; assert.equal(completed, true);
   afters.shift()(); await new Promise(setImmediate);
   const history = afters.shift()(); await new Promise(setImmediate);
-  assert.equal(pending.length, 1); pending.shift()(); await history;
+  assert.equal(pending.length, 2, 'announce the pending history read and then its completion'); pending.splice(0).forEach(resolve => resolve()); await history;
   assert.match(JSON.stringify(await draw()), /saved history/);
   completed = false;
   const input = nodes(await draw()).find((node) => node.type === 'Input').props.onInput('x').then(() => { completed = true; });

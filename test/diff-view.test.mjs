@@ -17,6 +17,8 @@ test('hunk lines carry correct old and new numbers across additions and removals
   assert.equal(boxes.length, 2);
   assert.match(boxes[0].props.backgroundColor, /248,81,73/);
   assert.match(boxes[1].props.backgroundColor, /46,160,67/);
+  assert.deepEqual(boxes.map(box => box.props.children.map(child => child.props.children[0].props.children[0])), [['1', 'old'], ['1', 'new']]);
+  assert.ok(!nodes(tree).some(n => n.type === 'Text' && n.props.children.some(v => typeof v === 'string' && v.startsWith('@@'))));
   assert.ok(!nodes(tree).some(n => n.type === 'Text' && n.props.children.includes('example.js')));
 });
 
@@ -45,7 +47,7 @@ test('paging reaches every line, clamps the index and keeps nodes bounded', () =
     const tree = render(source, { page, onPage: next => calls.push(next) });
     const all = nodes(tree);
     assert.ok(all.length < 1000);
-    seen.push(...all.filter(n => n.type === 'Text').flatMap(n => n.props.children).filter(v => typeof v === 'string' && v.startsWith(' line ')));
+    seen.push(...all.filter(n => n.type === 'Text').flatMap(n => n.props.children).filter(v => typeof v === 'string' && v.startsWith('line ')));
     const next = all.find(n => n.type === 'Button' && n.props.label === '下一页');
     if (next) next.props.onPress();
   }
@@ -69,5 +71,35 @@ test('internal diff page copies only its visible rows', () => {
   const source = '@@ -1,250 +1,250 @@' + String.fromCharCode(10) + Array.from({ length: 250 }, (_, i) => ` line ${i + 1}`).join(String.fromCharCode(10)) + String.fromCharCode(10);
   let copied; const tree = render(source, { page: 1, onCopy: value => { copied = value; } });
   nodes(tree).find(n => n.type === 'Button' && n.props.key.endsWith(':copy')).props.onPress();
-  assert.ok(copied.includes(' line 120')); assert.ok(!copied.includes(' line 119' + String.fromCharCode(10))); assert.ok(!copied.includes(' line 241' + String.fromCharCode(10)));
+  assert.ok(copied.includes(' line 121')); assert.ok(!copied.includes(' line 120' + String.fromCharCode(10))); assert.ok(!copied.includes(' line 241' + String.fromCharCode(10)));
+});
+
+test('one gutter follows old lines for deletions and new lines for additions and context', () => {
+  const source = '@@ -4,3 +4,4 @@ heading\n keep\n--literal\n++literal\n+extra\n end\n@@ -20 +21 @@\n-tail\n+finish\n';
+  const tree = render(source);
+  const rows = nodes(tree).filter(n => n.type === 'Box' && n.props.key?.startsWith('d:row:'));
+  assert.deepEqual(rows.map(row => row.props.children.map(child => child.props.children[0].props.children[0])), [
+    ['4', 'keep'], ['5', '-literal'], ['5', '+literal'], ['6', 'extra'], ['7', 'end'], ['20', 'tail'], ['21', 'finish'],
+  ]);
+});
+
+test('continuations preserve literal leading signs, with raw page copy unchanged', () => {
+  const source = '+first fragment\n+literal continuation';
+  const rows = [{ kind: 'added', text: '+first fragment', new: 1 }, { kind: 'added', text: '+literal continuation', continuation: true }];
+  let copied;
+  const tree = render(source, { rows, onCopy: value => { copied = value; } });
+  const texts = nodes(tree).filter(n => n.type === 'Text').flatMap(n => n.props.children);
+  assert.ok(texts.includes('first fragment')); assert.ok(texts.includes('+literal continuation'));
+  nodes(tree).find(n => n.type === 'Button' && n.props.key.endsWith(':copy')).props.onPress();
+  assert.equal(copied, source);
+});
+
+test('internal pages copy exact patch slices, including headers and CRLF', () => {
+  const source = '--- a/x\r\n+++ b/x\r\n@@ -1,121 +1,121 @@\r\n' + Array.from({ length: 121 }, (_, i) => ` line ${i}\r\n`).join('');
+  const copies = [];
+  for (const page of [0, 1]) {
+    const tree = render(source, { page, onCopy: value => copies.push(value) });
+    nodes(tree).find(n => n.type === 'Button' && n.props.key.endsWith(':copy')).props.onPress();
+  }
+  assert.equal(copies.join(''), source);
 });

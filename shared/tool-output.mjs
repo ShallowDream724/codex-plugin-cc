@@ -1,11 +1,29 @@
 // Pure presentation of a tool result; callers supply their own safe serializer.
-import { isImageBlock, sanitizeMedia } from './tool-media.mjs';
+import { isImageBlock, sanitizeMedia, serializedToolResult } from './tool-media.mjs';
 const text = (value) => typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '';
 export function toolOutputText(value, { serialize = text, formatPart = (part) => typeof part?.text === 'string' ? serialize(part.text) : serialize(part) } = {}) {
   if (value == null) return '';
   value = sanitizeMedia(value);
-  const partText = (part) => isImageBlock(part) ? '' : part && typeof part === 'object' && (Array.isArray(part.content) || Array.isArray(part.contentItems)) ? toolOutputText(part, { serialize, formatPart }) : formatPart(part);
-  if (isImageBlock(value)) return '';
+  const serialized = serializedToolResult(value);
+  if (serialized?.value) value = serialized.value;
+  const partText = (part) => {
+    if (isImageBlock(part)) {
+      const { type, media_omitted, mimeType, ...extra } = part;
+      return Object.keys(extra).length ? serialize(extra) : '';
+    }
+    if (part && typeof part === 'object') {
+      if (Array.isArray(part.content) || Array.isArray(part.contentItems)) return toolOutputText(part, { serialize, formatPart });
+      if (['text', 'inputText', 'outputText', 'input_text', 'output_text'].includes(part.type) && typeof part.text === 'string') {
+        const wrapped = serializedToolResult(part.text);
+        if (wrapped?.value) {
+          const { type, text, ...extra } = part;
+          return [toolOutputText(wrapped.value, { serialize, formatPart }), Object.keys(extra).length ? serialize(extra) : ''].filter(Boolean).join('\n');
+        }
+      }
+    }
+    return formatPart(part);
+  };
+  if (isImageBlock(value)) return partText(value);
   if (Array.isArray(value)) return value.map(partText).filter(Boolean).join('\n');
   if (!value || typeof value !== 'object') return serialize(value);
   const protocolKeys = ['content', 'contentItems', 'structuredContent', '_meta'];

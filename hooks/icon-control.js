@@ -19,5 +19,5 @@ export default function IconControl(props, surface) {
   surface.onKey(event => {
     if (!event.ctrl && !event.meta && !event.shift && (event.key === 'return' || event.key === ' ')) surface.post({ action, expanded });
   });
-  return Box({ key: 'icon-hit', width: '100%', height: props.rows === 2 ? 2 : 1, children: [] });
+  return Box({ key: 'icon-hit', width: '100%', height: props.rows === 2 ? 2 : 1, ...(surface.state?.pressed ? { backgroundColor: 'rgba(128,128,128,0.16)' } : {}), children: [] });
 }

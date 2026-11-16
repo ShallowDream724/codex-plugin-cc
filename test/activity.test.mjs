@@ -312,6 +312,7 @@ test('previews bound deep data and image payloads while details format native it
   controller.guidance = { collaboration: 'Shared rules.', default: { instructions: 'Scout rules.' } };
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item: { id: 'user', type: 'userMessage', content: [{ text: 'Claude is your parent agent.\n\nScout rules.\n\nFind the issue' }] } } });
   assert.equal(store.revision({ target: 'a' }).entries.find((e) => e.id === 'user').preview, 'Find the issue');
+  assert.equal(store.revision({ target: 'a' }).entries.find((e) => e.id === 'user').data.message_origin, 'parent');
   const legacy = 'Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.';
   const original = { id: 'legacy-user', type: 'userMessage', content: [{ text: legacy + '\n\nOriginal task' }] };
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'old-turn', item: original } });
@@ -320,6 +321,7 @@ test('previews bound deep data and image payloads while details format native it
   const quoted = 'Explain these historical instructions: ' + legacy + '\n\nKeep this user text';
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'later-turn', item: { id: 'quoted-guidance', type: 'userMessage', content: [{ text: quoted }] } } });
   assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').preview, quoted);
+  assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').data.message_origin, undefined);
 });
 
 test('tool call titles survive live and deferred history projection without reading output titles', async () => {
@@ -397,6 +399,38 @@ test('file change counts use the full native diff before display truncation', ()
   const entry = store.revision({ target: 'a' }).entries[0];
   assert.deepEqual(entry.data.fileSummary, [{ path: 'src/file.js', kind: 'unknown', added: 900, removed: 1 }, { path: 'image.png', kind: 'unknown' }]);
   assert.ok(entry.data.changes[0].diff.length < diff.length);
+  assert.equal(entry.file_preview.complete, false);
+});
+
+test('file preview completeness detects shared budget clipping across files in live and history', async () => {
+  const { store, client } = fixture();
+  const patch = n => `--- a/${n}.js\n+++ b/${n}.js\n@@ -1 +1 @@\n-old\n+${'x'.repeat(1800)}\n`;
+  const item = { id: 'multi', type: 'fileChange', changes: [1, 2, 3].map(n => ({ path: `${n}.js`, kind: 'update', diff: patch(n) })) };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item } });
+  const live = store.revision({ target: 'a' }).entries[0];
+  assert.equal(live.file_preview.complete, false);
+  assert.ok(live.data.changes[1].diff.length < 4096);
+  assert.deepEqual(live.data.fileSummary.map(({ added, removed }) => [added, removed]), [[1, 1], [1, 1], [1, 1]]);
+  client.request = async method => method === 'thread/turns/list' ? { data: [{ id: 'turn' }], nextCursor: null } : { data: [{ item }], nextCursor: null };
+  assert.equal((await store.history({ target: 'a' })).entries[0].file_preview.complete, false);
+  const small = { id: 'small', type: 'fileChange', changes: [{ path: 'literal.js', kind: 'update', diff: 'literal…' }] };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item: small } });
+  assert.equal(store.revision({ target: 'a' }).entries.at(-1).file_preview.complete, true);
+  await store.close();
+});
+
+test('large update file detail returns complete source and structured rows', async () => {
+  const { store, client } = fixture();
+  const diff = '--- a/large.js\n+++ b/large.js\n@@ -1,300 +1,300 @@\n' + '-old\n'.repeat(300) + '+new\n'.repeat(300);
+  const item = { id: 'large', type: 'fileChange', changes: [{ path: 'large.js', kind: 'update', diff }] };
+  client.request = async () => ({ data: [{ item }] });
+  const pages = []; let offset = 0;
+  do { const page = await store.detail({ target: 'a', turn_id: 'turn', item_id: 'large', file_path: 'large.js', offset }); pages.push(page); offset = page.next_offset; } while (offset !== null);
+  assert.equal(pages.map(page => page.text).join(''), diff);
+  assert.ok(pages.every(page => page.format === 'diff'));
+  assert.equal(pages.flatMap(page => page.rows).filter(row => row.kind === 'removed').length, 300);
+  assert.equal(pages.flatMap(page => page.rows).filter(row => row.kind === 'added').length, 300);
+  await store.close();
 });
 
 test('file detail pages retain normalized diff rows and exact previous offsets', async () => {
@@ -754,6 +788,45 @@ test('media sanitization bounds deeply nested and cyclic data', async () => {
   assert.match(JSON.stringify(sanitizeMedia(root)), /nested data omitted/);
   const loop = {}; loop.self = loop;
   assert.match(JSON.stringify(sanitizeMedia(loop)), /circular data omitted/);
+});
+
+test('serialized MCP image results are sanitized and expanded only on request', async () => {
+  const { client, store } = fixture();
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+  const encoded = JSON.stringify({ content: [
+    { type: 'text', text: 'before' },
+    { type: 'image', data: jpeg, mimeType: 'image/jpeg', description: 'image description' },
+    { type: 'image', data: jpeg, mimeType: 'image/jpeg' },
+    { type: 'text', text: 'after' },
+  ], isError: true, extra: 'keep metadata' });
+  const item = { id: 'wrapped-media', type: 'mcpToolCall', result: { content: [{ type: 'text', text: encoded, note: 'keep note' }] } };
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item } });
+  const entry = store.revision({ target: 'a' }).entries[0];
+  assert.deepEqual(entry.media, { count: 2, has_images: true });
+  assert.ok(!JSON.stringify(entry).includes(jpeg));
+  assert.equal(store.exportDir, null);
+  client.request = async () => ({ data: [{ turnId: 'turn', item }] });
+  const args = { target: 'a', turn_id: 'turn', item_id: item.id };
+  const output = (await store.detail({ ...args, view: 'output' })).text;
+  assert.match(output, /before/); assert.match(output, /after/);
+  assert.match(output, /isError/); assert.match(output, /keep metadata/); assert.match(output, /keep note/); assert.match(output, /image description/);
+  assert.ok(!output.includes(jpeg));
+  const media = await store.detail({ ...args, view: 'media' });
+  assert.equal(media.images.length, 2);
+  assert.ok(media.images.every(image => image.mime_type === 'image/jpeg'));
+  assert.deepEqual(readFileSync(media.images[0].path), Buffer.from(jpeg, 'base64'));
+  await store.close();
+});
+
+test('serialized result recognition leaves prose and unrelated JSON untouched', async () => {
+  const { toolOutputText } = await import('../shared/tool-output.mjs');
+  const { collectImages } = await import('../shared/tool-media.mjs');
+  const prose = 'example: {"content":[{"type":"image","data":"literal"}]}';
+  const business = JSON.stringify({ content: ['ordinary'], data: 'business data' });
+  for (const value of [prose, business]) {
+    assert.equal(toolOutputText(value), value);
+    assert.equal(collectImages({ result: value }).images.length, 0);
+  }
 });
 
 test('Windows codecs convert generated JPEG GIF BMP previews and preserve originals', { skip: process.platform !== 'win32' }, async () => {

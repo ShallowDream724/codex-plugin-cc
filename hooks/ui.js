@@ -1,7 +1,7 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
 import { agentIcon, agentVisual, retainIcons, clearIcons, displayLabel, agentDisplayName } from './presentation.js';
 import { toolSections, communicationFailure } from './tool-presentation.js';
-import { activityIcon, contextIndicator, disclosureIcon, copyIcon, jumpIcon } from './tool-icons.js';
+import { activityIcon, contextIndicator, disclosureIcon, copyIcon, copiedIcon, copyFailedIcon, jumpIcon } from './tool-icons.js';
 import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { renderDiff } from './diff-view.js';
@@ -16,6 +16,7 @@ const VISIBLE_ENTRIES = 500;
 const MAX_COPY_LENGTH = 16 * 1024 * 1024;
 const MAX_COPY_PAGES = 1100;
 let copyIntent = 0;
+const copyLabels = { pending: '正在复制…', copied: '已复制', failed: '复制失败，请重试' };
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
 const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
@@ -90,8 +91,8 @@ const description = (entry) => {
   const d = entry.data || {};
   if (typeof entry.communication?.title === 'string' && entry.communication.title.trim()) return entry.communication.title;
   if (entry.type === 'parentMessage') return 'Claude';
-  if (entry.type === 'directUserMessage') return '你';
-  if (entry.type === 'userMessage') return 'Claude';
+  if (entry.type === 'directUserMessage') return 'User';
+  if (entry.type === 'userMessage') return d.message_origin === 'parent' ? 'Claude' : '消息';
   if (entry.type === 'agentMessage') return 'Codex';
   if (entry.type === 'commandExecution') return `运行命令 ${d.command || ''}`;
   if (entry.type === 'mcpToolCall' || entry.type === 'dynamicToolCall') return toolTitle(d);
@@ -190,7 +191,9 @@ function conversationEntries(all) {
 function timelineWindow(page, count = page.windowSize ?? VISIBLE_ENTRIES, from) {
   const all = page.timeline ??= conversationEntries(page.live), lastStart = Math.max(0, all.length - count);
   const anchor = page.windowAnchor ? all.findIndex(entry => entryKey(entry) === page.windowAnchor) : -1;
-  const preferred = from ?? (page.followTail ? (anchor >= 0 ? Math.max(0, Math.min(anchor - Math.floor(count / 2), lastStart)) : lastStart) : (page.windowEnd != null ? page.windowEnd - count : page.windowStart));
+  // Budget retries shrink the count and pass the previous start. In tail mode
+  // recalculate from the end for each retry, unless an expanded item is held.
+  const preferred = page.followTail && anchor < 0 ? lastStart : (from ?? (page.followTail ? Math.max(0, Math.min(anchor - Math.floor(count / 2), lastStart)) : (page.windowEnd != null ? page.windowEnd - count : page.windowStart)));
   const start = Math.max(0, Math.min(preferred, Math.max(0, all.length - 1)));
   return { entries: all.slice(start, page.windowEnd != null && !page.followTail ? page.windowEnd : start + count), start, total: all.length };
 }
@@ -321,7 +324,12 @@ async function chooseAttachments($, id, source = 'file') {
       const result = await bridge($, 'ui_history', { target: id });
       if (!state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen) return;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
+      const before = timelineWindow(page), first = before.entries[0] && entryKey(before.entries[0]);
       const changed = mergeLive(page, result.entries, true), cursorChanged = JSON.stringify(page.cursor) !== JSON.stringify(result.next_cursor ?? null);
+      if (changed && !page.followTail && first) {
+        const index = timelineWindow(page).total && page.timeline.findIndex(entry => entryKey(entry) === first);
+        if (index >= 0) { const delta = index - before.start; page.windowStart += delta; if (page.windowEnd != null) page.windowEnd += delta; }
+      }
       const hadError = page.historyError;
       page.cursor = result.next_cursor ?? null; page.historyError = '';
       if (changed || cursorChanged || hadError) await invalidate($);
@@ -336,7 +344,7 @@ async function chooseAttachments($, id, source = 'file') {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
     const page = pageFor(id), control = controlFor(id), mutationEpoch = control.mutationEpoch;
-    if (afterSend) { page.afterSendGeneration = gen; page.followTail = true; page.awayFromBottom = false; page.windowAnchor = null; page.scrollGeneration++; page.afterSendScrollGeneration = page.scrollGeneration; }
+    if (afterSend) { page.afterSendGeneration = gen; page.followTail = true; page.awayFromBottom = false; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.scrollGeneration++; page.afterSendScrollGeneration = page.scrollGeneration; }
     if (page.busy) { if (afterSend) page.refreshAfterPoll = true; return; }
     page.busy = true;
     try {
@@ -397,29 +405,46 @@ async function chooseAttachments($, id, source = 'file') {
   async function history($, id) {
     const page = pageFor(id), gen = state.generation, cursor = page.cursor;
     if (!cursor || page.historyLoading) return;
-    const scrollGen = page.scrollGeneration, anchor = timelineWindow(page).entries[0];
-    page.historyLoading = true;
+    const scrollGen = page.scrollGeneration, anchor = timelineWindow(page).entries[0], request = {};
+    let continueHistory = false, changed = false, loaded = false;
+    page.historyLoading = true; page.historyRequest = request;
+    void invalidate($);
     try {
       const result = await prefetchHistory($, id);
       if (!state.opened || state.selected !== id || state.generation !== gen) return;
       page.historyPrefetch = null;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
       if (result.next_cursor && JSON.stringify(result.next_cursor) === JSON.stringify(cursor)) throw new Error('历史读取位置未推进');
-      const previous = timelineWindow(page), oldLength = page.live.length;
-      const changed = mergeLive(page, result.entries, true);
-      if (!page.followTail) page.windowStart = page.scrollGeneration === scrollGen ? 0 : previous.start + page.live.length - oldLength;
+      const previous = timelineWindow(page), first = previous.entries[0] && entryKey(previous.entries[0]);
+      changed = mergeLive(page, result.entries, true);
+      if (changed && !page.followTail && first) {
+        timelineWindow(page);
+        const index = page.timeline.findIndex(entry => entryKey(entry) === first);
+        if (index >= 0) {
+          if (page.scrollGeneration === scrollGen) { const size = page.windowSize ?? VISIBLE_ENTRIES; page.windowEnd = page.timeline.length <= size ? page.timeline.length : index + 1; page.windowStart = Math.max(0, page.windowEnd - size); }
+          else { const delta = index - previous.start; page.windowStart += delta; if (page.windowEnd != null) page.windowEnd += delta; }
+        }
+      }
       page.cursor = result.next_cursor ?? null; page.historyError = '';
-      await invalidate($);
-      // Run after this wheel dispatch returns. Revealing the previous first row
-      // preserves its position without recursively dispatching a scroll hook.
-      if (changed) anchorAfterRender($, id, page, gen, scrollGen, anchor, 'start');
-      queueHistoryPrefetch($, id);
-    } catch (error) { if (state.opened && state.selected === id && state.generation === gen) { page.historyError = `无法读取对话记录：${failureText(error)}。请重试。`; await invalidate($); } }
-    finally { page.historyLoading = false; }
+      continueHistory = !changed && Boolean(page.cursor) && page.scrollGeneration === scrollGen;
+      loaded = true;
+    } catch (error) { if (state.opened && state.selected === id && state.generation === gen) page.historyError = `无法读取对话记录：${failureText(error)}。请重试。`; }
+    finally {
+      if (page.historyRequest === request) {
+        page.historyLoading = false; page.historyRequest = null;
+        if (state.opened && state.selected === id && state.generation === gen) {
+          await invalidate($);
+          // Restore the anchor after the loading indicator has disappeared.
+          if (changed) anchorAfterRender($, id, page, gen, scrollGen, anchor, 'start');
+          if (loaded) queueHistoryPrefetch($, id);
+          if (continueHistory && page.scrollGeneration === scrollGen) $.clock.after(0, () => history($, id));
+        }
+      }
+    }
   }
   async function select($, id) {
     state.selected = id; state.generation++; state.imagePreview = null;
-    const page = pageFor(id);
+    const page = pageFor(id); page.historyLoading = false; page.historyRequest = null;
     state.restore = state.scroll.has(id) && !page.followTail;
     page.detailRequests.clear();
     await poll($);
@@ -474,10 +499,35 @@ async function chooseAttachments($, id, source = 'file') {
     await invalidate($);
     if (!background) await fetch();
   }
-  async function copyMessage($, id, entry, surface, view = 'message') {
-    const page = pageFor(id), gen = state.generation, intent = ++copyIntent, key = entryKey(entry);
+  async function copyWithFeedback($, id, key, surface, read) {
+    const page = pageFor(id), gen = state.generation, intent = ++copyIntent;
     const valid = () => intent === copyIntent && state.opened && state.selected === id && state.generation === gen;
+    page.copyFeedback = { key, phase: 'pending', intent, generation: gen };
+    page.copyError = null;
+    void invalidate($);
     try {
+      const text = typeof read === 'function' ? await read(valid) : read;
+      if (!valid() || typeof text !== 'string') return;
+      const result = await $.ui.copy({ text, surface });
+      if (result?.isCopied !== true) throw new Error(result?.reason || '剪贴板未确认复制成功');
+      if (!valid()) return;
+      page.copyFeedback = { key, phase: 'copied', intent, generation: gen };
+      await invalidate($);
+      $.clock.after(1600, async () => {
+        if (!valid() || page.copyFeedback?.intent !== intent) return;
+        page.copyFeedback = null;
+        await invalidate($);
+      });
+    } catch (error) {
+      if (valid()) {
+        page.copyFeedback = { key, phase: 'failed', intent, generation: gen };
+        page.copyError = { key, text: `复制失败：${failureText(error)}` };
+        await invalidate($);
+      }
+    }
+  }
+  async function copyMessage($, id, entry, surface, view = 'message') {
+    return copyWithFeedback($, id, entryKey(entry), surface, async valid => {
       let text = view === 'communication' ? entry.communication.text : body(entry);
       if (view === 'communication' ? entry.communication.truncated : entry.message?.truncated) {
         text = ''; let offset = 0, pages = 0;
@@ -493,11 +543,8 @@ async function chooseAttachments($, id, source = 'file') {
           offset = result.next_offset;
         }
       }
-      if (!valid()) return;
-      const result = await $.ui.copy({ text, surface });
-      if (result?.isCopied === false) throw new Error(result.reason || '剪贴板未接受内容');
-      if (valid()) { page.copyError = null; await invalidate($); }
-    } catch (error) { if (valid()) { page.copyError = { key, text: `复制失败：${failureText(error)}` }; await invalidate($); } }
+      return text;
+    });
   }
   async function expandBody($, id, entry, view, foldKey) {
     const page = pageFor(id), key = detailKey(entry, undefined, view), gen = state.generation, historyGen = page.historyGeneration;
@@ -555,30 +602,37 @@ export function registerUI(on) {
   });
   on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
     const id = state.selected;
-    const page = id && pageFor(id), view = page && timelineWindow(page), gen = state.generation;
+    const page = id && pageFor(id), gen = state.generation;
+    const view = page && (page.renderedWindow?.timeline === page.timeline ? page.renderedWindow : timelineWindow(page));
     const atBottom = Number.isFinite(e.contentRows) && Number.isFinite(e.bodyRows) && e.offset >= e.contentRows - e.bodyRows - 1;
     const wasAway = page?.awayFromBottom;
+    let scrollGen;
     if (e.origin.kind === 'person' && id) {
       state.scroll.set(id, e.offset); page.scrollGeneration++;
+      scrollGen = page.scrollGeneration;
       page.windowAnchor = null;
       holdWindow(page);
-      page.followTail = atBottom && view.start + view.entries.length >= view.total;
+      if (page.windowEnd == null) page.windowStart = view.start;
+      page.followTail = e.by > 0 && atBottom && view.start + view.entries.length >= view.total;
       page.awayFromBottom = !page.followTail;
     }
     if (e.origin.kind === 'plugin' && state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(state.selected) || 0 }); }
     if (e.origin.kind === 'plugin' && state.selected) state.scroll.set(state.selected, e.offset);
     const result = await next(e);
-    if (e.origin.kind === 'person' && id && state.opened && state.selected === id && state.generation === gen) {
+    if (e.origin.kind === 'person' && id && state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen) {
       if (Boolean(wasAway) !== page.awayFromBottom) await invalidate($);
+      if (!state.opened || state.selected !== id || state.generation !== gen || page.scrollGeneration !== scrollGen) return result;
       if (e.by < 0 && view.start === 0 && e.offset <= Math.max(2, (e.bodyRows || 12) * 2)) prefetchHistory($, id);
       if (e.by < 0 && e.offset <= 1) {
         if (view.start > 0) {
+          page.renderedWindow = null;
           page.windowEnd = view.start + (view.entries.length > 1 ? 1 : 0);
           page.windowSize = Math.min(VISIBLE_ENTRIES, Math.max(2, view.entries.length * 2)); page.followTail = false; page.windowAnchor = null;
           await invalidate($);
           anchorAfterRender($, id, page, gen, page.scrollGeneration, view.entries[0], 'start');
         } else $.clock.after(0, async () => { if (state.opened && state.selected === id && state.generation === gen) await history($, id); });
       } else if (e.by > 0 && atBottom && view.start + view.entries.length < view.total) {
+        page.renderedWindow = null;
         page.windowEnd = null; page.windowStart = view.start + Math.max(1, view.entries.length - 1);
         page.windowSize = Math.min(VISIBLE_ENTRIES, Math.max(2, view.entries.length * 2)); page.windowAnchor = null;
         await invalidate($);
@@ -586,7 +640,7 @@ export function registerUI(on) {
       } else if (e.by > 0 && atBottom && page.followTail) {
         const scrollGen = page.scrollGeneration;
         $.clock.after(0, async () => {
-          if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
+          if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {});
         });
       }
     }
@@ -615,7 +669,13 @@ export function registerUI(on) {
 }
 function renderPane($, e, next, attempt = {}) {
     if (e.requestId !== PANE) return next(e);
-    const budget = nativeRenderBudget($.ui.resolve(e), { copy: text => $.ui.copy({ text, surface: e.surface }) });
+    const budget = nativeRenderBudget($.ui.resolve(e), {
+      copy: (text, key) => copyWithFeedback($, state.selected, `full-content:${key}`, e.surface, text),
+      copyLabel: key => {
+        const feedback = state.pages.get(state.selected)?.copyFeedback;
+        return feedback?.key === `full-content:${key}` && feedback.generation === state.generation ? copyLabels[feedback.phase] : null;
+      },
+    });
     const { Box, Text, Button, Input, Markdown, Image, Code, Svg, Client } = budget.ui, id = state.selected;
     const selected = state.agents.find((agent) => idOf(agent) === id);
     if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
@@ -646,7 +706,7 @@ function renderPane($, e, next, attempt = {}) {
         Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key: actionKey, module: './image-control.js', width: size.columns, height: size.rows, props: { rows: size.rows } })] }),
       ] });
     };
-    const hint = (key, child, label, width = 18, left = 0) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
+    const hint = (key, child, label, width = 18, left = 0, visible = false) => Box({ key, position: 'relative', alignSelf: 'center', children: [child, Box({ position: 'absolute', bottom: 1, left, width, display: visible ? 'flex' : 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [label] })] })] });
     const iconFor = (key, icon) => e.surface === 'desktop' && typeof Svg === 'function' ? Svg({ key, source: icon.source, alt: icon.alt, width: 14, height: 14, ...(icon.animated ? { isInteractive: true } : {}) }) : caption(key, icon.glyph);
     const agentMark = (key, agentId) => {
       const visual = agentVisual(agentId);
@@ -654,10 +714,18 @@ function renderPane($, e, next, attempt = {}) {
     };
     const iconButton = (key, { source, label, onPress, action = 'activate', expanded = false, width = 2, height = 1, size = 12, align = 'center' }) => {
       control.iconActions.set(key, { action, expanded, onPress });
-      return Box({ key: `icon_region_${key}`, position: 'relative', width, height, flexShrink: 0, children: [
+      return Box({ key: `icon_region_${key}`, position: 'relative', width, height, flexShrink: 0, hover: { backgroundColor: 'rgba(128,128,128,0.12)' }, children: [
         Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', justifyContent: align, children: [Svg({ key: `icon_${key}`, source, alt: label, width: size, height: size })] }),
         Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key, module: './icon-control.js', width, height, props: { expanded, action, rows: height } })] }),
       ] });
+    };
+    const copyButton = (key, feedbackKey, label, onPress) => {
+      const feedback = page.copyFeedback?.key === feedbackKey && page.copyFeedback.generation === state.generation ? page.copyFeedback : null;
+      const status = copyLabels[feedback?.phase];
+      const source = feedback?.phase === 'copied' ? copiedIcon : feedback?.phase === 'failed' ? copyFailedIcon : copyIcon;
+      return e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
+        ? hint(`${key}_hint`, iconButton(key, { source, label: status || label, size: 14, onPress }), status || label, 18, -10, !!status)
+        : Button({ key, plain: true, label: status || label, onPress });
     };
     const disclosure = (key, label, onPress, entry, integration = false, expanded) => {
       const activate = entry ? (...args) => {
@@ -707,6 +775,10 @@ function renderPane($, e, next, attempt = {}) {
     navigation.push(Box({ key: `codex_title_row_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [agentMark(`codex_title_icon_${id}`, id), Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [safe(agentDisplayName(selected.name || 'Codex'))] })] }));
     const sourceLabel = ({ new: '新建', claude: '继承 Claude', codex: 'Codex 历史', unknown: '来源未记录' })[selected.context_source];
     if (sourceLabel) navigation.push(caption(`codex_origin_${id}`, sourceLabel));
+    if (page.historyLoading) navigation.push(Box({ key: `codex_history_loading_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [
+      ...(e.surface === 'desktop' && typeof Svg === 'function' ? [Svg({ key: `codex_history_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 14, height: 14, isInteractive: true })] : []),
+      caption(`codex_history_loading_label_${id}`, '正在加载历史消息…'),
+    ] }));
     if (state.error) navigation.push(caption('codex_open_error', state.error));
     if (state.error || page.liveError || page.historyError) {
       if (page.liveError) navigation.push(caption('codex_update_error', page.liveError));
@@ -737,14 +809,14 @@ function renderPane($, e, next, attempt = {}) {
           const loaded = detailFor(page, entry, undefined, view), local = String(entry.id).startsWith('action:');
           const rawBody = body(entry), truncated = Boolean(entry.message?.truncated || entry.deferred || (entry.preview?.length ?? 0) >= 4096 || (local && rawBody.length > 4096));
           const message = [];
-          if (['userMessage', 'parentMessage'].includes(entry.type)) message.push(caption(`author_${key}`, 'Claude'));
+          if (['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) message.push(caption(`author_${key}`, description(entry)));
           const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
           const shown = bodyOpen && loaded && !loaded.error ? loaded : null;
           const text = safe(shown?.text ?? (local && truncated && !bodyOpen ? rawBody.slice(0, 4096) : rawBody));
           message.push(shown?.external ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: normalizeMessageMarkdown(text, { displayMath: e.surface === 'desktop' }) }));
           if (entry.type === 'agentMessage' && entry.message?.is_final) {
             const copy = (press = {}) => copyMessage($, id, entry, press.surface ?? e.surface);
-            const action = e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function' ? hint(`message_copy_hint_${key}`, iconButton(`message_copy_${key}`, { source: copyIcon, label: '复制回复', size: 14, onPress: copy }), '复制回复', 12, -10) : Button({ key: `message_copy_${key}`, plain: true, label: '⧉', onPress: copy });
+            const action = copyButton(`message_copy_${key}`, entryKey(entry), '复制回复', copy);
             message.push(Box({ key: `message_actions_${key}`, flexDirection: 'row', justifyContent: 'flex-start', children: [action] }));
             if (page.copyError?.key === entryKey(entry)) message.push(caption(`message_copy_error_${key}`, page.copyError.text));
           }
@@ -774,7 +846,7 @@ function renderPane($, e, next, attempt = {}) {
             const rawChange = entry.data?.changes?.find((item) => item.path === change.path) ?? change;
             const diff = rawChange.content ?? rawChange.unified_diff ?? rawChange.diff;
             const filePath = typeof change.path === 'string' ? change.path : '';
-            const deferred = entry.deferred || typeof diff !== 'string' || diff.length >= 4096 || diff.includes('[truncated]');
+            const deferred = entry.file_preview?.complete === false || entry.deferred || typeof diff !== 'string' || diff.length >= 4096 || diff.includes('[truncated]');
             const summary = entry.data?.fileSummary?.length ? change : fileChangeSummary(deferred ? { ...rawChange, diff: undefined, content: undefined, unified_diff: undefined } : rawChange);
             itemRows.push(disclosure(`file_${fileKey}`, changeLabel(summary), () => {
               toggle(fileKey);
@@ -784,23 +856,23 @@ function renderPane($, e, next, attempt = {}) {
             }, entry, false, open));
             if (open) {
               const loaded = detailFor(page, entry, filePath);
-              const inline = !deferred ? fileChangeSource(rawChange) : { text: diff, format: 'source' };
-              const source = safe((loaded && !loaded.error ? loaded.text : inline.text) ?? '请查看完整内容');
+              const inline = !deferred ? fileChangeSource(rawChange) : { text: null, format: 'source' };
+              const rawSource = loaded && !loaded.error ? loaded.text : inline.text;
+              const source = safe(rawSource ?? '');
               const format = loaded && !loaded.error ? loaded.format : inline.format;
               const paged = loaded && !loaded.error && (loaded.previous_offset != null || loaded.next_offset != null);
               const copyControl = (copyText, localPaged) => {
                 const label = paged || localPaged ? '复制当前页差异' : '复制差异';
-                const copy = (press = {}) => $.ui.copy({ text: copyText, surface: press.surface ?? e.surface });
-                return e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
-                  ? hint(`diff_copy_hint_${fileKey}`, iconButton(`diff_copy_${fileKey}`, { source: copyIcon, label, size: 14, onPress: copy }), label, 18, -10)
-                  : Button({ key: `diff_copy_${fileKey}`, plain: true, label, onPress: copy });
+                const copy = (press = {}) => copyWithFeedback($, id, `diff:${fileKey}`, press.surface ?? e.surface, copyText);
+                return copyButton(`diff_copy_${fileKey}`, `diff:${fileKey}`, label, copy);
               };
-              const diffView = e.surface === 'desktop' && format === 'diff' ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source, rows: loaded && !loaded.error ? loaded.rows : undefined, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
+              const diffView = e.surface === 'desktop' && format === 'diff' ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source: rawSource, rows: loaded && !loaded.error ? loaded.rows : undefined, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
                 page.diffPages ??= new Map(); page.diffPages.set(fileKey, value);
                 if (page.diffPages.size > 64) page.diffPages.delete(page.diffPages.keys().next().value);
                 return invalidate($);
               } }) : null;
-              itemRows.push(diffView ?? (typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath.split(/[\\/]/).at(-1) } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: format === 'diff' && (!loaded || (loaded.offset === 0 && loaded.next_offset == null)) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] })));
+              if (rawSource != null) itemRows.push(diffView ?? (typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath.split(/[\\/]/).at(-1) } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: format === 'diff' && (!loaded || (loaded.offset === 0 && loaded.next_offset == null)) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] })));
+              if (page.copyError?.key === `diff:${fileKey}`) itemRows.push(caption(`diff_copy_error_${fileKey}`, page.copyError.text));
               if (loaded?.error) itemRows.push(caption(`file_error_${fileKey}`, loaded.text));
               if (loaded?.previous_offset != null) itemRows.push(disclosure(`file_prev_${fileKey}`, '上一页输出', () => detail($, id, entry, loaded.previous_offset, fileKey, filePath)));
               if (!page.detailRequests.has(detailKey(entry, filePath)) && !String(entry.id).startsWith('action:') && ((!loaded && deferred) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`file_detail_${fileKey}`, loaded?.error ? '重试获取内容' : loaded ? '下一页输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0, fileKey, filePath)));
@@ -886,7 +958,8 @@ function renderPane($, e, next, attempt = {}) {
           const localImage = typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(imagePath);
           if (['imageView', 'imageGeneration'].includes(entry.type) && localImage && !entry.media?.has_images) {
             if (typeof Image === 'function' && /\.png$/i.test(imagePath)) itemRows.push(previewImage(`legacy_${key}`, { ...entry.data, path: imagePath, alt: `图片：${imagePath}` }, key));
-            itemRows.push(disclosure(`copy_${key}`, '复制图片路径', press => $.ui.copy({ text: imagePath, surface: press.surface })));
+            itemRows.push(copyButton(`copy_${key}`, `image:${key}`, '复制图片路径', press => copyWithFeedback($, id, `image:${key}`, press.surface ?? e.surface, imagePath)));
+            if (page.copyError?.key === `image:${key}`) itemRows.push(caption(`image_copy_error_${key}`, page.copyError.text));
           }
           if (loaded?.offset > 0) itemRows.push(disclosure(`detail_prev_${key}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
           const truncated = entry.deferred || (entry.preview?.length ?? 0) >= 4096 || entry.preview?.includes('[truncated]') || JSON.stringify(entry.data || {}).includes('[truncated]');
@@ -925,15 +998,15 @@ function renderPane($, e, next, attempt = {}) {
     const bodyRows = e.surface === 'desktop' ? e.props?.scroll?.bodyRows : undefined;
     const fillPane = Number.isFinite(bodyRows) && bodyRows > 0;
     const jump = async () => {
-      const gen = state.generation; page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES;
+      const gen = state.generation; page.followTail = true; page.awayFromBottom = false; const scrollGen = ++page.scrollGeneration; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
       await invalidate($);
-      $.clock.after(0, async () => { if (state.opened && state.selected === id && state.generation === gen) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); });
+      $.clock.after(0, async () => { if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); });
     };
     const overlay = [];
     const offset = e.props?.scroll?.offset;
     if (page.awayFromBottom && fillPane && Number.isFinite(offset) && typeof Svg === 'function' && typeof Client === 'function') {
       // Pane re-queries on scroll; use its viewport coordinates, no scroll timer.
-      overlay.push(Box({ key: `codex_jump_position_${id}`, position: 'absolute', top: Math.max(0, Math.floor(offset + bodyRows - 3)), left: 0, width: '100%', flexDirection: 'row', justifyContent: 'center', children: [iconButton(`codex_jump_${id}`, { source: jumpIcon, label: '回到最新消息', size: 32, width: 4, height: 2, onPress: jump })] }));
+      overlay.push(Box({ key: `codex_jump_position_${id}`, position: 'absolute', top: Math.max(0, Math.floor(offset + bodyRows - 3)), left: 0, width: '100%', flexDirection: 'row', justifyContent: 'center', children: [hint(`codex_jump_hint_${id}`, iconButton(`codex_jump_${id}`, { source: jumpIcon, label: '回到最新消息', size: 32, width: 4, height: 2, onPress: jump }), '回到最新消息', 18, -7)] }));
     } else if (page.awayFromBottom && e.surface !== 'desktop') composer.push(Button({ key: `codex_jump_${id}`, plain: true, label: '↓ 最新消息', onPress: jump }));
     const timeline = Box({ key: `codex_timeline_${id}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 1 : 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows });
     const root = content => Box({ key: 'codex_conversation', position: 'relative', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation }), ...content, Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer }), ...overlay] });
@@ -959,7 +1032,7 @@ function renderPane($, e, next, attempt = {}) {
       ] });
       tree = root([parts[current], pager]);
     }
-    page.windowStart = view.start; page.windowSize = attempt.count ?? page.windowSize ?? VISIBLE_ENTRIES; page.windowEnd = null;
+    page.renderedWindow = { ...view, entries, timeline: page.timeline };
     return tree;
 }
 export function closeUI() { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }

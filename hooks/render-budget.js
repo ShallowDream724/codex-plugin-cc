@@ -32,7 +32,7 @@ function fragments(source, width) {
   return result;
 }
 
-export function nativeRenderBudget(constructors, { copy } = {}) {
+export function nativeRenderBudget(constructors, { copy, copyLabel } = {}) {
   const records = new WeakMap();
   const cost = node => typeof node === 'string' ? { chars: node.length, nodes: 1, depth: 1 } : records.get(node)?.cost ?? { chars: 0, nodes: 0, depth: 0 };
   const build = (type, props) => {
@@ -62,7 +62,7 @@ export function nativeRenderBudget(constructors, { copy } = {}) {
     if (field && typeof props[field] === 'string') {
       const source = props[field];
       const sourcePage = fragment => build('Box', { key: props.key, flexDirection: 'column', children: [
-        ...(!hasCopy && typeof copy === 'function' ? [build('Button', { key: `${props.key ?? 'content'}:copy`, plain: true, label: '复制完整内容', onPress: () => copy(source) })] : []),
+        ...(!hasCopy && typeof copy === 'function' ? [build('Button', { key: `${props.key ?? 'content'}:copy`, plain: true, label: copyLabel?.(props.key ?? 'content') || '复制完整内容', onPress: () => copy(source, props.key ?? 'content') })] : []),
         build('Text', { key: `${props.key ?? 'content'}:source`, mono: true, size: 'caption', children: [fragment] }),
       ] });
       const sourceType = type === 'Markdown' || type === 'Code';
