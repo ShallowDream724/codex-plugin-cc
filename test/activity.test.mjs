@@ -856,6 +856,9 @@ test('recovers truncated native image results from the exact registered rollout 
     client.request = async method => method === 'thread/read' ? { thread: { id: 'root', path } } : { data: [{ turnId: 'other', item }] };
     const missing = await store.detail({ ...args, turn_id: 'other', view: 'media' });
     assert.match(missing.notice, /截断/); assert.equal(missing.images[0].previewable, false); assert.match(missing.images[0].notice, /截断/);
+    client.request = async method => { if (method === 'thread/read') throw new Error('RPC unavailable'); return { data: [{ turnId: 'turn', item }] }; };
+    const unavailable = await store.detail({ ...args, view: 'media' });
+    assert.match(unavailable.notice, /截断/); assert.equal(unavailable.images[0].previewable, false);
     await store.close();
     const invalid = fixture();
     invalid.client.request = async method => method === 'thread/read' ? { thread: { id: 'root', path } } : { data: [{ turnId: 'turn', item }] };
@@ -863,6 +866,34 @@ test('recovers truncated native image results from the exact registered rollout 
     assert.match((await invalid.store.detail({ ...args, view: 'media' })).notice, /截断/);
     await invalid.store.close();
   } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('rollout media bounds its indexes and rediscovers evicted calls and threads', async () => {
+  const { mkdtemp, writeFile, appendFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { RolloutMedia } = await import('../runtime/rollout-media.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'rollout-lru-test-'));
+  const paths = Object.fromEntries(['a', 'b', 'c'].map(id => [id, join(dir, `${id}.jsonl`)]));
+  const record = id => JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: id, output: [{ type: 'input_image', image_url: id }], internal_chat_message_metadata_passthrough: { turn_id: 'turn' } } }) + '\n';
+  try {
+    for (const id of Object.keys(paths)) await writeFile(paths[id], JSON.stringify({ type: 'session_meta', payload: { id } }) + '\n' + record('one') + record('two') + record('three'));
+    const reader = new RolloutMedia({ request: async (_method, { threadId }) => ({ thread: { id: threadId, path: paths[threadId] } }) }, { threadLimit: 2, callLimit: 2 });
+    const read = async (thread, call) => (await reader.lookup(thread, 'turn', call))?.[0].image_url;
+    assert.equal(await read('a', 'one'), 'one');
+    assert.equal(await read('a', 'two'), 'two');
+    assert.equal(await read('a', 'three'), 'three');
+    assert.equal(reader.states.get('a').index.size, 2);
+    assert.equal(await read('a', 'one'), 'one'); // wrap and rescan an evicted call
+    await appendFile(paths.a, record('four'));
+    assert.equal(await read('a', 'four'), 'four');
+    assert.equal(await read('a', 'two'), 'two'); // find an older evicted call after append
+    assert.equal(await read('b', 'one'), 'one');
+    assert.equal(await read('c', 'one'), 'one');
+    assert.equal(reader.states.size, 2); assert.equal(reader.states.has('a'), false);
+    assert.equal(await read('a', 'one'), 'one'); // rebuild an evicted thread
+    assert.equal(reader.states.size, 2);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('Windows codecs convert generated JPEG GIF BMP previews and preserve originals', { skip: process.platform !== 'win32' }, async () => {
