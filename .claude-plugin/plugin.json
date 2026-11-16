@@ -1,6 +1,6 @@
 {
   "name": "codex-subagents",
-  "version": "0.2.0-rc.17",
+  "version": "0.2.0-rc.18",
   "description": "Use Codex as persistent subagents: delegate, steer, answer questions, wait, interrupt and resume.",
   "author": { "name": "ShallowDream724" },
   "license": "Apache-2.0",

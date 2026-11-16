@@ -10,6 +10,7 @@ export function paneScroll({ scroll, later, valid, position }) {
     get latest() { return latest; },
     get intent() { return intent; },
     get pending() { return !!pending; },
+    get disposed() { return disposed; },
     cancel() { disposed = true; serial++; pending = null; },
     observe(e) {
       if (e.origin.kind === 'person') {

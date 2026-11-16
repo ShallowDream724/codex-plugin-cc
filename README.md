@@ -4,7 +4,7 @@
 
 仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
-当前本地候选版为 **0.2.0-rc.17**，修复向上阅读时被拉回底部、自动历史翻页和桌面图片预览；保留底部居中的跟随按钮。等待用户验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
+当前本地候选版为 **0.2.0-rc.18**，补齐短窗口自动续读、连续滚动及加载期间跳转的并发处理；保留桌面图片预览和底部居中的跟随按钮。等待用户验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 

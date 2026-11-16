@@ -7,7 +7,7 @@ import navigationSync from '../hooks/navigation-sync.js';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 const entry = (id, type, text) => ({ id, turn_id: 'turn', type, data: { text } });
 
-async function setup(handler) {
+async function setup(handler, { acceptScroll = () => true } = {}) {
   const hooks = [], timers = [], afters = [], scrolls = [], calls = []; let painted = [], draw; const surfacePending = new Set();
   const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
     const promise = new Promise(resolve => setImmediate(resolve)).then(() => host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data })));
@@ -16,7 +16,7 @@ async function setup(handler) {
   const $ = {
     ui: {
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client', 'Image'].map((type) => [type, (props) => ({ type, props })])),
-      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { if (args.to?.key && !painted.some(node => node.type === 'Button' && node.props.key === args.to.key)) throw Error('key not painted'); scrolls.push(args); if (args.to?.key) await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 }); },
+      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { if (args.to?.key && (!painted.some(node => node.type === 'Button' && node.props.key === args.to.key) || !acceptScroll(args))) throw Error('key not painted'); scrolls.push(args); if (args.to?.key) await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 }); },
     },
     clock: { every(_ms, fn) { timers.push(fn); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn: () => host.callback(fn), cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
     state: { get: async () => ({}), set: async () => ({ isSet: true }) },
@@ -43,11 +43,19 @@ async function setup(handler) {
   return { draw, item, surfacePending, tick: async () => { await timers[0](); await draw(); }, scroll, scrollEvent, scrolls, calls, afters, open: (id) => openAgent($, id), close: () => hooks.find((hook) => hook.event === 'ui.close').fn($, { id: 'codex_subagent_activity' }, async (e) => e), message: (e) => hooks.find((hook) => hook.event === 'ui.message').fn($, e, async () => ({})) };
 }
 
+const tailCalls = scrolls => scrolls.filter(s => /^codex_tail_a_\d+$/.test(s.to?.key || '') && s.block === 'end');
+const tailCount = scrolls => new Set(tailCalls(scrolls).map(s => s.to.key)).size;
+const assertTailReveal = scrolls => {
+  assert.equal(scrolls.length, 2, 'the painted tail is confirmed twice');
+  assert.equal(tailCalls(scrolls).length, 2);
+  assert.equal(scrolls[0].to.key, scrolls[1].to.key);
+};
+
 test('first open starts at the end and reopening restores the saved reading position', async (t) => {
   t.after(closeUI);
   const ui = await setup(async (op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('saved', 'agentMessage', 'saved')], next_cursor: null } : { revision: 1, entries: [] });
   await flushTimers(ui);
-  assert.deepEqual(ui.scrolls, [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
+  assertTailReveal(ui.scrolls);
   await ui.scroll(1, 42);
   await ui.close();
   await ui.open('a');
@@ -111,7 +119,7 @@ test('sending while reading history keeps the conversation and shows the subsequ
   let rendered = JSON.stringify(await ui.draw());
   assert.match(rendered, /new question/); assert.match(rendered, /live before send/); assert.match(rendered, /older history/);
   assert.doesNotMatch(rendered, /消息已发送/);
-  assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
+  assertTailReveal(ui.scrolls.slice(scrollCount));
   entries = [...entries, entry('answer', 'agentMessage', 'subsequent answer')]; revision++;
   await ui.tick(); rendered = JSON.stringify(await ui.draw());
   assert.match(rendered, /new question/); assert.match(rendered, /subsequent answer/);
@@ -142,7 +150,7 @@ test('a send during an in-flight poll triggers a follow-up refresh', async (t) =
   await flushTimers(ui);
   assert.match(JSON.stringify(await ui.draw()), /sent during poll/);
   assert.equal(ui.calls.filter((call) => call.operation === 'ui_revision').length, 3);
-  assert.deepEqual(ui.scrolls.slice(scrollCount), [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
+  assertTailReveal(ui.scrolls.slice(scrollCount));
 });
 
 const flushTimers = async (ui) => {
@@ -169,8 +177,30 @@ test('jump control returns to the latest message', async (t) => {
   const before = ui.scrolls.length;
   const jump = nodes(await ui.draw()).find(node => node.type === 'Button' && node.props.key === 'codex_jump_a_viewport');
   assert.ok(jump); await jump.props.onPress(); await flushTimers(ui);
-  assert.deepEqual(ui.scrolls.slice(before), [{ in: 'codex_subagent_activity', to: { key: 'codex_tail_a' }, block: 'end' }]);
+  assertTailReveal(ui.scrolls.slice(before));
   assert.match(JSON.stringify(await ui.draw()), /message 149/);
+});
+
+test('jump waits for its new tail marker even when an older marker was painted', async t => {
+  t.after(closeUI);
+  let allowNew = true; const attempted = [];
+  const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [], next_cursor: null } : { revision: 1, entries: [entry('latest', 'agentMessage', 'latest')] }, {
+    acceptScroll: args => { if (args.to?.key?.startsWith('codex_tail_a_')) { attempted.push(args.to.key); return allowNew; } return true; },
+  });
+  await flushTimers(ui);
+  const oldKey = tailCalls(ui.scrolls).at(-1).to.key;
+  await ui.scroll(-1, 10);
+  allowNew = false;
+  await (await ui.item('codex_jump_a_viewport')).props.onPress();
+  const before = ui.scrolls.length;
+  await ui.draw(); await settle(); await settle();
+  assert.ok(attempted.length >= 3);
+  assert.notEqual(attempted.at(-1), oldKey, 'the old painted marker cannot satisfy the new request');
+  assert.equal(ui.scrolls.length, before, 'the jump remains pending while its marker is absent');
+  allowNew = true;
+  await flushTimers(ui);
+  assertTailReveal(ui.scrolls.slice(before));
+  assert.equal(ui.scrolls.at(-1).to.key, attempted.at(-1));
 });
 test('new activity pauses for reading and resumes after an explicit jump', async (t) => {
   t.after(closeUI);
@@ -178,7 +208,7 @@ test('new activity pauses for reading and resumes after an explicit jump', async
   let revision = 1, entries = [tool];
   const ui = await setup(async op => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'running' }] } : op === 'ui_revision' ? { revision, entries } : op === 'ui_history' ? { entries: [], next_cursor: null } : { text: '', next_offset: null });
   await (await ui.item('item_a:turn:tool')).props.onPress();
-  const countEnd = () => ui.scrolls.filter(s => s.to?.key === 'codex_tail_a' && s.block === 'end').length;
+  const countEnd = () => tailCount(ui.scrolls);
   let count = countEnd();
   entries = [...entries, entry('one', 'agentMessage', 'first')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), ++count, 'opening a tool at the bottom does not disable following');
@@ -205,12 +235,12 @@ test('a user scroll during an in-flight send refresh cancels the pending jump', 
     if (op === 'ui_send') { block = true; return { agent_id: 'a', status: 'steered' }; }
     if (op === 'ui_revision') { if (block) return new Promise(resolve => { release = resolve; }); return { revision, entries: [] }; }
   });
-  const before = ui.scrolls.filter(s => s.to?.key === 'codex_tail_a' && s.block === 'end').length;
+  const before = tailCount(ui.scrolls);
   const sending = (await ui.item('codex_message_a')).props.onSubmit('hello');
   while (!release) await new Promise(setImmediate);
   await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 10, contentRows: 100, bodyRows: 20 });
   revision++; release({ revision, entries: [entry('sent', 'directUserMessage', 'hello')] }); await sending; await flushTimers(ui);
-  assert.equal(ui.scrolls.filter(s => s.to?.key === 'codex_tail_a' && s.block === 'end').length, before);
+  assert.equal(tailCount(ui.scrolls), before);
 });
 
 test('switching or closing discards a delayed history result', async t => {

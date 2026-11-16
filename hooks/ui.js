@@ -205,16 +205,36 @@ function holdWindow(page) {
   page.windowSize = Math.max(1, view.entries.length); page.followTail = false;
 }
 const historyKey = (id, page) => `codex_history_${id}_${page.layoutRevision ?? 0}`;
-const tailKey = id => `codex_tail_${id}`;
+const tailKey = (id, token) => `codex_tail_${id}_${token || 0}`;
 let navigationSequence = 0;
+function scrollPane($, args, valid = () => true, controller = null) {
+  const id = state.selected, generation = state.generation;
+  const request = { controller, valid: () => state.opened && state.selected === id && state.generation === generation && valid() };
+  const run = async () => {
+    if (!request.valid()) return { deny: 'obsolete navigation' };
+    state.programmaticScroll = request;
+    try { return await $.ui.scroll({ in: PANE, ...args }); }
+    finally { if (state.programmaticScroll === request) state.programmaticScroll = null; }
+  };
+  const operation = (state.scrollQueue || Promise.resolve()).catch(() => {}).then(run);
+  state.scrollQueue = operation.catch(() => {});
+  return operation;
+}
+function cancelNavigation(page) {
+  page.navigationOwner = null; page.navigationRequest = null;
+  page.navigationTimeline = null; page.adding = null; page.navigating = false;
+  page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel();
+}
 function requestTail($, id) {
   const page = pageFor(id);
   page.tailRequest = { token: ++navigationSequence, generation: state.generation, scrollGeneration: page.scrollGeneration };
+  page.tailMarkerToken = page.tailRequest.token;
   return invalidate($);
 }
 async function requestHistoryNavigation($, id, direction) {
   const page = pageFor(id), generation = state.generation;
   if (page.navigating || state.imagePreview) return;
+  if (page.navigationRequest?.direction === direction && page.navigationRequest.generation === generation) return;
   const request = { token: ++navigationSequence, direction, generation, scrollGeneration: page.scrollGeneration };
   page.navigationRequest = request; holdWindow(page);
   const current = () => state.opened && state.selected === id && state.generation === generation
@@ -236,20 +256,22 @@ async function requestHistoryNavigation($, id, direction) {
   await invalidate($);
 }
 function scrollController($, id, page) {
-  return page.scroller ??= paneScroll({
-    scroll: args => $.ui.scroll({ in: PANE, ...args }), later: (ms, fn) => $.clock.after(ms, fn),
+  if (page.scroller) return page.scroller;
+  const controller = paneScroll({
+    scroll: args => scrollPane($, args, () => !controller.disposed, controller), later: (ms, fn) => $.clock.after(ms, fn),
     valid: () => state.opened && state.selected === id && state.pages.get(id) === page,
     position: offset => state.scroll.set(id, offset),
   });
+  return page.scroller = controller;
 }
-async function resizeWindow($, id, page, start, end, above) {
+async function resizeWindow($, id, page, start, end, above, owner) {
   // Height differences must describe this navigation only. Polls may keep
   // merging into the data cache, but cannot append/resize a different record
   // in the middle of our two measured frames.
   page.navigationTimeline ??= page.timeline ??= conversationEntries(page.live);
   const scroller = scrollController($, id, page), gen = state.generation;
   const before = await scroller.measure(historyKey(id, page));
-  if (!before || !state.opened || state.selected !== id || gen !== state.generation) return false;
+  if (!before || !state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
   const expanded = new Set(groupEntries(drawnWindow(page).entries).flatMap(group => state.folds.has(`${id}:${entryKey(group.items[0])}:group`) ? group.items.map(entryKey) : []));
   for (const group of groupEntries(page.navigationTimeline.slice(start, end))) {
     if (group.items.some(entry => expanded.has(entryKey(entry)))) state.folds.add(`${id}:${entryKey(group.items[0])}:group`);
@@ -259,18 +281,18 @@ async function resizeWindow($, id, page, start, end, above) {
   page.layoutRevision = (page.layoutRevision ?? 0) + 1;
   await invalidate($);
   const after = await scroller.measure(historyKey(id, page), before, above);
-  return !!after && state.opened && state.selected === id && gen === state.generation;
+  return !!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner;
 }
 async function browseHistory($, id, direction) {
   const page = pageFor(id), gen = state.generation;
   if (page.navigating || state.imagePreview) return;
+  const owner = {}; page.navigationOwner = owner;
   page.navigating = true; holdWindow(page);
-  const scrollGen = page.scrollGeneration;
   try {
     let view = drawnWindow(page);
     if (direction < 0 && view.start === 0 && page.cursor) {
       await history($, id);
-      if (gen !== state.generation || state.selected !== id || scrollGen !== page.scrollGeneration) return;
+      if (gen !== state.generation || state.selected !== id || page.navigationOwner !== owner) return;
       view = drawnWindow(page);
     }
     const available = () => direction < 0 ? view.start > 0 : view.start + view.entries.length < view.total;
@@ -278,18 +300,19 @@ async function browseHistory($, id, direction) {
     // Trim only the opposite, off-screen side, then measure that frame before
     // adding anything. Mixing a prepend and a tail eviction in one redraw
     // makes total-height compensation incorrect.
-    while (view.entries.length > 60 || (view.entries.length > 1 && page.renderCost?.chars > 44000)) {
+    while (view.entries.length > 1 && (page.renderCost?.chars > 44000 || page.renderCost?.nodes > 7000)) {
       const keep = Math.max(1, Math.min(60, Math.floor(view.entries.length / 2)));
       const start = direction < 0 ? view.start : view.start + view.entries.length - keep;
-      if (!await resizeWindow($, id, page, start, start + keep, direction > 0)) return;
+      if (!await resizeWindow($, id, page, start, start + keep, direction > 0, owner)) return;
       view = drawnWindow(page);
     }
     const end = view.start + view.entries.length;
     page.adding = { direction, start: view.start, end };
-    await resizeWindow($, id, page, direction < 0 ? Math.max(0, view.start - 30) : view.start, direction > 0 ? Math.min(view.total, end + 30) : end, direction < 0);
+    await resizeWindow($, id, page, direction < 0 ? Math.max(0, view.start - 30) : view.start, direction > 0 ? Math.min(view.total, end + 30) : end, direction < 0, owner);
   } finally {
+    if (page.navigationOwner !== owner) return;
     const previous = drawnWindow(page), first = previous.entries[0], last = previous.entries.at(-1);
-    page.navigationTimeline = null; page.adding = null; page.navigating = false;
+    page.navigationTimeline = null; page.adding = null; page.navigating = false; page.navigationOwner = null;
     if (!page.followTail && first && last) {
       const all = page.timeline ??= conversationEntries(page.live), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
       if (start >= 0 && end >= start) { page.windowStart = start; page.windowEnd = end + 1; page.windowSize = end - start + 1; }
@@ -350,7 +373,7 @@ async function sendAgent($, id) {
   let accepted = false;
   const selected = state.agents.find((agent) => idOf(agent) === id);
   if (!selected || control.sending || control.stopping || selected.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
-  const page = pageFor(id); page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel(); page.scrollGeneration++;
+  const page = pageFor(id); cancelNavigation(page); page.scrollGeneration++;
   control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; await invalidate($);
   try {
     const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
@@ -543,7 +566,7 @@ async function chooseAttachments($, id, source = 'file') {
     }
   }
   async function select($, id) {
-    const previous = state.pages.get(state.selected); previous?.scroller?.cancel(); if (previous) { previous.scroller = null; previous.browseTimer?.cancel(); previous.navigationRequest = null; }
+    const previous = state.pages.get(state.selected); if (previous) cancelNavigation(previous);
     state.selected = id; state.generation++; state.imagePreview = null;
     const page = pageFor(id); page.historyLoading = false; page.historyRequest = null;
     state.restore = state.scroll.has(id) && !page.followTail;
@@ -553,7 +576,7 @@ async function chooseAttachments($, id, source = 'file') {
   }
   async function showImagePreview($, id, preview) {
     if (!state.opened || state.selected !== id || !state.folds.has(preview.foldKey)) return;
-    const page = pageFor(id); page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel(); page.scrollGeneration++; if (!page.followTail) holdWindow(page);
+    const page = pageFor(id); if (!page.followTail) holdWindow(page); cancelNavigation(page); page.scrollGeneration++;
     page.tailRequest = null;
     state.imagePreview = { ...preview, agentId: id, scrollOffset: state.scroll.get(id) || 0 }; await invalidate($);
   }
@@ -569,7 +592,7 @@ async function chooseAttachments($, id, source = 'file') {
       for (const delay of [0, 32, 64, 128]) {
         if (!state.opened || state.selected !== id || state.generation !== gen || !state.restore) break;
         if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
-        await $.ui.scroll({ in: PANE, to: { key: historyKey(id, page) }, block: 'start' }).catch(() => {});
+        await scrollPane($, { to: { key: historyKey(id, page) }, block: 'start' }).catch(() => {});
       }
     } finally { state.restoringPreview = false; }
   }
@@ -589,7 +612,7 @@ async function chooseAttachments($, id, source = 'file') {
     const result = await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
     if (!state.opened || state.generation !== selectedGen) return;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
-    if (state.restore) await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => {});
+    if (state.restore) await scrollPane($, { to: 'start' }).catch(() => {});
     else await requestTail($, state.selected);
     if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
   }
@@ -729,6 +752,7 @@ export function registerUI(on) {
       page.tailRequest = null;
       if (page.navigationRequest && Math.sign(e.by) !== page.navigationRequest.direction) page.navigationRequest = null;
       state.scroll.set(id, e.offset); page.scrollGeneration++;
+      if (e.offset > 2 && e.offset < e.contentRows - e.bodyRows - 2) page.lastEdgeRequest = null;
       page.windowAnchor = null;
       holdWindow(page);
       if (page.windowEnd == null) page.windowStart = view.start;
@@ -742,7 +766,7 @@ export function registerUI(on) {
     if (e.origin.kind === 'person' && id && state.opened && !page.navigating) {
       const threshold = Math.max(2, (e.bodyRows || 12) * 2);
       if (e.by < 0 && e.offset <= threshold && page.cursor) prefetchHistory($, id);
-      const needsTrim = view.entries.length > 60 || page.renderCost?.chars > 44000;
+      const needsTrim = page.renderCost?.chars > 44000 || page.renderCost?.nodes > 7000;
       const earlier = e.by < 0 && e.offset <= (needsTrim ? 1 : threshold) && (view.start > 0 || page.cursor);
       const later = e.by > 0 && e.offset >= e.contentRows - e.bodyRows - (needsTrim ? 1 : threshold) && view.start + view.entries.length < view.total;
       if (earlier || later) {
@@ -757,6 +781,9 @@ export function registerUI(on) {
   on('ui.scroll', { requestId: PANE, origin: { kind: 'plugin' } }, ($, e, next) => {
     const id = state.selected, page = id && pageFor(id);
     if (!page) return next(e);
+    const transfer = state.programmaticScroll;
+    if (transfer && !transfer.valid()) return next({ ...e, offset: state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
+    if (transfer?.controller?.pending) return next(transfer.controller.observe(e));
     if (page.scroller?.pending) return next(page.scroller.observe(e));
     if (state.restore) { state.restore = false; return next({ ...e, offset: state.scroll.get(id) || 0 }); }
     // A cancelled header measurement must never become an actual jump to top.
@@ -773,13 +800,27 @@ export function registerUI(on) {
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     if (!state.opened || !state.selected) return next(e);
+    if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'edge') {
+      const id = state.selected, page = pageFor(id), generation = state.generation;
+      if (!e.data.token || e.data.token !== page.edgeKey || page.lastEdgeRequest === e.data.token || page.navigating || page.navigationRequest || page.tailRequest || state.imagePreview) return {};
+      page.lastEdgeRequest = e.data.token;
+      const direction = e.data.direction === 1 ? 1 : -1;
+      $.clock.after(0, () => { if (state.opened && state.selected === id && state.generation === generation) return requestHistoryNavigation($, id, direction); });
+      return {};
+    }
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'tail') {
-      const page = pageFor(state.selected), request = page.tailRequest;
+      const id = state.selected, page = pageFor(id), request = page.tailRequest;
       if (!request || request.token !== e.data.token || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) return {};
-      page.tailRequest = null;
       // to:'end' also enables native followEnd(), which can pull a later upward
       // scroll back down. A keyed reveal is strictly a single movement.
-      await $.ui.scroll({ in: PANE, to: { key: tailKey(state.selected) }, block: 'end' }).catch(() => {});
+      let revealed = false;
+      for (const delay of [0, 32, 64, 128]) {
+        if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
+        if (state.selected !== id || page.tailRequest !== request || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) break;
+        const result = await scrollPane($, { to: { key: tailKey(id, request.token) }, block: 'end' }, () => page.tailRequest === request && request.scrollGeneration === page.scrollGeneration && page.followTail).catch(() => ({ deny: 'not painted' }));
+        if (!result?.deny) { if (revealed) break; revealed = true; }
+      }
+      if (page.tailRequest === request) { page.tailRequest = null; await invalidate($); }
       return {};
     }
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'navigate') {
@@ -851,16 +892,11 @@ function renderPane($, e, next, attempt = {}) {
     }
     const view = timelineWindow(page, attempt.count, attempt.start), entries = view.entries;
     const jump = async () => {
-      page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel();
-      page.navigationRequest = null;
+      cancelNavigation(page);
       page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
       await requestTail($, id);
     };
     const rows = [], navigation = [], composer = [];
-    const navigationButton = (props, action) => {
-      control.navigationActions.set(props.key, action);
-      return Button({ ...props, onPress: () => {} });
-    };
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
     const previewImage = (key, image, foldKey) => {
       const size = imageSize(image, e.props?.bodyColumns), actionKey = `image_action_${key}`;
@@ -898,7 +934,7 @@ function renderPane($, e, next, attempt = {}) {
       const activate = entry ? (...args) => {
         page.scrollGeneration++; if (!page.followTail) holdWindow(page); page.windowAnchor = entryKey(entry);
         // Request the reading anchor without blocking the visible disclosure.
-        if (!page.scroller?.pending) $.ui.scroll({ in: PANE, to: { key }, block: 'nearest' }).catch(() => {});
+        if (!page.scroller?.pending) scrollPane($, { to: { key }, block: 'nearest' }).catch(() => {});
         return onPress(...args);
       } : onPress;
       const vector = typeof expanded === 'boolean' && e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function';
@@ -950,7 +986,7 @@ function renderPane($, e, next, attempt = {}) {
     // single jump control is positioned by the cheap frame wrapper below.
     navigation.push(Box({ key: `codex_history_bar_${id}`, height: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', children: [
       Box({ flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [
-        Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: historyKey(id, page), plain: true, label: ' ', onPress: () => {} })] }),
+        Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: historyKey(id, page), plain: true, label: '·', onPress: () => {} })] }),
         Box({ key: `codex_history_loading_${id}`, width: 2, height: 1, children: page.historyLoading || page.navigating || page.navigationRequest ? [e.surface === 'desktop' && typeof Svg === 'function'
           ? Svg({ key: `codex_history_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 14, height: 14, isInteractive: true })
           : caption(`codex_history_loading_label_${id}`, '…')] : [] }),
@@ -1177,8 +1213,8 @@ function renderPane($, e, next, attempt = {}) {
     const hasLater = view.start + entries.length < view.total;
     const historyEnd = Box({ key: `codex_history_end_${id}`, height: 1, children: [] });
     const timeline = Box({ key: `codex_timeline_${id}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 1 : 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows });
-    const navigationSync = typeof Client === 'function' ? Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, tailToken: page.tailRequest?.token || 0 } }) : null;
-    const tailMarker = Box({ position: 'absolute', bottom: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: tailKey(id), plain: true, label: ' ', onPress: () => {} })] });
+    const navigationProps = { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, tailToken: page.tailRequest?.token || 0 };
+    const tailMarker = Box({ position: 'absolute', bottom: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: tailKey(id, page.tailMarkerToken), plain: true, label: '·', onPress: () => {} })] });
     const jumpNode = jumpControl('viewport');
     const overlay = scroll => {
       const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
@@ -1192,7 +1228,13 @@ function renderPane($, e, next, attempt = {}) {
       renderedContent = content;
       // Keep the message port in the viewport: desktop surfaces may suspend
       // off-screen Client regions. Its empty node never handles pointer input.
-      const sync = navigationSync ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0), left: 0, width: 1, height: 1, children: [navigationSync] })] : [];
+      const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
+      const short = Number.isFinite(scroll?.contentRows) && scroll.contentRows <= bodyRows + 1;
+      const canRequest = !page.navigating && !page.navigationRequest && !page.tailRequest && !page.historyLoading && !page.historyError && !state.restoringPreview;
+      const edgeDirection = canRequest && (!page.followTail || short) ? hasEarlier && (offset <= 1 || short) ? -1 : hasLater && offset >= scroll?.contentRows - bodyRows - 1 ? 1 : 0 : 0;
+      const edgeToken = edgeDirection ? JSON.stringify([state.generation, id, edgeDirection, view.start, entries.length, view.total, page.cursor, page.layoutRevision || 0]) : '';
+      page.edgeKey = edgeToken;
+      const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
       return Box({ key: 'codex_conversation', position: 'relative', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: bodyRows } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
     };
     let tree = root([timeline]);

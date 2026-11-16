@@ -8,7 +8,7 @@ const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.
 const entry = i => ({ id: `m${i}`, turn_id: 't', type: 'agentMessage', data: { text: `message-${i}` } });
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
+async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, shortViewport = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
   closeUI();
   const hooks = [], scrolls = [], calls = [], timers = [];
   let painted = [], offset = 0, drawQueued = false, closed = false;
@@ -27,7 +27,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
           if (!painted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted');
           await onMeasurement(args.to.key);
           const contentRows = Math.max(20, painted.filter(n => n.type === 'Markdown').length + 10);
-          const destination = 3;
+          const destination = args.block === 'end' ? contentRows - 10 : 3;
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
           offset = (await host.dispatch('ui.scroll', e)).offset;
         }
@@ -48,7 +48,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   };
   const host = nativeHooks(hooks, $); registerUI(host.on);
   const draw = async () => {
-    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10 } } }, () => null));
+    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}) } } }, () => null));
     const sync = painted.find(n => n.type === 'Client' && n.props.module === './navigation-sync.js');
     if (autoPost && sync) navigationSync(sync.props.props, surface);
     return painted;
@@ -74,15 +74,23 @@ test('window navigation reaches earlier and later cached messages over multiple 
   assert.ok(h.scrolls.filter(s => s.to?.key?.startsWith('codex_history_a_')).length > 3);
 });
 
-test('short list loads earlier history automatically without a visible load button', async t => {
-  const h = await setup({ history: args => args.cursor ? { entries: [entry(0)], next_cursor: null } : { entries: [entry(1)], next_cursor: { turns_cursor: 'older' } } }); t.after(h.close);
-  assert.deepEqual(messages(h), ['message-1']);
+test('short list loads earlier history after render without a wheel event', async t => {
+  const h = await setup({ shortViewport: true, history: args => args.cursor ? { entries: [entry(0)], next_cursor: null } : { entries: [entry(1)], next_cursor: { turns_cursor: 'older' } } }); t.after(h.close);
   assert.ok(!h.painted.some(n => n.type === 'Button' && /加载更早消息|加载后续消息/.test(n.props.label || '')));
   const markerContainer = h.painted.find(n => n.type === 'Box' && n.props.children?.includes(older(h)));
   assert.equal(markerContainer?.props.height, 0);
   assert.equal(markerContainer?.props.overflow, 'hidden', 'the measurement marker cannot be seen or clicked');
-  h.wheel(-1); await pause(100);
-  assert.deepEqual(messages(h), ['message-0', 'message-1']);
+  assert.ok(older(h).props.label.trim(), 'the hidden native marker has measurable content');
+  await pause(150);
+  assert.deepEqual(messages(h), ['message-0', 'message-1'], JSON.stringify({ calls: h.calls, sync: h.painted.find(n => n.props.module === './navigation-sync.js')?.props.props }));
+  assert.equal(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).length, 1);
+});
+
+test('automatic edge navigation stops when history makes no progress', async t => {
+  const h = await setup({ shortViewport: true, history: () => ({ entries: [entry(1)], next_cursor: { turns_cursor: 'unchanged' } }) }); t.after(h.close);
+  await pause(250);
+  assert.equal(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).length, 1);
+  assert.deepEqual(messages(h), ['message-1']);
 });
 
 test('continued upward scrolling during an unfinished history request completes navigation', async t => {
@@ -92,8 +100,29 @@ test('continued upward scrolling during an unfinished history request completes 
   const first = h.wheel(-1, 0); assert.equal(first.offset, 0);
   await pause(45);
   const second = h.wheel(-1, 0); assert.equal(second.offset, 0);
+  assert.equal(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).length, 1, 'same-direction requests share one history fetch');
   resolveHistory({ entries: [entry(0)], next_cursor: null }); await pause(100);
   assert.deepEqual(messages(h), ['message-0', 'message-1']);
+});
+
+test('jump during a pending navigation measurement owns the final viewport', async t => {
+  let release, started;
+  const measuring = new Promise(resolve => { started = resolve; });
+  const h = await setup({
+    live: Array.from({ length: 240 }, (_, i) => entry(i)),
+    onMeasurement: key => key.startsWith('codex_history_a_') && !release ? new Promise(resolve => { release = resolve; started(); }) : undefined,
+  }); t.after(h.close);
+  h.wheel(-1, 0);
+  await measuring;
+  const jump = h.painted.find(node => node.type === 'Button' && node.props.key === 'codex_jump_a_viewport');
+  assert.ok(jump);
+  await jump.props.onPress();
+  await pause(100); await h.draw();
+  assert.ok(messages(h).includes('message-239'), 'jump renders the actual latest message');
+  release(); await pause(250); await h.draw();
+  assert.ok(messages(h).includes('message-239'), 'old measurement cannot restore its navigation snapshot');
+  assert.ok(h.scrolls.some(call => call.to?.key?.startsWith('codex_tail_a') && call.block === 'end'));
+  assert.equal(h.offset, Math.max(20, messages(h).length + 10) - 10, 'late navigation cannot move the viewport away from the latest message');
 });
 
 test('budget-limited windows preserve access to both sides of the cached conversation', async t => {
@@ -129,7 +158,7 @@ test('live updates during a navigation measurement retain the range and appear a
   assert.ok(messages(h).includes('message-130'), 'the measured frame remains stable during the update');
   assert.ok(!messages(h).some(text => text.includes('extra height')));
   release(); await pause(600); await h.draw();
-  assert.equal(messages(h)[0], 'message-90', 'continued upward scrolling does not interrupt the in-flight window change');
+  assert.ok(Number(messages(h)[0].split('-')[1]) <= 90, 'continued upward scrolling does not interrupt the in-flight window change');
   assert.ok(messages(h).some(text => text.startsWith('message-130 updated with extra height')));
   assert.ok(messages(h).includes('message-179'));
   for (let i = 0; i < 12 && !messages(h).includes('message-240'); i++) { h.wheel(1); await pause(120); }

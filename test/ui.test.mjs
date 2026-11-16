@@ -524,13 +524,15 @@ test('expanding a tool paints existing output without waiting for scrolling or a
     return { entries: [], next_cursor: null };
   });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
-  $.ui.scroll = () => new Promise(() => {});
+  let releaseScroll;
+  $.ui.scroll = () => new Promise(resolve => { releaseScroll = resolve; });
   const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
   const button = () => draw().then(tree => nodes(tree).find(node => node.props.key === 'item_a:t:run'));
   let settled = false;
   (await button()).props.onPress().then(() => { settled = true; });
   await new Promise(setImmediate);
   assert.equal(settled, true, 'native click completes before slow scroll or read');
+  $.ui.scroll = async () => ({}); releaseScroll?.({});
   assert.equal(detailCalls, 0, 'cold read starts after the click returns');
   assert.ok(nodes(await draw()).some(node => node.type === 'Code' && node.props.source === 'available output'));
   const fetching = afters.shift()();
