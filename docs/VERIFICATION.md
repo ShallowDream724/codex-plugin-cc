@@ -1,5 +1,9 @@
 # 验证记录
 
+## rc.13 本地安装候选（2026-11-16）
+
+rc.13 汇总下述开发阶段修复，用于本地验收，尚未发布 GitHub。最近完整回归为 396 项通过、2 项环境相关跳过及 11 条宿主 Box 属性路径核验。安装前的 Claude 原生校验发现两处 `$.clock.after` 被当成值检查，不符合宿主调用规则；改为直接调用后，相关 68 项界面回归通过，原生插件校验及元数据/语法检查均通过。证据为 `artifacts/validate-rc13.log`、`artifacts/test-rc13-host-compat.log`、`artifacts/check-rc13.log`。下文“未安装”指对应开发验证发生时的状态。
+
 ## 未发布：文件差异、跟随滚动与轮次内通知（2026-11-16）
 
 完整本地测试 **396 项通过、2 项环境相关跳过**，元数据与 JavaScript 语法检查通过；宿主 Box 属性规则核对 **11 条界面路径通过**。日志：`artifacts/test-completion-file-change.log`、`artifacts/check-completion-file-change.log`、`artifacts/host-box-final-reading.log`。

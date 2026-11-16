@@ -359,7 +359,7 @@ async function chooseAttachments($, id, source = 'file') {
       if (entriesChanged && hadRevision && page.followTail && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
         const scrollGen = page.scrollGeneration;
         const follow = async () => { if (state.opened && state.selected === id && state.generation === gen && page.scrollGeneration === scrollGen && page.followTail && !state.imagePreview) await $.ui.scroll({ in: PANE, to: 'end' }).catch(() => {}); };
-        if (typeof $.clock.after === 'function') $.clock.after(0, follow); else await follow();
+        $.clock.after(0, follow);
       }
       const selected = state.agents.find((agent) => idOf(agent) === id);
       if (selected && selected.status !== 'starting' && !page.historyChecked) await latestHistory($, id);
@@ -435,7 +435,7 @@ async function chooseAttachments($, id, source = 'file') {
     if (!preview || preview.agentId !== id) return;
     state.imagePreview = null; await invalidate($);
     const restore = async () => { if (state.opened && state.selected === id && state.generation === gen && !state.imagePreview) await $.ui.scroll({ in: PANE, to: { key: `row_item_${preview.foldKey}` }, block: 'nearest' }).catch(() => {}); };
-    if (typeof $.clock.after === 'function') $.clock.after(0, restore); else await restore();
+    $.clock.after(0, restore);
   }
   export async function openAgent($, id) {
     state.opened = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
