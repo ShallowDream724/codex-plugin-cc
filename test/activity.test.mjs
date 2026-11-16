@@ -829,6 +829,42 @@ test('serialized result recognition leaves prose and unrelated JSON untouched', 
   }
 });
 
+test('recovers truncated native image results from the exact registered rollout call', async () => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'rollout-media-test-'));
+  const path = join(dir, 'rollout.jsonl');
+  const png = Buffer.concat([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=', 'base64'), Buffer.alloc(12000)]);
+  const data = png.toString('base64');
+  const payload = (turn, call, count) => ({ type: 'response_item', payload: { type: 'function_call_output', call_id: call, output: Array.from({ length: count }, () => ({ type: 'input_image', image_url: `data:image/png;base64,${data}` })), internal_chat_message_metadata_passthrough: { turn_id: turn } } });
+  const { client, store } = fixture();
+  const original = JSON.stringify({ content: [{ type: 'image', mimeType: 'image/png', data: data.slice(0, 100) + '…12000 chars truncated…' + data.slice(-100), _meta: { 'codex/imageDetail': 'high' } }], isError: false });
+  const item = { id: 'call', type: 'mcpToolCall', result: { content: [{ type: 'text', text: original }], isError: false } };
+  try {
+    await writeFile(path, [JSON.stringify({ type: 'session_meta', payload: { id: 'root' } }), JSON.stringify(payload('wrong-turn', 'call', 1)), JSON.stringify(payload('turn', 'wrong-call', 1)), JSON.stringify(payload('turn', 'call', 3)), ''].join('\n'));
+    client.request = async method => method === 'thread/read' ? { thread: { id: 'root', path } } : { data: [{ turnId: 'turn', item }] };
+    client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'turn', item } });
+    assert.equal(store.revision({ target: 'a' }).entries[0].media.omitted, true);
+    const args = { target: 'a', turn_id: 'turn', item_id: 'call' };
+    const result = await store.detail({ ...args, view: 'media' });
+    assert.equal(result.count, 3); assert.equal(result.omitted, undefined);
+    assert.ok(result.images.every(image => image.previewable));
+    assert.deepEqual(readFileSync(result.images[0].path), png);
+    assert.equal((await store.detail({ ...args, view: 'output' })).text, '');
+    assert.equal((await store.detail({ ...args, view: 'media' })).count, 3);
+    client.request = async method => method === 'thread/read' ? { thread: { id: 'root', path } } : { data: [{ turnId: 'other', item }] };
+    const missing = await store.detail({ ...args, turn_id: 'other', view: 'media' });
+    assert.match(missing.notice, /截断/); assert.equal(missing.images[0].previewable, false); assert.match(missing.images[0].notice, /截断/);
+    await store.close();
+    const invalid = fixture();
+    invalid.client.request = async method => method === 'thread/read' ? { thread: { id: 'root', path } } : { data: [{ turnId: 'turn', item }] };
+    await writeFile(path, [JSON.stringify({ type: 'session_meta', payload: { id: 'foreign' } }), JSON.stringify(payload('turn', 'call', 3)), ''].join('\n'));
+    assert.match((await invalid.store.detail({ ...args, view: 'media' })).notice, /截断/);
+    await invalid.store.close();
+  } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test('Windows codecs convert generated JPEG GIF BMP previews and preserve originals', { skip: process.platform !== 'win32' }, async () => {
   const { mkdtemp, readFile, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');

@@ -9,6 +9,10 @@ export function toolOutputText(value, { serialize = text, formatPart = (part) =>
   const partText = (part) => {
     if (isImageBlock(part)) {
       const { type, media_omitted, mimeType, ...extra } = part;
+      if (extra._meta && typeof extra._meta === 'object' && !Array.isArray(extra._meta)) {
+        const { 'codex/imageDetail': imageDetail, ...rest } = extra._meta;
+        if (Object.keys(rest).length) extra._meta = rest; else delete extra._meta;
+      }
       return Object.keys(extra).length ? serialize(extra) : '';
     }
     if (part && typeof part === 'object') {
@@ -33,6 +37,11 @@ export function toolOutputText(value, { serialize = text, formatPart = (part) =>
     if (['content', 'contentItems'].includes(key) && Array.isArray(field)) parts.push(...field.map(partText));
     else if (key === 'structuredContent' && field != null) parts.push(serialize(field));
     else if (key === 'type' && ['tool_result', 'toolResult'].includes(field) && (Array.isArray(value.content) || Array.isArray(value.contentItems))) continue;
+    else if (key === 'isError' && field === false) continue;
+    else if (key === '_meta' && field && typeof field === 'object' && !Array.isArray(field)) {
+      const { 'codex/imageDetail': imageDetail, ...rest } = field;
+      if (Object.keys(rest).length) extra[key] = rest;
+    }
     else if (!(protocolKeys.includes(key) && field == null)) extra[key] = field;
   }
   if (Object.keys(extra).length) parts.push(serialize(extra));

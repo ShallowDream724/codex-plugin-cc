@@ -3,6 +3,7 @@
 import { toolOutputText } from '../shared/tool-output.mjs';
 import { collectImages, sanitizeMedia } from '../shared/tool-media.mjs';
 import { materializeImage, pngDimensions } from './tool-media-files.mjs';
+import { RolloutMedia } from './rollout-media.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { communication, safeBoundary } from '../shared/communication.mjs';
 import { fileChanges, fileChangeSummary, fileChangePage } from '../shared/file-changes.mjs';
@@ -167,6 +168,7 @@ export class ActivityStore {
   constructor({ client, controller, cacheLimits = { bytes: 256 * 1024 * 1024, files: 512 } }) {
     this.client = client; this.controller = controller; this.live = new Map(); this.nextRevision = 1;
     this.agentNames = new Map(); this.turnStates = new Map();
+    this.rolloutMedia = new RolloutMedia(client);
     this.exportDir = null; this.exports = new Map(); this.exportSizes = new Map(); this.exportBytes = 0; this.cacheLimits = cacheLimits; this.exportQueue = Promise.resolve(); this.closed = false;
     this.notification = (message) => this.observe(message);
     this.action = (action) => this.recordAction(action);
@@ -456,9 +458,16 @@ export class ActivityStore {
     const item = record?.item;
     if (view === 'media') {
       if (item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id)) throw new Error('Media item is unavailable.');
-      const { images, omitted } = collectImages(removeGuidance(item, this.controller.guidance));
+      let { images, omitted, truncated } = collectImages(removeGuidance(item, this.controller.guidance));
+      if (truncated && ['mcpToolCall', 'dynamicToolCall'].includes(item.type)) {
+        const recovered = await this.rolloutMedia.lookup(agent.threadId, turn_id, item_id);
+        if (recovered) {
+          const found = collectImages({ output: recovered });
+          if (found.images.length && !found.truncated) ({ images, omitted, truncated } = found);
+        }
+      }
       const batch = await Promise.all(images.slice(offset, offset + 8).map(image => materializeImage(image, (buffer, mime) => this.exportImage(buffer, mime), path => this.exportPreview(path))));
-      return { images: batch, count: images.length, next_offset: offset + 8 < images.length ? offset + 8 : null, ...(omitted ? { omitted: true, notice: 'Image scan reached its limit; additional images may not be listed.' } : {}) };
+      return { images: batch, count: images.length, next_offset: offset + 8 < images.length ? offset + 8 : null, ...(omitted ? { omitted: true, notice: truncated ? '原始图片数据已被截断，无法恢复完整图片。' : 'Image scan reached its limit; additional images may not be listed.' } : {}) };
     }
     if (view === 'communication') {
       if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id)) throw new Error('Communication item is unavailable.');

@@ -32,6 +32,7 @@ export async function materializeImage(source, save, convert) {
   } else {
     if (typeof source.data !== 'string') return fail('Image data is unavailable.');
     let encoded = source.data;
+    if (/…\d+ chars truncated…/.test(encoded)) return fail('原始图片数据已被截断，无法恢复完整图片。');
     const match = /^data:([^;,]+);base64,([\s\S]*)$/i.exec(encoded);
     if (match) { mime ||= match[1].toLowerCase(); encoded = match[2]; }
     if (!mime || !Object.values(mimeForExt).includes(mime)) return fail('Unsupported image format.');

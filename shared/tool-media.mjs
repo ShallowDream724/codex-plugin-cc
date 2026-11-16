@@ -17,7 +17,11 @@ export function serializedToolResult(value) {
     const content = parsed.content ?? parsed.contentItems;
     if (!Array.isArray(content) || !content.every(part => part && typeof part === 'object' && !Array.isArray(part) && typeof part.type === 'string')) return null;
     return { value: parsed };
-  } catch { return null; }
+  } catch {
+    // Native activity records can truncate a serialized result in the middle
+    // of a base64 field, leaving the inner JSON incomplete.
+    return /…\d+ chars truncated…/.test(trimmed) && /"(?:content|contentItems)"\s*:/.test(trimmed) && /"type"\s*:\s*"(?:image|input_image|inputImage|output_image|outputImage)"/.test(trimmed) ? { omitted: true } : null;
+  }
 }
 export function sanitizeMedia(value) {
   let nodes = 0;
@@ -35,7 +39,7 @@ export function sanitizeMedia(value) {
     }
     if (typeof field === 'string') {
       const parsed = serializedToolResult(field);
-      if (parsed?.omitted) return '[serialized image result omitted]';
+      if (parsed?.omitted) return '[图片结果已截断或超出显示限制]';
       if (parsed) return JSON.stringify(visit(parsed.value, depth + 1));
       return /^data:image\/[^,]*;base64,/i.test(field) ? '[image data omitted]' : field;
     }
@@ -60,7 +64,7 @@ export function sanitizeMedia(value) {
   return visit(value, 0);
 }
 export function collectImages(item) {
-  const images = []; let nodes = 0, omitted = false;
+  const images = []; let nodes = 0, omitted = false, truncated = false;
   const add = (source) => {
     if (images.length >= 256) { omitted = true; return; }
     images.push({ ...source, index: images.length });
@@ -68,6 +72,7 @@ export function collectImages(item) {
   function visit(value, depth = 0) {
     if (depth > 8 || ++nodes > 4096 || images.length >= 256) { omitted = true; return; }
     if (typeof value === 'string') {
+      if (/…\d+ chars truncated…/.test(value)) { truncated = true; omitted = true; }
       const parsed = serializedToolResult(value);
       if (parsed?.omitted) omitted = true;
       else if (parsed) visit(parsed.value, depth + 1);
@@ -78,6 +83,7 @@ export function collectImages(item) {
     if (isImageBlock(value)) {
       const url = value.image_url ?? value.imageUrl;
       const dataUrl = typeof url === 'string' ? url : url?.url;
+      if (typeof (value.data ?? value.base64 ?? dataUrl) === 'string' && /…\d+ chars truncated…/.test(value.data ?? value.base64 ?? dataUrl)) { truncated = true; omitted = true; }
       add({ data: value.data ?? value.base64 ?? dataUrl, mime: value.mimeType ?? value.mime_type ?? value.media_type, alt: value.alt ?? value.name });
       return;
     }
@@ -95,5 +101,5 @@ export function collectImages(item) {
       if (attachment?.type === 'image' && typeof attachment.path === 'string') add({ path: attachment.path, alt: attachment.name });
     }
   } else visit(item);
-  return { images, omitted };
+  return { images, omitted, truncated };
 }
