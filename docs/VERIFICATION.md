@@ -1,6 +1,18 @@
 # 验证记录
 
-## rc.22：通知与侧栏修复（2026-11-16，未安装）
+## rc.23：输入框入口与代理总列表（2026-11-17，未安装）
+
+只读 SDK 与实际 Desktop 渲染代码，确认 AbovePrompt 的组合方式、调查问卷让位、独立 state 订阅、pane 枚举及关闭契约。实际 Button 只显示 label，目录采用独立图标、名称按钮、时间和 Client 点击区域，不依赖 Button 内嵌布局。入口使用代码图标及紧凑计数，不向全局工具栏注入控件。
+
+完整测试 **477 项通过、2 项环境相关跳过**；随后目录分页边界、极长名称与 5,000 个代理的预算测试、返回/草稿/阅读位置、连续开关、迟到结果、停止命令及原有 UI 的专项复验 **61 项通过**。时间元数据覆盖持久化恢复、真实工作活动更新、查询/确认不改排序及旧记录未知时间。元数据/JavaScript 检查和实际 Claude Code 2.1.325 插件校验通过。日志为 `artifacts/rc23-full.log`、`rc23-directory-final.log`、`rc23-check.log`、`rc23-native-validation.log`。
+
+`work/rc23-directory-verification/verify.cjs` 用产品目录树及提取的原生 Box/Text 样式、Button、Svg 和 Client 占位在隔离 headless Edge 中检查 320/480px：长中英名称截断，图标和时间完整，行没有横向溢出。原生预算计数器验证每页最多 100 个条目低于字符、节点和深度上限；其余记录可分页到达。该探针没有运行完整宿主及 Client frame，不替代安装后的实际交互验收。
+
+仅修改开发目录并准备安装包，未覆盖 rc.22、未重启或操作 Claude、未发送实际模型请求、未发布 GitHub。
+
+## rc.22：通知与侧栏修复（2026-11-16；11-17 已本地安装）
+
+安装补记：用户确认 Astra 停止后明确授权安装 rc.22。本地版本目录、插件缓存和安装包的 102 个文件逐一核对一致；没有修改 `.claude.json` 或重启宿主，未发布 GitHub。下述“未安装”描述为开发验证当时的状态。
 
 只读实际 Claude Code 2.1.325：安全模块 `ro` 将 `classic.*` 越过个人插件，`hco` 生成用户看到的 skipped 提示；公开 `turn.step` 与 tool-result 事件不在该跳过规则中。`Xp` 在 `gi` 派发 step 之前已经复制消息并合并 arrived rows，因此把通知移到 step 开头仍然错误。响应结束后、工具结果 append 返回前才是可用边界；原生外围 through 会等 append 完成后才把工具结果交回 query loop。未改安全策略，也未用会影响工具 detach 的广泛 tool.call 钩子。
 

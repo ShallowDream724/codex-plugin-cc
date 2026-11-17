@@ -345,6 +345,7 @@ export class ActivityStore {
     return agent;
   }
   summary(a) { return { id: a.id, agent_id: a.id, name: a.name, status: a.status, activity: a.activity,
+    created_at_ms: a.createdAtMs ?? null, last_activity_at_ms: a.lastActivityAtMs ?? null,
     model: a.model, reasoning_effort: a.effort, context_source: a.contextSource ?? 'unknown',
     permissions_mode: this.controller.settings?.permissionsMode ?? null,
     context_used_tokens: Number.isSafeInteger(a.tokenUsage?.last?.totalTokens) && a.tokenUsage.last.totalTokens >= 0 ? a.tokenUsage.last.totalTokens : null,

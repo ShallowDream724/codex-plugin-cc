@@ -8,6 +8,7 @@ async function setup(respond) {
   const hooks = [], commands = [], tools = [], calls = [];
   register((...args) => hooks.push({ event: args[0], filter: args.length === 3 ? args[1] : {}, fn: args.at(-1) }));
   const $ = {
+    state: { get: async () => undefined, set: async () => ({ isSet: true }) },
     session: { id: async () => 'owner', cwd: async () => 'C:/work', messages: async () => [] },
     plugin: { root: 'C:/plugin' }, env: { get: async () => undefined },
     tool: { register: async spec => tools.push(spec) }, command: { register: async spec => commands.push(spec) },

@@ -9,10 +9,14 @@ import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs'
 import { nativeRenderBudget } from './render-budget.js';
 import { paneScroll } from './pane-scroll.js';
 import { planHistoryWindow } from './history-window.js';
+import { renderAgentDirectory } from './agent-directory.js';
 
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
+const ENTRY_REVISION = { plugin: 'codex-subagents', key: 'entryRevision' };
 let paneRevision = 0;
+let entryRevision = 0;
+let entrySignature = '';
 const MAX_DETAILS = 16;
 // Candidate safety cap only; actual visible content is chosen by render cost.
 const VISIBLE_ENTRIES = 400;
@@ -23,7 +27,8 @@ let copyIntent = 0;
 const copyLabels = { pending: '正在复制…', copied: '已复制', failed: '复制失败，请重试' };
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
-const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status'].filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
+const summaryFields = ['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status', 'created_at_ms', 'last_activity_at_ms'];
+const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(summaryFields.filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
 const detailKey = (entry, filePath, view) => JSON.stringify([entryKey(entry), filePath ?? null, ...(view ? [view] : [])]);
 const detailFor = (page, entry, filePath, view) => page.details.get(detailKey(entry, filePath, view));
@@ -147,8 +152,13 @@ export function groupEntries(entries) {
 
 // The caller feeds its existing low-frequency observe result to observeUI.
 // There are no session hooks, model calls, or delivery acknowledgements here.
-const state = { agents: [], selected: null, requested: null, error: '', opened: false, timer: null, pages: new Map(), controls: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
-const mergeSummaries = (agents) => summaries(agents).map((agent) => ({ ...state.agents.find((previous) => idOf(previous) === idOf(agent)), ...agent }));
+const state = { agents: [], selected: null, requested: null, view: 'agent', error: '', opened: false, timer: null, pages: new Map(), controls: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
+const directory = { openOffset: 0, completedOffset: 0, offset: 0, loading: false, error: '', request: null, minute: 0, restore: null, actions: new Map() };
+let toggleQueue = Promise.resolve();
+const mergeSummaries = (agents) => {
+  const previous = new Map(state.agents.map(agent => [idOf(agent), agent]));
+  return summaries(agents).map(agent => ({ ...previous.get(idOf(agent)), ...agent }));
+};
 const failureText = (error) => safe(error?.message || error?.error?.message || error?.error || (typeof error === 'string' ? error : JSON.stringify(error)) || '连接未返回有效响应').slice(0, 400);
 function mergeLive(page, entries, prepend = false) {
   const positions = new Map(page.live.map((entry, index) => [entryKey(entry), index]));
@@ -378,7 +388,7 @@ function updateAgent(id, fields) {
   const agent = state.agents.find((a) => idOf(a) === id);
   if (!agent) return false;
   let changed = false;
-  for (const key of ['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status']) {
+  for (const key of summaryFields) {
     if (Object.hasOwn(fields, key) && agent[key] !== fields[key]) { agent[key] = fields[key]; changed = true; }
   }
   return changed;
@@ -477,6 +487,64 @@ async function chooseAttachments($, id, source = 'file') {
     // Reading this key in the pane renderer subscribes only that render site.
     // Event-wide invalidation also rebuilds the host conversation's tool rows.
     return $.state.set(PANE_REVISION, ++paneRevision).catch(() => {});
+  }
+  function invalidateEntry($) {
+    const signature = `${state.opened}:${state.agents.length}`;
+    if (signature === entrySignature) return Promise.resolve();
+    entrySignature = signature;
+    return $.state.set(ENTRY_REVISION, ++entryRevision).catch(() => {});
+  }
+  function stopPane() {
+    state.opened = false; state.imagePreview = null; state.generation++;
+    state.timer?.cancel(); state.timer = null; directory.request = null; directory.loading = false; directory.restore = null;
+    for (const page of state.pages.values()) { cancelNavigation(page); page.tailRequest = null; }
+  }
+  function startPanePolling($) {
+    if (!state.timer) state.timer = $.clock.every(1000, () => (state.view === 'directory' ? refreshDirectory($) : poll($)).catch(() => {}));
+  }
+  async function refreshDirectory($) {
+    if (!state.opened || state.view !== 'directory' || directory.request) return;
+    const request = { generation: state.generation }; directory.request = request;
+    try {
+      const result = await bridge($, 'ui_list', {});
+      if (directory.request !== request || !state.opened || state.view !== 'directory' || request.generation !== state.generation) return;
+      if (result.error || result.offline || !Array.isArray(result.agents)) throw new Error(failureText(result));
+      const before = JSON.stringify(state.agents);
+      const dirty = directory.loading || directory.error || directory.minute !== Math.floor(Date.now() / 60000);
+      directory.loading = false; directory.error = ''; directory.minute = Math.floor(Date.now() / 60000);
+      await observeUI($, result);
+      if (dirty && before === JSON.stringify(state.agents)) await invalidate($);
+    } catch (error) {
+      if (directory.request !== request || request.generation !== state.generation) return;
+      const message = failureText(error), dirty = directory.loading || directory.error !== message;
+      directory.loading = false; directory.error = message;
+      if (dirty) await invalidate($);
+    } finally { if (directory.request === request) directory.request = null; }
+  }
+  export async function openDirectory($) {
+    const previous = state.pages.get(state.selected); if (previous) { cancelNavigation(previous); previous.tailRequest = null; }
+    state.opened = true; state.view = 'directory'; state.selected = null; state.requested = null; state.restore = false; state.imagePreview = null;
+    const generation = ++state.generation;
+    directory.request = null; directory.loading = true; directory.error = '';
+    directory.restore = { token: ++navigationSequence, generation, offset: directory.offset };
+    await invalidateEntry($); await invalidate($);
+    await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
+    if (!state.opened || state.generation !== generation) return;
+    startPanePolling($);
+    // Open with cached summaries immediately; fetching never holds the click.
+    void refreshDirectory($);
+  }
+  function toggleDirectory($) {
+    const toggle = async () => {
+      const panes = await $.ui.panes();
+      if (panes.some(pane => pane.id === PANE)) {
+        const result = await $.ui.close({ id: PANE });
+        if (!result?.deny) { stopPane(); await invalidateEntry($); }
+      } else await openDirectory($);
+    };
+    const operation = toggleQueue.then(toggle);
+    toggleQueue = operation.catch(() => {});
+    return operation.catch(() => { $.ui.toast('无法切换 Codex 侧栏，请重试。'); });
   }
   async function latestHistory($, id) {
     const page = pageFor(id), gen = state.generation, historyGen = page.historyGeneration;
@@ -658,6 +726,8 @@ async function chooseAttachments($, id, source = 'file') {
     } finally { state.restoringPreview = false; }
   }
   export async function openAgent($, id) {
+    directory.request = null; directory.restore = null;
+    state.view = 'agent';
     state.opened = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
     try {
       const list = await bridge($, 'ui_list', {});
@@ -666,6 +736,7 @@ async function chooseAttachments($, id, source = 'file') {
       state.agents = mergeSummaries(list.agents);
     } catch (error) { state.error = `无法读取代理列表：${failureText(error)}。请重试。`; }
     if (!state.opened || state.generation !== gen) return;
+    await invalidateEntry($);
     const selected = id ? state.agents.find((agent) => idOf(agent) === id) : [...state.agents].reverse().find(active) || state.agents.at(-1);
     if (selected) await select($, idOf(selected));
     else { state.selected = null; if (!state.error) state.error = id ? '未找到此代理。请重新读取代理列表。' : '当前会话没有可打开的 Codex 代理。'; await invalidate($); }
@@ -676,7 +747,7 @@ async function chooseAttachments($, id, source = 'file') {
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
     if (state.restore) await scrollPane($, { to: 'start' }).catch(() => {});
     else await requestTail($, state.selected, true);
-    if (!state.timer) state.timer = $.clock.every(1000, () => poll($).catch(() => {}));
+    startPanePolling($);
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false, view) {
     const page = pageFor(id), key = detailKey(entry, filePath, view), gen = state.generation, historyGen = page.historyGeneration, request = ++page.detailSequence;
@@ -780,27 +851,21 @@ async function chooseAttachments($, id, source = 'file') {
 export function registerUI(on) {
   on('command.run', { command: 'codex-stop' }, async ($) => stopAllAgents($));
   on('command.run', { command: 'codex-agents' }, async ($) => {
-    try {
-      const result = await bridge($, 'ui_list', {});
-      if (result.error || result.offline) { $.ui.toast('无法获取 Codex 代理。'); return {}; }
-      const agents = Array.isArray(result.agents) ? result.agents : [];
-      if (!agents.length) { $.ui.toast('当前会话没有 Codex 代理。'); return {}; }
-      state.agents = mergeSummaries(agents);
-      const selected = agents.find((agent) => idOf(agent) === state.selected)
-        || [...agents].reverse().find((agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent.status))
-        || agents.at(-1);
-      await openAgent($, idOf(selected));
-    } catch { $.ui.toast('无法获取 Codex 代理。'); }
+    await openDirectory($);
     return {};
   });
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; for (const page of state.pages.values()) { page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel(); } }
+    if (e.id === PANE) { stopPane(); await invalidateEntry($); }
     return next(e);
   });
   on('ui.scroll', { requestId: PANE }, ($, e, next) => {
     // Claude suppresses the registration that raised a nested event. Programmatic
     // measurements must therefore be observed by a DIFFERENT registration below.
     if (e.origin.kind !== 'person') return next(e);
+    if (state.view === 'directory') {
+      if (!directory.restore) directory.offset = e.offset;
+      return next(e);
+    }
     if (state.imagePreview || state.restoringPreview) return next(e);
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
@@ -858,6 +923,11 @@ export function registerUI(on) {
     return next(e);
   });
   on('ui.scroll', { requestId: PANE, origin: { kind: 'plugin' } }, ($, e, next) => {
+    if (state.view === 'directory') {
+      const offset = directory.restore?.offset ?? e.offset;
+      directory.offset = offset;
+      return next({ ...e, offset });
+    }
     const id = state.selected, page = id && pageFor(id);
     if (!page) return next(e);
     const transfer = state.programmaticScroll;
@@ -874,12 +944,26 @@ export function registerUI(on) {
     return next(e);
   });
   on('ui.press', { requestId: PANE }, async ($, e, next) => {
-    const action = state.opened && state.controls.get(state.selected)?.navigationActions?.get(e.element);
+    const action = state.opened && (state.view === 'directory' ? directory.actions.get(e.element) : state.controls.get(state.selected)?.navigationActions?.get(e.element));
     // Run navigation under this registered frame, rather than the Button's raw
     // callback origin (which suppresses every hook owned by this plugin).
     return action ? (await action(), {}) : next(e);
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
+    if (state.opened && state.view === 'directory' && e.data?.action === 'open-agent' && e.element?.startsWith('directory_hit_')) {
+      const id = e.element.slice('directory_hit_'.length);
+      if (state.agents.some(agent => idOf(agent) === id)) await openAgent($, id);
+      return {};
+    }
+    if (state.opened && state.view === 'directory' && e.element === 'codex_directory_sync') {
+      const request = directory.restore;
+      if (e.data?.action !== 'navigate' || !request || e.data.token !== request.token) return {};
+      await refreshPaneGeometry($, directory);
+      if (state.view !== 'directory' || directory.restore !== request || state.generation !== request.generation) return {};
+      await $.ui.scroll({ in: PANE, to: 'start' });
+      if (directory.restore === request) { directory.restore = null; await invalidate($); }
+      return {};
+    }
     if (!state.opened || !state.selected) return next(e);
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'edge') {
       const id = state.selected, page = pageFor(id), generation = state.generation;
@@ -945,9 +1029,48 @@ export function registerUI(on) {
     await $.state.get(PANE_REVISION);
     return renderPane($, e, next);
   });
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const inherited = await next(e);
+    if (e.props?.hasSurvey) return inherited;
+    await $.state.get(ENTRY_REVISION);
+    const { Box, Button, Svg, Client } = $.ui.resolve(e);
+    const icon = typeof Svg === 'function' && e.surface === 'desktop';
+    const label = `Codex·${state.agents.length}`;
+    return Box({ flexDirection: 'column', children: [inherited, Box({ flexDirection: 'row', children: [
+      Box({ key: 'codex_directory_entry', flexDirection: 'row', alignItems: 'center', gap: 'xs', paddingX: 0.5, hover: { backgroundColor: 'rgba(128,128,128,0.12)' }, ...(state.opened ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}), children: [
+        ...(icon ? [Box({ position: 'relative', width: 2, height: 1, children: [
+          Svg({ key: 'codex_entry_icon', source: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><path d="m8 6-6 6 6 6m8-12 6 6-6 6M14 3l-4 18" fill="none" stroke="#888" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>', alt: 'Codex', width: 16, height: 16 }),
+          ...(typeof Client === 'function' ? [Box({ position: 'absolute', top: 0, left: 0, children: [Client({ key: 'codex_entry_icon_toggle', module: './icon-control.js', props: { action: 'toggle-directory', expanded: state.opened }, height: 1, width: 2 })] })] : []),
+        ] })] : []),
+        Button({ key: 'codex_directory_toggle', plain: true, label: icon ? label : `◇ ${label}`, onPress: () => toggleDirectory($) }),
+      ] }),
+    ] })] });
+  });
+  on('ui.message', async ($, e, next) => {
+    if (e.element === 'codex_entry_icon_toggle' && e.data?.action === 'toggle-directory') { await toggleDirectory($); return {}; }
+    return next(e);
+  });
 }
 function renderPane($, e, next) {
     if (e.requestId !== PANE) return next(e);
+    if (state.view === 'directory') {
+      const ui = $.ui.resolve(e), { Box, Client } = ui;
+      directory.surface = e.surface; directory.actions.clear();
+      if (typeof Client !== 'function') directory.restore = null;
+      const onPage = async (group, offset) => {
+        directory[group === 'open' ? 'openOffset' : 'completedOffset'] = Math.max(0, offset);
+        directory.offset = 0;
+        directory.restore = { token: ++navigationSequence, generation: state.generation, offset: 0 };
+        await invalidate($);
+      };
+      const onRetry = async () => { directory.error = ''; directory.loading = true; await invalidate($); await refreshDirectory($); };
+      for (const agent of state.agents) directory.actions.set(`directory_open_${idOf(agent)}`, () => openAgent($, idOf(agent)));
+      directory.actions.set('directory_retry', onRetry);
+      return Box({ key: 'codex_directory', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'sm', children: [
+        ...(typeof Client === 'function' && directory.restore ? [Box({ position: 'absolute', top: Math.max(0, e.props?.scroll?.offset || 0), left: 0, width: 1, height: 1, children: [Client({ key: 'codex_directory_sync', module: './navigation-sync.js', props: { token: directory.restore.token }, width: 1, height: 1 })] })] : []),
+        renderAgentDirectory(ui, { agents: state.agents, surface: e.surface, columns: e.props?.bodyColumns, openOffset: directory.openOffset, completedOffset: directory.completedOffset, loading: directory.loading, error: directory.error, onOpen: id => openAgent($, id), onPage, onRetry }),
+      ] });
+    }
     // A native scroll already schedules a render. Reuse the entire transcript
     // and handler tree on those frames; only the small overlay wrapper moves.
     // No scroll timer, state write, Markdown parsing or list regrouping here.
@@ -1069,6 +1192,9 @@ function renderPane($, e, next) {
     const rawEffort = displayLabel(selected?.reasoning_effort, 64);
     const effort = rawEffort ? rawEffort[0].toUpperCase() + rawEffort.slice(1) : '';
     const model = [friendlyModel, effort].filter(Boolean).join(' · ');
+    const backToDirectory = () => openDirectory($);
+    control.navigationActions.set('codex_back_directory', backToDirectory);
+    navigation.push(Button({ key: 'codex_back_directory', plain: true, label: '‹ 代理列表', onPress: backToDirectory }));
     navigation.push(Box({ key: `codex_title_row_${id}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [agentMark(`codex_title_icon_${id}`, id), Text({ key: `codex_title_${id}`, size: 'body', weight: 'semibold', children: [safe(agentDisplayName(selected.name || 'Codex'))] })] }));
     const sourceLabel = ({ new: '新建', claude: '继承 Claude', codex: 'Codex 历史', unknown: '来源未记录' })[selected.context_source];
     if (sourceLabel) navigation.push(caption(`codex_origin_${id}`, sourceLabel));
@@ -1315,7 +1441,8 @@ function renderPane($, e, next) {
     const context = contextIndicator(used, limit);
     const paste = hint(`codex_paste_hover_${id}`, Button({ key: `codex_paste_${id}`, plain: true, dimColor: true, label: '📎︎', onPress: control.actions.paste }), '粘贴图片或文件');
     const attach = hint(`codex_attach_hover_${id}`, Button({ key: `codex_attach_${id}`, plain: true, dimColor: true, label: control.picking ? '…' : '+', onPress: control.actions.attach }), '添加文件', 12);
-    const left = [Box({ key: `codex_attachment_actions_${id}`, flexDirection: 'row', alignItems: 'center', gap: 0, children: [attach, paste] }), ...(permission ? [caption(`codex_permissions_${id}`, permission)] : [])];
+    control.navigationActions.set('codex_back_directory_footer', backToDirectory);
+    const left = [Button({ key: 'codex_back_directory_footer', plain: true, dimColor: true, label: '‹ 列表', onPress: backToDirectory }), Box({ key: `codex_attachment_actions_${id}`, flexDirection: 'row', alignItems: 'center', gap: 0, children: [attach, paste] }), ...(permission ? [caption(`codex_permissions_${id}`, permission)] : [])];
     const stopping = canStop && !control.draft.trim() && !control.attachments.length;
     const disabled = control.stopping || stopStatus === 'stopping' || (!stopping && (control.sending || (!control.draft.trim() && !control.attachments.length)));
     const action = e.surface === 'desktop' && typeof Client === 'function' ? Client({ key: `codex_action_${id}`, module: './action-control.js', width: 3, height: 2, props: { mode: stopping ? 'stop' : 'send', disabled, label: stopStatus === 'stopping' ? '正在停止' : stopping ? '停止' : '发送' } }) : Button({ key: `codex_action_${id}`, plain: true, label: control.sending || control.stopping || stopStatus === 'stopping' ? '…' : stopping ? '■' : '↑', onPress: control.actions.activate });
@@ -1425,11 +1552,12 @@ function renderPane($, e, next) {
     page.renderCache = { key: frameKey, draft: control.draft, draw: scroll => root(content, scroll) };
     return tree;
 }
-export function closeUI() { state.opened = false; state.imagePreview = null; state.generation++; state.timer?.cancel(); state.timer = null; for (const page of state.pages.values()) { page.scroller?.cancel(); page.browseTimer?.cancel(); } state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.error = ''; clearIcons(); }
+export function closeUI() { stopPane(); state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.view = 'agent'; state.error = ''; entrySignature = ''; directory.openOffset = 0; directory.completedOffset = 0; directory.offset = 0; directory.error = ''; directory.actions.clear(); clearIcons(); }
 export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);
     state.agents = mergeSummaries(result.agents);
+    await invalidateEntry($);
     const ids = new Set(state.agents.map(idOf));
     retainIcons([...ids], state.agents.filter((agent) => active(agent) || agent.status === 'unknown').map(idOf));
     for (const id of state.controls.keys()) if (!ids.has(id)) state.controls.delete(id);

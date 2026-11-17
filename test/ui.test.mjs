@@ -89,7 +89,7 @@ test('mixed rich text keeps native Markdown structure and fenced language labels
   assert.ok(!calls.includes('ui_detail'), 'ordinary rich text requires no per-format detail fetch');
 });
 
-test('keyboard command opens an agent without submitting a prompt or mutating work', async () => {
+test('keyboard command opens the directory without reading transcripts or mutating work', async () => {
   const hooks = [], calls = [], notices = []; let agents = [];
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { ui: { toast: (s) => notices.push(s), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
@@ -102,12 +102,13 @@ test('keyboard command opens an agent without submitting a prompt or mutating wo
   closeUI(); registerUI(on);
   const command = hooks.find((h) => h.event === 'command.run' && h.matcher.command === 'codex-agents').fn;
   assert.deepEqual(await command($, {}, () => { throw new Error('must not call next'); }), {});
-  assert.match(notices[0], /没有 Codex 代理/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notices.length, 0);
   agents = [{ agent_id: 'a', name: 'Agent', status: 'running' }];
   assert.deepEqual(await command($, {}, () => { throw new Error('must not call next'); }), {});
   await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(calls.includes('ui_revision'));
-  assert.ok(calls.every((op) => ['ui_list', 'ui_history', 'ui_revision'].includes(op)));
+  assert.ok(calls.includes('ui_list'));
+  assert.ok(calls.every((op) => op === 'ui_list'));
   assert.equal($.prompt, undefined);
   closeUI();
 });
@@ -628,7 +629,7 @@ test('agents have independent entries and polling ends when pane closes', async 
   closeUI(); connect($, bridge); registerUI(on);
   observeUI($, { agents: [{ agent_id: 'a', name: 'a very long name '.repeat(10), status: 'running' }, { agent_id: 'b', name: 'b', status: 'completed' }] });
   const render = (componentName) => hooks.find((h) => h.event === 'ui.render' && h.matcher.component === componentName).fn;
-  assert.equal(hooks.some((h) => h.matcher.component === 'AbovePrompt'), false);
+  assert.equal(hooks.some((h) => h.matcher.component === 'AbovePrompt'), true);
   await openAgent($, 'a');
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(timers[0].ms, 1000);

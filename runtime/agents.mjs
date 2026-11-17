@@ -24,6 +24,7 @@ function storedContextSource(a) {
 }
 const copy = (x) => structuredClone(x);
 const input = (text) => [{ type: 'text', text }];
+const now = () => Date.now();
 const isOverflow = (error) => error?.codexErrorInfo === 'contextWindowExceeded' || error?.code === 'contextWindowExceeded';
 const roleConfig = (role) => role === 'default' ? { 'features.default_mode_request_user_input': false, 'features.multi_agent': false, 'features.multi_agent_v2': false, 'features.image_generation': false } : undefined;
 
@@ -196,6 +197,7 @@ export class AgentController extends EventEmitter {
   }
 
   action(kind, a, message, origin, attachments, turnId = a.turnId ?? null) {
+    if (kind === 'send' || kind === 'interrupt') { a.lastActivityAtMs = now(); this.persist().catch(() => {}); this.emit('state'); }
     this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: turnId, name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }), ...(attachments?.length ? { attachments: copy(attachments) } : {}) });
   }
 
@@ -228,7 +230,8 @@ export class AgentController extends EventEmitter {
       throw new Error('context_mode available requires a validated snapshot.');
     }
     const reservation = Symbol('spawn'); this.reserve(reservation);
-    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, role, contextSource: context_mode === 'available' ? 'claude' : 'new', status: 'starting', activity: 'starting',
+    const createdAtMs = now();
+    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, role, createdAtMs, lastActivityAtMs: createdAtMs, contextSource: context_mode === 'available' ? 'claude' : 'new', status: 'starting', activity: 'starting',
       pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: true, recoveryUsed: false, interrupted: false, spawning: true };
     this.agents.set(a.id, a);
     this.reservations.delete(reservation);
@@ -429,7 +432,8 @@ export class AgentController extends EventEmitter {
       if (!['idle', 'notLoaded'].includes(thread.status?.type)) throw new Error(`Native thread status is ${thread.status?.type ?? 'unknown'}; active or unconfirmed external threads cannot be adopted.`);
       const clientTools = await externalClientTools(thread);
       if (this.stopAllInProgress || this.stopAllEpoch !== stopAllEpoch) throw new Error('A user stop-all action interrupted adoption; retry afterward.');
-      const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, contextSource: 'codex', status: 'interrupted', activity: 'adopted',
+      const createdAtMs = now();
+      const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, createdAtMs, lastActivityAtMs: createdAtMs, contextSource: 'codex', status: 'interrupted', activity: 'adopted',
         pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: false, recoveryUsed: false, interrupted: false, terminalEmitted: true, adopting: true, externalAdopted: true, externalThread: true };
       if (this.pausedThreads.has(id)) { a.userPaused = true; a.userControlStatus = 'stopped'; a.interrupted = true; }
       this.updateResolved(a, { thread });
@@ -481,6 +485,7 @@ export class AgentController extends EventEmitter {
         const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: wireInput });
         if (origin === 'user') { a.turnOrigin = 'user'; a.pendingUserSteer = null; await this.persist(); this.emit('state'); }
         this.action('send', a, message, origin, attachments);
+        await this.persist();
         return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
       } catch (error) {
         if (a.pendingUserSteer) {
@@ -514,10 +519,12 @@ export class AgentController extends EventEmitter {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
           items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
         this.action('send', a, message, origin, attachments);
+        await this.persist();
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
       await this.startTurn(a, wireInput, true, origin === 'user' ? 'user' : 'parent');
       this.action('send', a, message, origin, attachments);
+      await this.persist();
       return this.view(a);
     } finally { a.resuming = false; if (a.interrupted) this.stopTree(a).catch(() => {}); }
   }
@@ -797,6 +804,7 @@ export class AgentController extends EventEmitter {
 
   observeDescendant(a, message, p) {
     if (!['turn/started', 'turn/completed', 'serverRequest/resolved'].includes(message.method)) return;
+    if (message.method !== 'serverRequest/resolved') a.lastActivityAtMs = now();
     const sourceId = this.threadId(p);
     if (message.method === 'turn/started') this.descendantTurns.set(sourceId, p.turn.id);
     if (message.method === 'turn/completed') {
@@ -900,9 +908,12 @@ export class AgentController extends EventEmitter {
         this.pruneRequestEvents(a);
         if (!a.pending.length && a.status === 'waiting') a.status = 'running';
         break;
-      case 'turn/completed': this.turnCompleted(a, p.turn); break;
+      case 'turn/completed':
+        if (!p.turn?.id || a.completedTurns.has(p.turn.id) || a.turnId && a.turnId !== p.turn.id || a.terminalEmitted && a.turnId !== p.turn.id) return;
+        this.turnCompleted(a, p.turn); break;
       default: return;
     }
+    if (['turn/started', 'turn/completed', 'item/started', 'item/completed', 'thread/compacted', 'error'].includes(message.method)) a.lastActivityAtMs = now();
     this.persist().catch(() => {});
   }
 
@@ -948,6 +959,7 @@ export class AgentController extends EventEmitter {
 
   finish(a, kind, details) {
     if (a.terminalEmitted) return;
+    a.lastActivityAtMs = now();
     a.terminalEmitted = true;
     a.status = kind; a.activity = kind; a.turnId = null; a.recovery = null;
     // Descendants can outlive the root turn. Their wire IDs remain answerable
@@ -992,7 +1004,7 @@ export class AgentController extends EventEmitter {
     }
     if (message.method === 'item/tool/call' && p.tool === 'notify_parent') {
       const valid = nonempty(p.arguments?.message);
-      if (valid && direct) this.publish(a, 'message', { message: p.arguments.message });
+      if (valid && direct) { a.lastActivityAtMs = now(); this.publish(a, 'message', { message: p.arguments.message }); }
       await this.client.respond(message.id, { contentItems: [{ type: 'inputText', text: valid ? direct ? 'Delivered to parent.' : 'Report this blocker to your Codex parent agent.' : 'A nonempty message is required.' }], success: valid });
       return;
     }
@@ -1006,6 +1018,7 @@ export class AgentController extends EventEmitter {
     }
     if (direct && !a.turnId && p.turnId) a.turnId = p.turnId;
     a.pending.push({ id, wireId: message.id, method: message.method, params: copy(p) });
+    a.lastActivityAtMs = now();
     if (ACTIVE.has(a.status)) a.status = 'waiting';
     a.activity = `${direct ? '' : 'subagent '}waiting for parent ${kind}`;
     this.publish(a, kind, { method: message.method, ...copy(p), request_id: id,
@@ -1026,6 +1039,7 @@ export class AgentController extends EventEmitter {
     try { await this.client.respond(pending.wireId, result); }
     catch (error) { pending.responding = false; throw error; }
     a.pending = a.pending.filter((r) => r !== pending);
+    a.lastActivityAtMs = now();
     this.pruneRequestEvents(a);
     if (!a.pending.length) {
       if (a.status === 'waiting') a.status = 'running';
@@ -1076,7 +1090,7 @@ export class AgentController extends EventEmitter {
       this.persistScheduled = null;
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
       id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
-      activity: a.activity, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
+      activity: a.activity, createdAtMs: a.createdAtMs, lastActivityAtMs: a.lastActivityAtMs, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
       snapshot: a.snapshot, injected: a.injected, contextSource: a.contextSource, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus,
     })) };
       return (async () => {

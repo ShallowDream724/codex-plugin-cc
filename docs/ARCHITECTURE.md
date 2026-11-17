@@ -16,6 +16,14 @@
 
 `runtime/delivery.mjs` 管理单批交付租约、正文校验和精确确认；`hooks/delivery.js` 仅从宿主最终保留消息中识别本插件交付，兼容裸信封及 Claude 为本插件添加的两种精确固定包装（轮间、轮内）。不扫描任意嵌套 JSON；回执仍核对交付 ID 和完整事件内容。主界面通知行复用同一解析器。`runtime/receipts.mjs` 用单个动作对应单个原子文件保存回执，启动时迁移旧 `receipts.json`，不全量加载已有回执。
 
+## 代理目录入口
+
+`AbovePrompt` 组合 `next(e)` 的现有树和紧凑 Codex 入口，调查问卷期间让出区域。计数和开关状态读取独立 `entryRevision`，对话绘制仍只订阅 `paneRevision`；流式输出不重绘入口。开关串行执行，并以 `$.ui.panes()` 为准，兼容宿主保留 pane 的模块重载。关闭保留代理缓存及草稿，停止目录/对话轮询；不暂停模型。
+
+`hooks/agent-directory.js` 负责纯分组、排序、相对时间、Unicode 名称截断及公开组件布局。只展示当前 Claude 会话直接登记、未清理的代理；终态放在「完成」，未知状态明确标注，归入「已开启」。两组独立每页 50 条，目录仅请求摘要，不加载所有代理的历史。目录刷新单请求在途，无变化不重绘；旧响应不能覆盖新选择。返回保存列表页码/偏移、各代理草稿/历史/阅读位置。顶部和输入区均提供返回列表。
+
+控制器持久保存 `createdAtMs` / `lastActivityAtMs`，UI 摘要输出 `created_at_ms` / `last_activity_at_ms`。创建、采用、通信、轮次及工具生命周期、提问与答复更新活动时间；轮询、查看及交付确认不改变顺序。旧登记缺失时间时保留 `null`，不会把重启或查看时间当成活动。模型的 `list_agents` 契约不增加这些展示字段。
+
 ## 初始历史
 
 顺序固定为 `thread/start` → `thread/inject_items` → `turn/start`。只在新线程注入一次。没有使用内部专用的 `thread/resume.history`，也没有借用会遍历整个源文件、截短工具内容的外部会话导入器。
