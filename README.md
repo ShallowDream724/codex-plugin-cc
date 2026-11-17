@@ -4,7 +4,7 @@
 
 仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
-当前开发候选版为 **0.2.0-rc.23**，新增输入框上方的 Codex 入口和代理总列表。rc.22 已按用户要求本地安装；rc.23 尚未覆盖安装，待安排安装及验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
+当前开发候选版为 **0.2.0-rc.23**，新增输入框上方的 Codex 入口和代理总列表。已按用户要求本地安装，等待实际验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 
