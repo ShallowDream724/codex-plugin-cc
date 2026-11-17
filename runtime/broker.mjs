@@ -78,7 +78,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       if (args.lease_id) await delivery.renew(args.lease_id);
       const listed = await controller.dispatch('list_agents', {});
       const batch = args.deliver && !waiting ? await delivery.claim({ channel: 'prompt' }) : { events: [] };
-      return { ...listed, ...(batch.busy ? { events: [], delivery_pending: true } : batch), waiting };
+      return { ...listed, ...(activity ? activity.list() : {}), ...(batch.busy ? { events: [], delivery_pending: true } : batch), waiting };
     }
     if (operation === 'wait') {
       if (args.timeout_ms !== undefined && (!Number.isSafeInteger(args.timeout_ms) || args.timeout_ms < 0 || args.timeout_ms > 25000)) throw new Error('Wait timeout_ms must be an integer from 0 to 25000.');
@@ -163,6 +163,13 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     const done = new Promise(resolve => { finished = resolve; });
     requests.add(done);
     res.on('close', () => { if (!res.writableEnded) aborter.abort(); });
+    let body;
+    const withSummary = result => {
+      if (body?.ui_summary === true && activity) {
+        try { return { ...result, ui_summary: activity.list() }; } catch { /* UI failure cannot change an action result. */ }
+      }
+      return result;
+    };
     try {
       const chunks = []; let length = 0;
       for await (const chunk of req) {
@@ -172,10 +179,11 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
         }
         chunks.push(chunk);
       }
-      const result = await dispatch(JSON.parse(Buffer.concat(chunks).toString('utf8')), aborter.signal);
-      if (!res.destroyed) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); }
+      body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const result = await dispatch(body, aborter.signal);
+      if (!res.destroyed) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(withSummary(result))); }
     } catch (error) {
-      if (!res.destroyed) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: errorBody(error) })); }
+      if (!res.destroyed) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(withSummary({ error: errorBody(error) }))); }
     } finally {
       aborters.delete(aborter); requests.delete(done); finished();
     }

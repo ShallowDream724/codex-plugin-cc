@@ -19,6 +19,7 @@ const TOOLS = [
 ];
 
 let active = false;
+let activityEpoch = 0;
 let waiters = 0;
 let observing = false;
 let notificationPending;
@@ -116,7 +117,7 @@ function toolArgs(e, operation) {
 
 async function handle($, e, next, operation) {
   try {
-    active = true;
+    active = true; activityEpoch++;
     if (operation === 'wait_agent') {
       if (e.timeout_ms !== undefined && (!Number.isSafeInteger(e.timeout_ms) || e.timeout_ms < 0 || e.timeout_ms > 3600000)) throw new Error('timeout_ms must be an integer from 0 to 3600000.');
       const deadline = e.timeout_ms === undefined ? Infinity : Date.now() + e.timeout_ms;
@@ -140,7 +141,12 @@ async function handle($, e, next, operation) {
     const args = toolArgs(e, operation);
     const context = operation === 'spawn_agent' && args.context_mode === 'available' ? await capture($, e) : undefined;
     if (operation === 'spawn_agent' && !args.cwd) args.cwd = await $.session.cwd();
-    const result = await bridge($, operation, args, { requestId: e.tool_use_id, ...(context ? { context } : {}) });
+    const response = await bridge($, operation, args, { requestId: e.tool_use_id, ui_summary: true, ...(context ? { context } : {}) });
+    const { ui_summary, ...result } = response;
+    // The summary travels with the action response, without another bridge or
+    // coupling UI freshness to notification delivery. Never send it to Claude.
+    if (ui_summary) await observeUI($, ui_summary).catch(() => {});
+    else if (operation === 'list_agents') await observeUI($, result).catch(() => {});
     if (operation === 'close_agent' && !result.error) {
       if (typeof result.agent_id === 'string') closedAgents.add(result.agent_id);
       for (const id of result.closed_ids || []) closedAgents.add(id);
@@ -153,6 +159,7 @@ async function handle($, e, next, operation) {
 
 async function observe($, atBoundary = false, signal) {
   if (!active || observing) return;
+  const epoch = activityEpoch;
   observing = true;
   try {
     void wake($);
@@ -162,9 +169,9 @@ async function observe($, atBoundary = false, signal) {
     const pendingDelivery = notificationPending || deliveries.keys().next().value;
     const deliver = !signal?.aborted && !pausedAfterStop && !wakePending && !waking && !waiters && !pendingDelivery && (!busyTurns.size || Boolean(atBoundary));
     const result = await bridge($, 'observe', { deliver, ...(pendingDelivery ? { lease_id: pendingDelivery } : {}) });
-    if (result.offline) { active = false; return; }
+    if (result.offline) { if (epoch === activityEpoch) active = false; return; }
     if (result.error) return;
-    await observeUI($, result);
+    if (epoch === activityEpoch) await observeUI($, result);
     if (result.events?.length && result.delivery_id) {
       // Recheck after the async bridge: a tool wait may have started meanwhile.
       if (signal?.aborted || pausedAfterStop || wakePending || waking || waiters || notificationPending || deliveries.size || (busyTurns.size && (!atBoundary || [...busyTurns].some(turn => !atBoundary.has(turn))))) { await release($, result.delivery_id); return; }
@@ -240,7 +247,7 @@ export function register(on, options = {}) {
   registerUI(on);
   registerRows(on);
   on('session.start', async ($, e, next) => {
-    active = true; // Observe an existing session helper once; observation never starts one.
+    active = true; activityEpoch++; // Observe existing helpers; never start one.
     for (const tool of TOOLS) await $.tool.register(tool); // ToolSearch controls deferral.
     // Recover only retained deliveries in the current API window, once per startup.
     const retained = scanRetainedDeliveries(await $.session.messages({ as: 'api' }));
@@ -299,7 +306,7 @@ export function register(on, options = {}) {
   on('session.end', async ($, e, next) => {
     closeUI();
     if (active) await bridge($, 'shutdown').catch(() => {});
-    active = false;
+    active = false; activityEpoch++;
     return next(e);
   });
   on('tool.call', { tool: 'mcp__codex-subagents__spawn_agent' }, ($, e, next) => handle($, e, next, 'spawn_agent'));

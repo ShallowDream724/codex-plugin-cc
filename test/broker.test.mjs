@@ -55,6 +55,35 @@ test('UI reads never claim or confirm Claude events, even with extraneous restor
   assert.equal(wait.body.events.length, 1);
 });
 
+test('action responses can carry a fresh UI-only catalog without caching it in the receipt', async t => {
+  let agents = [{ agent_id: 'a', name: 'Native title', last_activity_at_ms: 1000 }];
+  const { post, controller } = await setup(t, { activity: { list: () => ({ agents }) } });
+  controller.publish();
+  const body = { operation: 'followup_task', requestId: 'continue-once', args: { target: 'a', message: 'Continue' }, ui_summary: true };
+  const first = (await post(body)).body;
+  assert.deepEqual(first.ui_summary, { agents });
+  agents = [...agents, { agent_id: 'b' }];
+  assert.deepEqual((await post(body)).body.ui_summary, { agents });
+  assert.equal(controller.calls.filter(call => call.op === 'followup_task').length, 1);
+  assert.equal((await post({ ...body, ui_summary: false })).body.ui_summary, undefined);
+  assert.equal(controller.events.length, 1); assert.deepEqual(controller.acks, []);
+  const observed = await post({ operation: 'observe', args: { deliver: false } });
+  assert.deepEqual(observed.body.agents, agents);
+});
+
+test('partial adoption failures still refresh the catalog, and a UI failure cannot lose an accepted action', async t => {
+  let broken = false;
+  const { post, controller } = await setup(t, { activity: { list: () => { if (broken) throw new Error('UI unavailable'); return { agents: [{ agent_id: 'adopted' }] }; } } });
+  const dispatch = controller.dispatch.bind(controller);
+  controller.dispatch = async (operation, args) => { if (args.target === 'partial') throw new Error('Thread registered; continuation failed'); return dispatch(operation, args); };
+  const failed = await post({ operation: 'followup_task', requestId: 'partial', args: { target: 'partial', message: 'Continue' }, ui_summary: true });
+  assert.equal(failed.status, 400);
+  assert.deepEqual(failed.body.ui_summary.agents, [{ agent_id: 'adopted' }]);
+  broken = true;
+  const accepted = await post({ operation: 'followup_task', requestId: 'accepted', args: { target: 'a', message: 'Continue' }, ui_summary: true });
+  assert.equal(accepted.status, 200); assert.equal(accepted.body.accepted, true);
+});
+
 test('direct user controls use durable receipts without acknowledging Claude events', async t => {
   const { post, controller } = await setup(t);
   controller.publish();

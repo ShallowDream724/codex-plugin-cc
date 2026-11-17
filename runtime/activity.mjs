@@ -21,6 +21,10 @@ const LIVE_LIMIT = 64;
 const AGENT_LIMIT = 32;
 const INLINE_CACHE_LIMIT = 64;
 const PREVIEW_BUDGET = 8192;
+const METADATA_CONCURRENCY = 4;
+const METADATA_TIMEOUT_MS = 800;
+const METADATA_RETRY_MS = 30000;
+const nativeTimeMs = value => Number.isFinite(value) && value > 0 && Number.isSafeInteger(value * 1000) ? value * 1000 : null;
 const BINARY = /^(?:base64|imageData|image_data|b64_json)$/i;
 // This is a presentation projection only: it never changes the model's input or
 // native history. Account for keys, values, depth and element count together.
@@ -173,6 +177,7 @@ export class ActivityStore {
     this.rolloutMedia = new RolloutMedia(client);
     this.exportDir = null; this.exports = new Map(); this.exportSizes = new Map(); this.exportBytes = 0; this.cacheLimits = cacheLimits; this.exportQueue = Promise.resolve(); this.closed = false;
     this.inlineCache = new Map();
+    this.metadataQueue = []; this.metadataPending = new Set(); this.metadataRetry = new Map(); this.metadataRunning = 0;
     this.notification = (message) => this.observe(message);
     this.action = (action) => this.recordAction(action);
     client.on('notification', this.notification);
@@ -184,6 +189,7 @@ export class ActivityStore {
     this.live.clear();
     this.agentNames.clear(); this.turnStates.clear();
     this.closed = true;
+    this.metadataQueue.length = 0; this.metadataPending.clear(); this.metadataRetry.clear();
     this.inlineCache.clear();
     // Serialize cleanup behind in-flight writes; close remains safe for callers
     // that do not await it, and only files created by this store are removed.
@@ -344,14 +350,60 @@ export class ActivityStore {
     if (!agent?.threadId || this.controller.threads.get(agent.threadId) !== agent) throw new Error('Agent thread is unavailable.');
     return agent;
   }
-  summary(a) { return { id: a.id, agent_id: a.id, name: a.name, status: a.status, activity: a.activity,
+  summary(a) { return { id: a.id, agent_id: a.id, name: (typeof a.name === 'string' && a.name.trim() ? a.name : a.threadName), status: a.status, activity: a.activity,
     created_at_ms: a.createdAtMs ?? null, last_activity_at_ms: a.lastActivityAtMs ?? null,
     model: a.model, reasoning_effort: a.effort, context_source: a.contextSource ?? 'unknown',
     permissions_mode: this.controller.settings?.permissionsMode ?? null,
     context_used_tokens: Number.isSafeInteger(a.tokenUsage?.last?.totalTokens) && a.tokenUsage.last.totalTokens >= 0 ? a.tokenUsage.last.totalTokens : null,
     context_limit_tokens: Number.isSafeInteger(a.tokenUsage?.modelContextWindow) && a.tokenUsage.modelContextWindow > 0 ? a.tokenUsage.modelContextWindow : null,
     user_paused: a.userPaused === true, user_control_status: a.userControlStatus ?? null }; }
-  list() { return { agents: [...this.controller.agents.values()].map((a) => this.summary(a)) }; }
+  list() {
+    const agents = [...this.controller.agents.values()];
+    for (const a of agents) this.queueMetadata(a);
+    return { agents: agents.map((a) => this.summary(a)) };
+  }
+  queueMetadata(a) {
+    if (this.closed || !a.threadId || a.removing || this.metadataPending.has(a.id) || (this.metadataRetry.get(a.id) ?? 0) > Date.now()) return;
+    if (((typeof a.name === 'string' && a.name.trim()) || (typeof a.threadName === 'string' && a.threadName.trim())) && a.createdAtMs != null && a.lastActivityAtMs != null) return;
+    this.metadataPending.add(a.id); this.metadataQueue.push(a); this.pumpMetadata();
+  }
+  pumpMetadata() {
+    while (!this.closed && this.metadataRunning < METADATA_CONCURRENCY && this.metadataQueue.length) {
+      const a = this.metadataQueue.shift(); this.metadataRunning++;
+      this.readMetadata(a).catch(() => {}).finally(() => {
+        this.metadataRunning--; this.metadataPending.delete(a.id);
+        if (!this.closed && this.controller.agents.get(a.id) === a) this.metadataRetry.set(a.id, Date.now() + METADATA_RETRY_MS);
+        this.pumpMetadata();
+      });
+    }
+  }
+  async metadataRequest(method, params) {
+    let timer;
+    try {
+      return await Promise.race([
+        this.client.request(method, params, { timeoutMs: METADATA_TIMEOUT_MS }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Metadata request timed out.')), METADATA_TIMEOUT_MS); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
+  async readMetadata(a) {
+    const threadId = a.threadId;
+    const needLast = a.lastActivityAtMs == null;
+    const [threadResult, turnsResult] = await Promise.allSettled([
+      this.metadataRequest('thread/read', { threadId, includeTurns: false }),
+      needLast ? this.metadataRequest('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' }) : Promise.resolve(null),
+    ]);
+    if (this.closed || this.controller.closed || a.removing || this.controller.agents.get(a.id) !== a || this.controller.threads.get(threadId) !== a || a.threadId !== threadId) return;
+    const thread = threadResult.status === 'fulfilled' && threadResult.value?.thread?.id === threadId ? threadResult.value.thread : null;
+    const turn = turnsResult.status === 'fulfilled' ? turnsResult.value?.data?.[0] : null;
+    let changed = false;
+    if (!a.threadName && typeof thread?.name === 'string' && thread.name.trim()) { a.threadName = thread.name; changed = true; }
+    const created = nativeTimeMs(thread?.createdAt);
+    if (a.createdAtMs == null && created != null) { a.createdAtMs = created; changed = true; }
+    const last = nativeTimeMs(turn?.startedAt) ?? nativeTimeMs(thread?.updatedAt);
+    if (a.lastActivityAtMs == null && last != null) { a.lastActivityAtMs = last; changed = true; }
+    if (changed) { await this.controller.persist(); if (!this.closed && this.controller.agents.get(a.id) === a) this.controller.emit('state'); }
+  }
   bucket(id) {
     let bucket = this.live.get(id);
     if (!bucket) { bucket = { revision: this.nextRevision++, entries: [] }; }
@@ -369,7 +421,7 @@ export class ActivityStore {
   }
   recordAction(action) {
     const agent = this.controller.agents.get(action.agent_id);
-    if (action.kind === 'close') { this.live.delete(action.agent_id); return; }
+    if (action.kind === 'close') { this.live.delete(action.agent_id); this.metadataRetry.delete(action.agent_id); return; }
     if (!agent || action.thread_id !== agent.threadId || typeof action.message !== 'string') return;
     this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '', type: action.origin === 'user' ? 'directUserMessage' : 'parentMessage', data: { text: clean(action.message), ...(action.attachments?.length ? { attachments: clean(action.attachments) } : {}) } });
   }

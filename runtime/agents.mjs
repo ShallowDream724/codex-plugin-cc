@@ -204,8 +204,10 @@ export class AgentController extends EventEmitter {
   updateResolved(a, response) {
     const model = response?.model ?? response?.thread?.model;
     const effort = response?.reasoningEffort ?? response?.thread?.reasoningEffort;
+    const threadName = response?.thread?.name;
     if (nonempty(model)) a.model = model;
     if (nonempty(effort)) a.effort = effort;
+    if (nonempty(threadName)) a.threadName = threadName;
   }
 
   async rpc(method, params) {
@@ -432,8 +434,9 @@ export class AgentController extends EventEmitter {
       if (!['idle', 'notLoaded'].includes(thread.status?.type)) throw new Error(`Native thread status is ${thread.status?.type ?? 'unknown'}; active or unconfirmed external threads cannot be adopted.`);
       const clientTools = await externalClientTools(thread);
       if (this.stopAllInProgress || this.stopAllEpoch !== stopAllEpoch) throw new Error('A user stop-all action interrupted adoption; retry afterward.');
-      const createdAtMs = now();
-      const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, createdAtMs, lastActivityAtMs: createdAtMs, contextSource: 'codex', status: 'interrupted', activity: 'adopted',
+      const createdAtMs = Number.isFinite(thread.createdAt) && thread.createdAt > 0 && Number.isSafeInteger(thread.createdAt * 1000) ? thread.createdAt * 1000 : null;
+      const lastActivityAtMs = Number.isFinite(thread.updatedAt) && thread.updatedAt > 0 ? thread.updatedAt * 1000 : null;
+      const a = { id: randomUUID(), threadId: id, cwd: thread.cwd, createdAtMs, lastActivityAtMs, contextSource: 'codex', status: 'interrupted', activity: 'adopted',
         pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: false, recoveryUsed: false, interrupted: false, terminalEmitted: true, adopting: true, externalAdopted: true, externalThread: true };
       if (this.pausedThreads.has(id)) { a.userPaused = true; a.userControlStatus = 'stopped'; a.interrupted = true; }
       this.updateResolved(a, { thread });
@@ -1089,7 +1092,7 @@ export class AgentController extends EventEmitter {
     const write = this.persistTail.then(() => {
       this.persistScheduled = null;
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
-      id: a.id, threadId: a.threadId, name: a.name, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
+      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
       activity: a.activity, createdAtMs: a.createdAtMs, lastActivityAtMs: a.lastActivityAtMs, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
       snapshot: a.snapshot, injected: a.injected, contextSource: a.contextSource, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus,
     })) };

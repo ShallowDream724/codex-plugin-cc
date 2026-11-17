@@ -39,7 +39,7 @@ function harness(t) {
   const host = nativeHooks([], $); registerUI(host.on);
   const draw = (component = 'Pane', props = {}) => host.dispatch('ui.render', { component, requestId: component === 'Pane' ? PANE : 'above-prompt', surface: 'desktop', props: { bodyColumns: 64, scroll: { offset: 0, bodyRows: 24, contentRows: 500 }, ...props } }, () => null);
   const press = async key => {
-    const tree = await draw(key === 'codex_directory_toggle' ? 'AbovePrompt' : 'Pane');
+    const tree = await draw(key === 'codex_directory_toggle' ? 'SessionMode' : 'Pane');
     const node = nodes(tree).find(node => node.type === 'Button' && node.props.key === key);
     assert.ok(node, `missing action ${key}`);
     return host.dispatch('ui.press', { requestId: key === 'codex_directory_toggle' ? 'above-prompt' : PANE, element: key }, e => node.props.onPress(e));
@@ -51,14 +51,24 @@ function harness(t) {
   return { $, host, draw, press, fixture, calls, writes, panes, timers, scrolls, syncDirectory };
 }
 
-test('entry composes AbovePrompt, respects survey, updates count independently, and toggles the actual pane', async t => {
+test('desktop entry composes SessionMode without an icon, while AbovePrompt passes through and terminal retains its entry', async t => {
   const h = harness(t), inherited = { type: 'Text', props: { children: ['Other plugin'] } };
-  const render = props => h.host.dispatch('ui.render', { component: 'AbovePrompt', requestId: 'above-prompt', surface: 'desktop', props }, () => inherited);
-  assert.equal(await render({ hasSurvey: true }), inherited);
-  assert.ok(nodes(await render({})).includes(inherited));
+  const render = (component, surface, props = {}) => h.host.dispatch('ui.render', { component, requestId: 'entry', surface, props }, () => inherited);
+  assert.equal(await render('AbovePrompt', 'desktop'), inherited);
+  assert.equal(await render('AbovePrompt', 'desktop', { hasSurvey: true }), inherited);
+  assert.equal(await render('AbovePrompt', 'terminal', { hasSurvey: true }), inherited);
+  assert.ok(nodes(await render('AbovePrompt', 'terminal')).some(n => n.props.key === 'codex_directory_toggle'));
+  const entry = await render('SessionMode', 'desktop');
+  assert.ok(nodes(entry).includes(inherited));
+  assert.equal(nodes(entry).some(n => n.type === 'Svg'), false);
+  const button = nodes(entry).find(n => n.props.key === 'codex_directory_toggle');
+  assert.equal(button.type, 'Button');
+  assert.equal(button.props.icon, undefined);
+  assert.equal(await render('SessionMode', 'terminal'), inherited);
+  const desktop = () => render('SessionMode', 'desktop');
   h.fixture.agents = [{ agent_id: 'a', status: 'running' }, { agent_id: 'b', status: 'completed' }];
   await observeUI(h.$, { agents: h.fixture.agents });
-  assert.equal(nodes(await render({})).find(n => n.props.key === 'codex_directory_toggle').props.label, 'Codex·2');
+  assert.equal(nodes(await desktop()).find(n => n.props.key === 'codex_directory_toggle').props.label, 'Codex·2');
   assert.deepEqual(h.writes.map(w => w.key), ['entryRevision']);
   await h.press('codex_directory_toggle'); await settle();
   assert.ok(h.panes.has(PANE));
@@ -79,7 +89,7 @@ test('rapid repeated toggles remain ordered and closing ignores a late directory
   assert.ok(nodes(await h.draw()).some(n => n.props.key === 'directory_loading'));
   await h.press('codex_directory_toggle');
   resolve({ agents: [{ agent_id: 'stale', status: 'running' }] }); await settle();
-  assert.equal(nodes(await h.draw('AbovePrompt')).find(n => n.props.key === 'codex_directory_toggle').props.label, 'Codex·0');
+  assert.equal(nodes(await h.draw('SessionMode')).find(n => n.props.key === 'codex_directory_toggle').props.label, 'Codex·0');
   h.fixture.list = null;
   await Promise.all([h.press('codex_directory_toggle'), h.press('codex_directory_toggle')]);
   assert.equal(h.panes.has(PANE), false);
@@ -132,7 +142,7 @@ test('selected agent ignores a late list response and remains reachable from dir
   await observeUI(h.$, { agents: h.fixture.agents });
   await h.press('codex_back_directory'); await settle();
   assert.ok(nodes(await h.draw()).some(n => n.props.key === 'directory_open_a'));
-  assert.equal(nodes(await h.draw('AbovePrompt')).find(n => n.props.key === 'codex_directory_toggle').props.label, 'Codex·1');
+  assert.equal(nodes(await h.draw('SessionMode')).find(n => n.props.key === 'codex_directory_toggle').props.label, 'Codex·1');
 });
 
 test('page navigation follows the displayed page after cleanup and row hit regions open the right agent', async t => {
@@ -148,4 +158,39 @@ test('page navigation follows the displayed page after cleanup and row hit regio
   assert.ok(nodes(await h.draw()).some(n => n.props.children?.includes?.('完成 · 75')));
   await h.host.dispatch('ui.message', { element: 'directory_hit_a74', data: { action: 'open-agent' } });
   assert.ok(nodes(await h.draw()).some(n => n.props.key === 'codex_title_a74'));
+});
+
+test('last directory hit wins when an earlier list or entry write completes late', async t => {
+  const h = harness(t);
+  h.fixture.agents = [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }];
+  await openDirectory(h.$); await settle();
+  let releaseB, startedB;
+  const started = new Promise(r => { startedB = r; });
+  let calls = 0;
+  h.fixture.list = () => ++calls === 1 ? new Promise(r => { releaseB = r; startedB(); }) : { agents: h.fixture.agents };
+  const hit = id => h.host.dispatch('ui.message', { element: `directory_hit_${id}`, data: { action: 'open-agent' } });
+  const b = hit('b'); await started;
+  const a = hit('a'); await a;
+  releaseB({ agents: h.fixture.agents }); await b;
+  assert.ok(nodes(await h.draw()).some(n => n.props.key === 'codex_title_a'));
+});
+
+test('late entry revision write cannot reopen an earlier selection', async t => {
+  const h = harness(t);
+  h.fixture.agents = [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }];
+  await openDirectory(h.$); await settle();
+  // Force a changed count in B's listing, making its entry state write awaitable.
+  h.fixture.list = () => ({ agents: [...h.fixture.agents, { agent_id: 'c', status: 'completed' }] });
+  const set = h.$.state.set; let releaseB, startedB;
+  const started = new Promise(r => { startedB = r; });
+  let blocked = false;
+  h.$.state.set = async (key, value) => {
+    if (key.key === 'entryRevision' && !blocked) { blocked = true; startedB(); await new Promise(r => { releaseB = r; }); }
+    return set(key, value);
+  };
+  const hit = id => h.host.dispatch('ui.message', { element: `directory_hit_${id}`, data: { action: 'open-agent' } });
+  const b = hit('b'); await started;
+  const a = hit('a'); await a;
+  releaseB(); await b;
+  assert.ok(nodes(await h.draw()).some(n => n.props.key === 'codex_title_a'));
 });

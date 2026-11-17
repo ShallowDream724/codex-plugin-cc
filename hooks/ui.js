@@ -491,11 +491,13 @@ async function chooseAttachments($, id, source = 'file') {
   function invalidateEntry($) {
     const signature = `${state.opened}:${state.agents.length}`;
     if (signature === entrySignature) return Promise.resolve();
-    entrySignature = signature;
-    return $.state.set(ENTRY_REVISION, ++entryRevision).catch(() => {});
+    const revision = ++entryRevision;
+    return $.state.set(ENTRY_REVISION, revision).then(result => {
+      if (result?.isSet !== false && revision === entryRevision) entrySignature = signature;
+    }).catch(() => {});
   }
   function stopPane() {
-    state.opened = false; state.imagePreview = null; state.generation++;
+    state.opened = false; state.opening = false; state.imagePreview = null; state.generation++;
     state.timer?.cancel(); state.timer = null; directory.request = null; directory.loading = false; directory.restore = null;
     for (const page of state.pages.values()) { cancelNavigation(page); page.tailRequest = null; }
   }
@@ -523,7 +525,7 @@ async function chooseAttachments($, id, source = 'file') {
   }
   export async function openDirectory($) {
     const previous = state.pages.get(state.selected); if (previous) { cancelNavigation(previous); previous.tailRequest = null; }
-    state.opened = true; state.view = 'directory'; state.selected = null; state.requested = null; state.restore = false; state.imagePreview = null;
+    state.opened = true; state.opening = false; state.view = 'directory'; state.selected = null; state.requested = null; state.restore = false; state.imagePreview = null;
     const generation = ++state.generation;
     directory.request = null; directory.loading = true; directory.error = '';
     directory.restore = { token: ++navigationSequence, generation, offset: directory.offset };
@@ -693,14 +695,14 @@ async function chooseAttachments($, id, source = 'file') {
       } finally { request.finish(); }
     }
   }
-  async function select($, id) {
+  async function select($, id, gen) {
     const previous = state.pages.get(state.selected); if (previous) cancelNavigation(previous);
-    state.selected = id; state.generation++; state.imagePreview = null;
+    state.selected = id; state.imagePreview = null;
     const page = pageFor(id); page.historyLoading = false; page.historyRequest = null;
     state.restore = state.scroll.has(id) && !page.followTail;
     page.detailRequests.clear();
     await poll($);
-    await invalidate($);
+    if (state.opened && state.generation === gen && state.selected === id) await invalidate($);
   }
   async function showImagePreview($, id, preview) {
     if (!state.opened || state.selected !== id || !state.folds.has(preview.foldKey)) return;
@@ -727,26 +729,34 @@ async function chooseAttachments($, id, source = 'file') {
   }
   export async function openAgent($, id) {
     directory.request = null; directory.restore = null;
+    const previous = state.pages.get(state.selected);
+    if (previous) { cancelNavigation(previous); previous.tailRequest = null; }
     state.view = 'agent';
-    state.opened = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
+    state.opened = true; state.selected = null; state.opening = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
+    const current = () => state.opened && state.generation === gen && state.view === 'agent';
+    await invalidate($);
+    if (!current()) return;
     try {
       const list = await bridge($, 'ui_list', {});
       if (!state.opened || state.generation !== gen) return;
       if (list.error || list.offline || !Array.isArray(list.agents)) throw new Error(failureText(list));
       state.agents = mergeSummaries(list.agents);
-    } catch (error) { state.error = `无法读取代理列表：${failureText(error)}。请重试。`; }
+    } catch (error) { if (current()) state.error = `无法读取代理列表：${failureText(error)}。请重试。`; }
     if (!state.opened || state.generation !== gen) return;
     await invalidateEntry($);
+    if (!current()) return;
+    state.opening = false;
     const selected = id ? state.agents.find((agent) => idOf(agent) === id) : [...state.agents].reverse().find(active) || state.agents.at(-1);
-    if (selected) await select($, idOf(selected));
+    if (selected) await select($, idOf(selected), gen);
     else { state.selected = null; if (!state.error) state.error = id ? '未找到此代理。请重新读取代理列表。' : '当前会话没有可打开的 Codex 代理。'; await invalidate($); }
-    const selectedGen = state.generation;
+    if (!current()) return;
     const result = await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
-    if (!state.opened || state.generation !== selectedGen) return;
+    if (!current()) return;
     geometryPulse = false;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
     if (state.restore) await scrollPane($, { to: 'start' }).catch(() => {});
-    else await requestTail($, state.selected, true);
+    else if (state.selected) await requestTail($, state.selected, true);
+    if (!current()) return;
     startPanePolling($);
   }
   async function detail($, id, entry, offset = 0, foldKey = `${id}:${entryKey(entry)}`, filePath, background = false, view) {
@@ -888,14 +898,14 @@ export function registerUI(on) {
       const wasFollowing = page.followTail;
       page.browseTimer?.cancel();
       page.tailRequest = null;
-      if (page.navigationRequest && Math.sign(e.by) !== page.navigationRequest.direction) page.navigationRequest = null;
+      if (page.navigationRequest && e.by !== 0 && Math.sign(e.by) !== page.navigationRequest.direction) page.navigationRequest = null;
       state.scroll.set(id, e.offset); page.scrollGeneration++;
       const stableGeometry = !oldGeometry || oldGeometry.contentRows === e.contentRows && oldGeometry.bodyRows === e.bodyRows;
-      if (!page.navigating && Date.now() >= (page.edgeCooldownUntil || 0) && stableGeometry) {
-        const oldOffset = e.offset - e.by;
-        if (page.boundaryBlocked === -1 && Math.max(e.offset, oldOffset) > 3 || page.boundaryBlocked === 1 && Math.min(e.offset, oldOffset) < e.contentRows - e.bodyRows - 3) {
-          page.boundaryBlocked = null; page.lastEdgeRequest = null;
-        }
+      if (!page.navigating && !page.navigationRequest && !page.historyLoading && Date.now() >= (page.edgeCooldownUntil || 0) && stableGeometry && e.by !== 0) {
+        // A new wheel/key gesture can retry the same edge. Requiring the reader
+        // to leave three rows first permanently locks short panes and failures.
+        // Gestures during an in-flight navigation are consumed, never queued.
+        page.boundaryBlocked = null; page.lastEdgeRequest = null;
       }
       page.windowAnchor = null;
       holdWindow(page);
@@ -950,7 +960,7 @@ export function registerUI(on) {
     return action ? (await action(), {}) : next(e);
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
-    if (state.opened && state.view === 'directory' && e.data?.action === 'open-agent' && e.element?.startsWith('directory_hit_')) {
+    if (state.opened && e.data?.action === 'open-agent' && e.element?.startsWith('directory_hit_')) {
       const id = e.element.slice('directory_hit_'.length);
       if (state.agents.some(agent => idOf(agent) === id)) await openAgent($, id);
       return {};
@@ -1029,26 +1039,19 @@ export function registerUI(on) {
     await $.state.get(PANE_REVISION);
     return renderPane($, e, next);
   });
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+    const inherited = await next(e);
+    if (e.surface !== 'desktop') return inherited;
+    await $.state.get(ENTRY_REVISION);
+    const { Box, Button } = $.ui.resolve(e);
+    return Box({ flexDirection: 'row', children: [inherited, Button({ key: 'codex_directory_toggle', plain: true, label: `Codex·${state.agents.length}`, onPress: () => toggleDirectory($) })] });
+  });
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const inherited = await next(e);
-    if (e.props?.hasSurvey) return inherited;
+    if (e.surface === 'desktop' || e.props?.hasSurvey) return inherited;
     await $.state.get(ENTRY_REVISION);
-    const { Box, Button, Svg, Client } = $.ui.resolve(e);
-    const icon = typeof Svg === 'function' && e.surface === 'desktop';
-    const label = `Codex·${state.agents.length}`;
-    return Box({ flexDirection: 'column', children: [inherited, Box({ flexDirection: 'row', children: [
-      Box({ key: 'codex_directory_entry', flexDirection: 'row', alignItems: 'center', gap: 'xs', paddingX: 0.5, hover: { backgroundColor: 'rgba(128,128,128,0.12)' }, ...(state.opened ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}), children: [
-        ...(icon ? [Box({ position: 'relative', width: 2, height: 1, children: [
-          Svg({ key: 'codex_entry_icon', source: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><path d="m8 6-6 6 6 6m8-12 6 6-6 6M14 3l-4 18" fill="none" stroke="#888" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>', alt: 'Codex', width: 16, height: 16 }),
-          ...(typeof Client === 'function' ? [Box({ position: 'absolute', top: 0, left: 0, children: [Client({ key: 'codex_entry_icon_toggle', module: './icon-control.js', props: { action: 'toggle-directory', expanded: state.opened }, height: 1, width: 2 })] })] : []),
-        ] })] : []),
-        Button({ key: 'codex_directory_toggle', plain: true, label: icon ? label : `◇ ${label}`, onPress: () => toggleDirectory($) }),
-      ] }),
-    ] })] });
-  });
-  on('ui.message', async ($, e, next) => {
-    if (e.element === 'codex_entry_icon_toggle' && e.data?.action === 'toggle-directory') { await toggleDirectory($); return {}; }
-    return next(e);
+    const { Box, Button } = $.ui.resolve(e);
+    return Box({ flexDirection: 'column', children: [inherited, Button({ key: 'codex_directory_toggle', plain: true, label: `Codex·${state.agents.length}`, onPress: () => toggleDirectory($) })] });
   });
 }
 function renderPane($, e, next) {
@@ -1088,6 +1091,7 @@ function renderPane($, e, next) {
     });
     const { Box, Text, Button, Input, Markdown, Image, Code, Svg, Client } = budget.ui, id = state.selected;
     const selected = state.agents.find((agent) => idOf(agent) === id);
+    if (state.opening && !selected) return Text({ size: 'caption', dimColor: true, children: ['正在打开对话…'] });
     if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
     const page = pageFor(id), control = controlFor(id);
     page.surface = e.surface;

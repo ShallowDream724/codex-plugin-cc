@@ -18,11 +18,15 @@
 
 ## 代理目录入口
 
-`AbovePrompt` 组合 `next(e)` 的现有树和紧凑 Codex 入口，调查问卷期间让出区域。计数和开关状态读取独立 `entryRevision`，对话绘制仍只订阅 `paneRevision`；流式输出不重绘入口。开关串行执行，并以 `$.ui.panes()` 为准，兼容宿主保留 pane 的模块重载。关闭保留代理缓存及草稿，停止目录/对话轮询；不暂停模型。
+桌面 `SessionMode` 组合 `next(e)` 和纯文本 Codex 按钮，使用宿主输入区下方的紧凑槽；桌面 AbovePrompt 原样透传，不再产生全宽灰条。终端仍用 AbovePrompt，调查问卷期间让位。计数和开关状态读取独立 `entryRevision`，仅成功写入 state 后确认签名，失败可重试；对话仍只订阅 `paneRevision`。开关串行执行并以 `$.ui.panes()` 为准，关闭保留缓存及草稿、停止 UI 轮询，不暂停模型。
+
+非 wait 模型工具的桥接请求携带 `ui_summary:true`，broker 在动作/回执之后附上当前活动摘要；不将此摘要写入幂等回执，重放动作仍附最新列表。hooks 先更新 UI，再剥离摘要返回模型，无额外桥接往返。通知观察用 activity epoch 防止旧 offline 响应关闭新的观察，以及旧快照覆盖新列表。UI 与事件领取/确认依旧分离。
 
 `hooks/agent-directory.js` 负责纯分组、排序、相对时间、Unicode 名称截断及公开组件布局。只展示当前 Claude 会话直接登记、未清理的代理；终态放在「完成」，未知状态明确标注，归入「已开启」。两组独立每页 50 条，目录仅请求摘要，不加载所有代理的历史。目录刷新单请求在途，无变化不重绘；旧响应不能覆盖新选择。返回保存列表页码/偏移、各代理草稿/历史/阅读位置。顶部和输入区均提供返回列表。
 
-控制器持久保存 `createdAtMs` / `lastActivityAtMs`，UI 摘要输出 `created_at_ms` / `last_activity_at_ms`。创建、采用、通信、轮次及工具生命周期、提问与答复更新活动时间；轮询、查看及交付确认不改变顺序。旧登记缺失时间时保留 `null`，不会把重启或查看时间当成活动。模型的 `list_agents` 契约不增加这些展示字段。
+控制器持久保存 `createdAtMs` / `lastActivityAtMs` / `threadName`。显式委派名称优先，否则 UI 使用原生 Thread.name，不能用包含首条任务正文的数据库 title。缺失元数据在目录读取后后台补齐：只读 `thread/read(includeTurns:false)` 和最新 `thread/turns/list(itemsView:notLoaded)`，Unix 秒转毫秒；最后活动优先最近轮次 startedAt，回退 Thread.updatedAt。最多 4 项并发、单请求 800ms、失败 30 秒退避；关闭或替换后忽略迟到结果，不覆盖期间新活动。不会通过元数据查询启动/恢复模型轮次，也不把查看时间冒充活动。UI 只输出时间展示字段，模型 `list_agents` 契约不变。
+
+代理导航在每个 await 后核验同一 generation，不在旧请求结束时认领新请求的代数。切换开始即撤下旧内容；尚可见的旧目录项点击仍可替换待打开目标。历史边缘的新非零人手势在冷却后可重试，不要求离开三行；在途请求和自动短页填充闩锁仍保留，零位移布局不能取消正在加载的导航。窗口规划和位置补偿算法未重写。
 
 ## 初始历史
 
