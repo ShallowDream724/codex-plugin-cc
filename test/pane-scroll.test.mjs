@@ -105,3 +105,51 @@ for (const scenario of [
   assert.equal(result.offset, scenario.expected);
   assert.equal(positions.at(-1), scenario.expected);
 });
+
+test('settled measurement holds the viewport through changing geometry and commits once', async () => {
+  let controller, calls = 0; const returned = [], positions = [];
+  const frames = [[20, 130], [25, 150], [30, 180], [30, 190], [30, 190]];
+  controller = paneScroll({ settleBeforeCommit: true, valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n),
+    scroll: async () => {
+      const [marker, rows] = frames[Math.min(calls++, frames.length - 1)];
+      returned.push(controller.observe(event('plugin', marker, marker - 35, rows)).offset);
+      return {};
+    },
+  });
+  const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
+  controller.stage(before, true, true);
+  // A zero-delta host layout notification is not a new reading intent.
+  controller.observe(event('person', 35, 0, 100));
+  const result = await controller.measure('marker', before, true, true);
+  assert.equal(result.offset, 45);
+  assert.deepEqual(returned, [35, 35, 35, 35, 35, 45]);
+  assert.deepEqual(positions, [45]);
+});
+
+test('cancelling settlement prevents a stale final commit', async () => {
+  let controller, release, calls = 0;
+  controller = paneScroll({ settleBeforeCommit: true, valid: () => true, position: () => assert.fail('cancelled position'),
+    later: (_ms, fn) => { release = fn; },
+    scroll: async () => { calls++; controller.observe(event('plugin', 10, -10, 140)); return {}; },
+  });
+  const measuring = controller.measure('marker', { offset: 20, contentRows: 100, bodyRows: 10 }, true);
+  await Promise.resolve();
+  controller.cancel(); release();
+  assert.equal(await measuring, null);
+  assert.equal(calls, 1);
+});
+
+test('a denied settled commit cannot report success or confirm position', async () => {
+  let controller, calls = 0; const positions = [];
+  controller = paneScroll({ settleBeforeCommit: true, valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n),
+    scroll: async () => {
+      calls++;
+      controller.observe(event('plugin', 10, -10, 140));
+      return calls === 4 ? { deny: 'commit rejected' } : {};
+    },
+  });
+  const result = await controller.measure('marker', { offset: 20, contentRows: 100, bodyRows: 10 }, true);
+  assert.equal(result, null);
+  assert.equal(calls, 4);
+  assert.deepEqual(positions, []);
+});

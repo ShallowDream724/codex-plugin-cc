@@ -4,7 +4,7 @@
 
 仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
-当前开发候选版为 **0.2.0-rc.25**，在 rc.24 的目录和历史修复基础上，固定代理图标，避免刷新历史或重新打开时换图案。桌面入口为输入框下方的小按钮。仅供本地测试，等待实际验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
+当前开发候选版为 **0.2.0-rc.26**，历史换页测量期间显示加载圈，布局稳定后一次定位并显示内容，避免反复位置修正造成晃动。保留 rc.24 的目录修复和 rc.25 的固定代理图标。仅供本地测试，等待实际验收后再发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 

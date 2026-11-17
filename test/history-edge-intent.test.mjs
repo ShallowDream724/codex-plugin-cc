@@ -137,9 +137,12 @@ test('rapid upward gestures during navigation do not queue another window', asyn
   } }); t.after(h.close);
   block = true;
   h.wheel(-1, 0); await Promise.race([started, pause(2000).then(() => { throw Error('navigation did not start measurement'); })]);
+  assert.ok(h.painted.some(n => n.props.key === 'codex_history_settling_a'), 'intermediate layouts stay behind the loading layer');
   const count = navigations(h);
-  await upward(h, 110); await upward(h, 110); await upward(h, 110);
+  const held = h.offset;
+  for (let repeat = 0; repeat < 3; repeat++) assert.equal((await upward(h, 110)).offset, held, 'loading gestures keep the current reading offset');
   block = false; release(); await h.waitNavigation(); await pause(500);
+  assert.ok(!h.painted.some(n => n.props.key === 'codex_history_settling_a'), 'the loading layer is removed after positioning');
   assert.equal(navigations(h), count, 'in-flight gestures must not schedule another navigation');
   const first = messages(h)[0];
   await pause(300);
@@ -161,4 +164,21 @@ test('zero-movement layout event does not cancel a deferred history navigation',
   await h.waitNavigation();
   assert.ok(navigations(h) >= 1, 'layout event must not cancel navigation');
   assert.ok(messages(h).includes('message-0'));
+});
+
+test('failed candidate positioning restores the old history window before removing the loading layer', async t => {
+  let h, oldFirst, rejected = 0;
+  const live = Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
+  h = await setup({ live, onMeasurement: async () => {
+    if (oldFirst && messages(h)[0] !== oldFirst) {
+      rejected++;
+      assert.ok(h.painted.some(n => n.props.key === 'codex_history_settling_a'));
+      throw Error('candidate anchor is not yet available');
+    }
+  } }); t.after(h.close);
+  oldFirst = messages(h)[0];
+  h.wheel(-1, 0); await h.waitNavigation(); await pause(100);
+  assert.ok(rejected > 0, 'candidate measurement must exercise the failure path');
+  assert.equal(messages(h)[0], oldFirst, 'unpositioned earlier content must not be revealed');
+  assert.ok(!h.painted.some(n => n.props.key === 'codex_history_settling_a'), 'failed measurement must release its loading layer');
 });

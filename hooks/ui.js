@@ -293,6 +293,7 @@ function scrollController($, id, page) {
     valid: () => state.opened && state.selected === id && state.pages.get(id) === page,
     position: offset => state.scroll.set(id, offset),
     refresh: () => refreshPaneGeometry($, page),
+    settleBeforeCommit: page.surface === 'desktop',
   });
   return page.scroller = controller;
 }
@@ -303,6 +304,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   page.navigationTimeline ??= page.timeline ??= conversationEntries(page.live);
   const scroller = scrollController($, id, page), gen = state.generation;
   const oldView = drawnWindow(page);
+  const oldGroups = page.renderedGroups;
   const anchorGroup = above && start < oldView.start ? page.renderedGroups?.find(group => group.start === oldView.start) : null;
   const anchored = !!anchorGroup;
   if (anchored && page.measureAnchor !== anchorGroup.key) {
@@ -323,6 +325,18 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   scroller.stage(before, above, anchored);
   await invalidate($);
   const after = await scroller.measure(measurementKey(), before, above, anchored);
+  if (!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner) {
+    // Never reveal an unpositioned candidate when a keyed sample was refused.
+    page.windowStart = oldView.start; page.windowEnd = oldView.start + oldView.entries.length;
+    page.windowSize = Math.max(1, oldView.entries.length); page.renderedGroups = oldGroups;
+    page.adding = null; page.layoutRevision++;
+    await invalidate($);
+    if (!state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
+    await refreshPaneGeometry($, page);
+    if (!state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
+    state.scroll.set(id, before.offset);
+    await scrollPane($, { to: 'start' }, () => page.navigationOwner === owner);
+  }
   if (page.navigationOwner === owner) page.layoutFloor = null;
   return !!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner;
 }
@@ -332,6 +346,10 @@ async function browseHistory($, id, direction) {
   const owner = {}; page.navigationOwner = owner;
   page.navigating = true; holdWindow(page);
   try {
+    // Native Markdown leaves are matched by ordinal while a new tree is
+    // installed. Cover that transient layout; expose only a positioned frame.
+    if (page.surface === 'desktop') await invalidate($);
+    if (gen !== state.generation || state.selected !== id || page.navigationOwner !== owner) return;
     let view = drawnWindow(page);
     if (direction < 0 && view.start === 0 && page.cursor) {
       await history($, id);
@@ -879,6 +897,11 @@ export function registerUI(on) {
     if (state.imagePreview || state.restoringPreview) return next(e);
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
+    if (page?.navigating && page.surface === 'desktop') {
+      // Repeated wheel input during settlement is one loading gesture, not a
+      // backlog of moves to replay after the reading position is restored.
+      return next({ ...e, offset: state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
+    }
     const oldGeometry = page?.scrollGeometry;
     if (page) page.scrollGeometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
     // Before the new tail marker is painted, native layout/clamping may emit
@@ -1464,6 +1487,7 @@ function renderPane($, e, next) {
     const navigationProps = { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, tailToken: page.tailRequest?.token || 0 };
     const tailMarker = Box({ position: 'absolute', bottom: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: tailKey(id, page.tailMarkerToken), plain: true, label: '·', onPress: () => {} })] });
     const jumpNode = jumpControl('viewport');
+    const settling = e.surface === 'desktop' && page.navigating;
     const overlay = scroll => {
       const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
       const visible = hasLater || page.awayFromBottom || (Number.isFinite(scroll?.contentRows) && offset < scroll.contentRows - bodyRows - 1);
@@ -1484,7 +1508,12 @@ function renderPane($, e, next) {
       const edgeToken = edgeDirection ? JSON.stringify([state.generation, id, edgeDirection, view.start, entries.length, view.total, page.cursor]) : '';
       page.edgeKey = edgeToken;
       const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
-      const frame = Box({ key: 'codex_conversation', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: Math.max(bodyRows, page.layoutFloor || 0) } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
+      const loadingLayer = settling ? [Box({ key: `codex_history_settling_${id}`, position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'background', children: [
+        Box({ key: `codex_history_settling_indicator_${id}`, position: 'absolute', top: offset + 2, left: 0, right: 0, height: 2, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', children: [
+          typeof Svg === 'function' ? Svg({ key: `codex_history_settling_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 18, height: 18, isInteractive: true }) : caption(`codex_history_settling_label_${id}`, '正在加载历史消息'),
+        ] }),
+      ] })] : [];
+      const frame = Box({ key: 'codex_conversation', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: Math.max(bodyRows, page.layoutFloor || 0) } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...loadingLayer, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
       page.renderCost = budget.cost(frame);
       return frame;
     };

@@ -2,7 +2,7 @@
 // revision marker: Desktop's key table does not contain Box keys. Native leaf
 // layout can settle after that marker, so changed frames get another sample.
 // Never await network/history work in the wheel handler.
-export function paneScroll({ scroll, later, valid, position, refresh }) {
+export function paneScroll({ scroll, later, valid, position, refresh, settleBeforeCommit = false }) {
   let pending = null, serial = 0, disposed = false;
   const sample = e => ({ offset: Math.max(0, e.offset - (e.origin.kind === 'plugin' ? e.by : 0)), contentRows: e.contentRows, bodyRows: e.bodyRows, ...(e.origin.kind === 'plugin' ? { anchorOffset: e.offset } : {}) });
   let latest = null, intent = 0;
@@ -23,7 +23,7 @@ export function paneScroll({ scroll, later, valid, position, refresh }) {
         const baseline = latest ?? pending?.before;
         const layoutChanged = pending?.layoutChange && baseline &&
           (e.contentRows !== baseline.contentRows || e.bodyRows !== baseline.bodyRows);
-        if (!layoutChanged) {
+        if (!layoutChanged && !(settleBeforeCommit && pending?.before && e.by === 0)) {
           const anchorOffset = latest?.contentRows === e.contentRows && latest?.bodyRows === e.bodyRows ? latest.anchorOffset : undefined;
           latest = { ...sample(e), ...(Number.isFinite(anchorOffset) ? { anchorOffset } : {}) }; intent++; return e;
         }
@@ -34,6 +34,10 @@ export function paneScroll({ scroll, later, valid, position, refresh }) {
       if (!pending) { latest = sample(e); return e; }
       const request = pending;
       const measured = sample(e);
+      if (settleBeforeCommit && request.before && request.committing) {
+        request.commitObserved = true;
+        return { ...e, offset: request.commitOffset };
+      }
       // A later human move owns the viewport. Do not overwrite it with an
       // asynchronous correction from an older frame.
       const unchanged = request.intent === intent;
@@ -46,8 +50,13 @@ export function paneScroll({ scroll, later, valid, position, refresh }) {
         ? measured.anchorOffset - reference.anchorOffset : measured.contentRows - reference.contentRows;
       const offset = reference.offset + (request.before && request.above ? delta : 0);
       const result = { ...measured, offset: Math.max(0, Math.min(offset, Math.max(0, measured.contentRows - measured.bodyRows))) };
-      latest = result;
       request.result = result;
+      if (settleBeforeCommit && request.before) {
+        // The keyed scroll reveals the marker coordinate, but its native
+        // movement must not expose partially painted history to the reader.
+        return { ...e, offset: measured.offset };
+      }
+      latest = result;
       if (e.origin.kind === 'person') position(result.offset);
       return { ...e, offset: result.offset };
     },
@@ -57,7 +66,8 @@ export function paneScroll({ scroll, later, valid, position, refresh }) {
       const token = request.token;
       request.staged = false;
       pending = request;
-      let previous = null, result = null, elapsed = 0;
+      let previous = null, result = null, elapsed = 0, settled = false;
+      const atomic = settleBeforeCommit && before != null;
       // A missing key means the host has not painted this revision yet. The
       // retries are bounded and run independently of native scrolling.
       for (const delay of before ? anchor ? [0, 32, 64, 128, 256] : [0, 32, 64, 128] : [0, 16, 32, 64, 128]) {
@@ -72,11 +82,24 @@ export function paneScroll({ scroll, later, valid, position, refresh }) {
         try { accepted = !(await scroll({ to: { key }, block: 'start' }))?.deny; } catch { /* Not drawn yet. */ }
         if (accepted && request.result) {
           result = request.result;
-          position(result.offset);
-          const stable = anchor ? previous?.anchorOffset === result.anchorOffset : previous?.contentRows === result.contentRows;
-          if (!before || elapsed >= (anchor ? 224 : 96) && stable && previous.bodyRows === result.bodyRows) break;
+          if (!atomic) position(result.offset);
+          const stable = anchor ? previous?.anchorOffset === result.anchorOffset && (!atomic || previous?.contentRows === result.contentRows) : previous?.contentRows === result.contentRows;
+          if (!before || elapsed >= (anchor ? 224 : 96) && stable && previous.bodyRows === result.bodyRows) { settled = true; break; }
           previous = result;
         } else previous = null;
+      }
+      if (atomic) {
+        // Commit the sampled offset through the same native scroll hook. Do
+        // not recompute it from the commit event's potentially newer geometry.
+        let accepted = false;
+        if (settled && result && !disposed && valid() && token === serial && request.intent === intent) {
+          request.committing = true;
+          request.commitOffset = result.offset;
+          request.commitObserved = false;
+          try { accepted = !(await scroll({ to: { key }, block: 'start' }))?.deny; } catch { /* Commit failed. */ }
+        }
+        if (!accepted || !request.commitObserved || disposed || !valid() || token !== serial || request.intent !== intent) result = null;
+        else { latest = result; position(result.offset); }
       }
       if (pending === request) pending = null;
       return token === serial ? result : null;
