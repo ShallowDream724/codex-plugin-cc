@@ -1,5 +1,5 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
-import { agentIcon, agentVisual, retainIcons, clearIcons, displayLabel, agentDisplayName } from './presentation.js';
+import { agentIcon, agentVisual, displayLabel, agentDisplayName } from './presentation.js';
 import { toolSections, communicationFailure } from './tool-presentation.js';
 import { activityIcon, contextIndicator, disclosureIcon, copyIcon, copiedIcon, copyFailedIcon, jumpIcon } from './tool-icons.js';
 import { normalizeMessageMarkdown } from './message-markdown.js';
@@ -1556,14 +1556,13 @@ function renderPane($, e, next) {
     page.renderCache = { key: frameKey, draft: control.draft, draw: scroll => root(content, scroll) };
     return tree;
 }
-export function closeUI() { stopPane(); state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.view = 'agent'; state.error = ''; entrySignature = ''; directory.openOffset = 0; directory.completedOffset = 0; directory.offset = 0; directory.error = ''; directory.actions.clear(); clearIcons(); }
+export function closeUI() { stopPane(); state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.view = 'agent'; state.error = ''; entrySignature = ''; directory.openOffset = 0; directory.completedOffset = 0; directory.offset = 0; directory.error = ''; directory.actions.clear(); }
 export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);
     state.agents = mergeSummaries(result.agents);
     await invalidateEntry($);
     const ids = new Set(state.agents.map(idOf));
-    retainIcons([...ids], state.agents.filter((agent) => active(agent) || agent.status === 'unknown').map(idOf));
     for (const id of state.controls.keys()) if (!ids.has(id)) state.controls.delete(id);
     for (const id of state.pages.keys()) if (!ids.has(id)) {
       state.pages.delete(id); state.scroll.delete(id);

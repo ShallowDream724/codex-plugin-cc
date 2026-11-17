@@ -14,38 +14,15 @@ export function agentDisplayName(value) {
   return displayLabel(value).replace(/\p{L}/u, letter => letter.toUpperCase());
 }
 
-// Slots are shared by the timeline and conversation, and bounded for long sessions.
-const icons = agentVisuals.map(visual => visual.glyph);
-const assigned = new Map();
-let activeIds = new Set();
-let next = 0;
+// Identity is independent of render order, current agent membership and status.
+// Historical descendants can leave the directory while remaining in a timeline.
+// A pure mapping also stays stable across pane/host reopen without a growing cache.
 function agentSlot(id) {
   const key = String(id || 'codex');
-  if (!assigned.has(key)) {
-    const used = new Set(assigned.values());
-    let slot = icons.findIndex((_, i) => !used.has(i));
-    if (slot < 0 && activeIds.size) {
-      const activeSlots = new Set([...activeIds].map(id => assigned.get(id)));
-      slot = icons.findIndex((_, i) => !activeSlots.has(i));
-    }
-    if (slot < 0) slot = next++ % icons.length;
-    assigned.set(key, slot);
-    if (assigned.size > 256) assigned.delete(assigned.keys().next().value);
-  }
-  return assigned.get(key);
+  let hash = 2166136261;
+  for (let i = 0; i < key.length; i++) hash = Math.imul(hash ^ key.charCodeAt(i), 16777619);
+  hash = Math.imul(hash ^ (hash >>> 16), 0x85ebca6b);
+  return ((hash ^ (hash >>> 13)) >>> 0) % agentVisuals.length;
 }
-export function agentIcon(id) { return icons[agentSlot(id)]; }
+export function agentIcon(id) { return agentVisual(id).glyph; }
 export function agentVisual(id) { return agentVisuals[agentSlot(id)]; }
-export function retainIcons(ids, active = ids) {
-  const keep = new Set(ids.map(String));
-  for (const key of assigned.keys()) if (!keep.has(key)) assigned.delete(key);
-  activeIds = new Set(active.map(String).filter(id => keep.has(id)));
-  const occupied = new Set();
-  for (const id of activeIds) {
-    let slot = assigned.get(id);
-    if (slot === undefined || occupied.has(slot)) slot = icons.findIndex((_, i) => !occupied.has(i));
-    if (slot < 0) slot = next++ % icons.length;
-    assigned.set(id, slot); occupied.add(slot);
-  }
-}
-export function clearIcons() { assigned.clear(); activeIds.clear(); next = 0; }

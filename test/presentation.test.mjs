@@ -1,23 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { agentIcon, agentVisual, retainIcons, clearIcons } from '../hooks/presentation.js';
+import { agentIcon, agentVisual } from '../hooks/presentation.js';
 
-test('active agents retain distinct stable icons among many saved conversations', () => {
-  clearIcons();
-  const ids = Array.from({ length: 80 }, (_, i) => `agent-${i}`);
-  ids.forEach(agentIcon);
-  const active = [ids[1], ids[8], ids[15], ids[22], ids[29], ids[36], ids[43]];
-  retainIcons(ids, active);
-  const icons = active.map(agentIcon);
-  assert.equal(new Set(icons).size, 7);
-  retainIcons(ids, active);
-  assert.deepEqual(active.map(agentIcon), icons);
-  clearIcons();
+test('history icons remain stable after traversing more than the former assignment cache', () => {
+  const ids = Array.from({ length: 600 }, (_, i) => `historical-child-${i}`);
+  const expected = new Map(ids.map(id => [id, agentVisual(id)]));
+  for (const id of ids.toReversed()) assert.strictEqual(agentVisual(id), expected.get(id), id);
+  for (const id of ids) assert.strictEqual(agentVisual(id), expected.get(id), id);
 });
 
-test('agent visuals share stable slots with text icons and provide distinct self-contained SVGs', () => {
-  clearIcons();
-  const ids = Array.from({ length: 16 }, (_, i) => `agent-${i}`);
+test('agent visuals share their identity with text icons and keep the varied self-contained SVG palette', () => {
+  const ids = Array.from({ length: 600 }, (_, i) => `agent-${i}`);
   const visuals = ids.map(agentVisual);
   assert.equal(new Set(visuals.map(visual => visual.source)).size, 16);
   assert.equal(new Set(visuals.map(visual => visual.glyph)).size, 16);
@@ -29,18 +22,12 @@ test('agent visuals share stable slots with text icons and provide distinct self
     assert.match(visual.source, /<\/(?:svg)>$/);
     assert.doesNotMatch(visual.source, /<(?:image|use|foreignObject|style|script)\b|\b(?:href|class|style)=/i);
   }
-  clearIcons();
 });
 
-test('active visual slots stay distinct and stable when older assignments overlap', () => {
-  clearIcons();
-  const ids = Array.from({ length: 80 }, (_, i) => `agent-${i}`);
-  ids.forEach(agentVisual);
-  const active = [ids[1], ids[8], ids[15], ids[22], ids[29], ids[36], ids[43]];
-  retainIcons(ids, active);
-  const visuals = active.map(agentVisual);
-  assert.equal(new Set(visuals).size, active.length);
-  retainIcons(ids, active);
-  assert.deepEqual(active.map(agentVisual), visuals);
-  clearIcons();
+test('independent render lifecycles choose the same icons regardless of encounter order', async () => {
+  const first = await import('../hooks/presentation.js?icon-lifecycle-first');
+  const second = await import('../hooks/presentation.js?icon-lifecycle-second');
+  const ids = ['root-A', 'root-B', '/root/history-child', 'archived-child', 'adopted-thread'];
+  const expected = new Map(ids.map(id => [id, first.agentVisual(id).source]));
+  for (const id of ids.toReversed()) assert.equal(second.agentVisual(id).source, expected.get(id), id);
 });
