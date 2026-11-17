@@ -53,6 +53,14 @@ test('wrapped MCP results decode; oversized or invalid results preserve native f
   assert.equal(describeCall(full('wait_agent'), {}, 'x'.repeat(524289)), null);
 });
 
+test('wait labels distinguish parent idle from all agents idle', () => {
+  const label = (result, running = false) => describeCall(full('wait_agent'), {}, result, running)[0].text;
+  assert.equal(label({ idle: false, parent_idle: true, active: true, events: [] }), '有代理继续工作');
+  assert.equal(label({ idle: true, parent_idle: true, active: false, events: [] }), 'Codex 空闲');
+  assert.equal(label({ idle: true, events: [] }), 'Codex 空闲');
+  assert.equal(label({ idle: false, parent_idle: true, active: true, events: [] }, true), '正在等待 Codex');
+});
+
 test('native framed plugin prompts retain compact rows and expanded or unrelated messages stay native', () => {
   const h = setup(), origin = { kind: 'plugin', name: 'codex-subagents' };
   const text = 'The codex-subagents plugin sent a message:\n' + EVENT_PREFIX + JSON.stringify({ events: [{ agent_id: 'a', name: 'worker', kind: 'user_action_receipt', origin: 'user', action: 'send', phase: 'delivered', quoted_user_message: 'OFFLINE_QUOTED_ACTION' }] }) + "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";

@@ -478,33 +478,24 @@ export class AgentController extends EventEmitter {
     if (a.removing) throw new Error('Agent is closing.');
     if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
     if (ACTIVE.has(a.status)) {
-      if (followup && origin !== 'user' && a.turnOrigin === 'user') {
-        // A steer and an already-generated private final can cross in transit.
-        // There is no native boundary that can attribute that final to the new
-        // parent task safely. Start a fresh turn on this same thread once idle.
-        const recovery = `Wait for this user turn to finish, inspect list_agents, then retry followup_task with the same agent ${a.id}. Its native thread and history are retained.`;
-        throw Object.assign(new Error(`Agent ${a.id} is handling a direct user turn. The parent task was not sent. ${recovery}`), {
-          code: 'private_turn_active', agent_id: a.id, thread_id: a.threadId, status: a.status, recovery,
-        });
-      }
       if (!a.turnId || a.status === 'compacting') throw new Error('Agent turn is not steerable yet.');
-      const turnId = a.turnId;
-      if (origin === 'user' && a.turnOrigin !== 'user') a.pendingUserSteer = { turnId, events: [] };
+      const turnId = a.turnId, turnOrigin = a.turnOrigin;
       a.sending = (a.sending ?? 0) + 1;
       try {
-        if (a.pendingUserSteer) await this.persist();
         const response = await this.rpc('turn/steer', { threadId: a.threadId, expectedTurnId: turnId, input: wireInput });
-        if (origin === 'user') { a.turnOrigin = 'user'; a.pendingUserSteer = null; await this.persist(); this.emit('state'); }
-        this.action('send', a, message, origin, attachments);
-        await this.persist();
-        return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
-      } catch (error) {
-        if (a.pendingUserSteer) {
-          const deferred = a.pendingUserSteer.events; a.pendingUserSteer = null;
-          this.pendingEvents.push(...deferred); this.pendingEvents.sort((a, b) => a.seq - b.seq); await this.persist();
-          for (const event of deferred) this.emit('event', copy(event));
+        // The acknowledgement can arrive after this turn completed and even
+        // after another turn started. Never transfer ownership of that new turn.
+        const crossedCompletion = a.turnId !== turnId || a.completedTurns.has(turnId);
+        if (followup && origin !== 'user' && !crossedCompletion && turnOrigin === 'user' && a.turnOrigin === 'user') {
+          // A private final item may precede the turn completion notification.
+          // Never reuse that already-observed text as the new parent's result.
+          a.result = null; a.unclassifiedResult = null;
+          a.turnOrigin = 'parent';
         }
-        throw error;
+        this.action('send', a, message, origin, attachments, turnId);
+        await this.persist();
+        return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId,
+          ...(crossedCompletion ? { recovery: 'The turn completed while the steer was being accepted. The message outcome is unknown; inspect the same agent before retrying.' } : {}) };
       } finally { a.sending--; if (a.interrupted) this.stopTree(a).catch(() => {}); }
     }
     if (a.resuming) throw new Error('Agent followup is already starting.');
@@ -1081,9 +1072,6 @@ export class AgentController extends EventEmitter {
     if (isUserSend({ kind, ...details })) return;
     if (isCompactionStatus({ kind }) || AUTOMATIC_TURN_EVENTS.has(kind) && a.turnOrigin === 'user') { this.persist().then(() => this.emit('state')).catch(() => {}); return; }
     const event = { seq: this.nextSeq++, agent_id: a.id, name: a.name ?? null, turn_id: details.turnId ?? a.turnId ?? a.lastTurnId ?? null, kind, ...details };
-    if (AUTOMATIC_TURN_EVENTS.has(kind) && a.pendingUserSteer?.turnId === event.turn_id) {
-      a.pendingUserSteer.events.push(event); this.persist().catch(() => {}); return;
-    }
     this.pendingEvents.push(event);
     // Keep every important event until a future explicit retention policy exists.
     // No tool output, thinking, or input prompt enters this durable journal.

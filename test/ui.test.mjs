@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hooks/ui.js';
 import { fileChangePage } from '../shared/file-changes.mjs';
 import { nativeHooks } from './native-hooks.mjs';
+import navigationSync from '../hooks/navigation-sync.js';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 
 // Native Box dimensions accept cells or percentages, not CSS unit strings.
@@ -270,16 +271,15 @@ test('conversation shows prose and expandable file changes with authoritative co
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
   const diff = '@@ -1,1 +1,1 @@\n-old\n+one\n';
   const entries = [{ id: 'm', type: 'agentMessage', turn_id: 't', data: { text: '正文直接显示' } }, { id: 'f', type: 'fileChange', turn_id: 't', deferred: true, data: { fileSummary: [{ path: 'test.js', added: 5, removed: 1 }], changes: [{ path: 'test.js', diff }] } }];
-  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : op === 'ui_detail' ? { text: diff, next_offset: args.offset ? null : 16000, format: 'source' } : { revision: 1, entries });
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', name: '代理', model: 'model', reasoning_effort: 'high' }] } : op === 'ui_detail' ? { text: diff, next_offset: null, format: 'source' } : { revision: 1, entries });
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   let tree = await draw(); assert.ok(nodes(tree).some(node => node.type === 'Markdown' && node.props.text === '正文直接显示'));
   const file = nodes(tree).find(node => node.props.key?.startsWith('file_'));
   assert.match(file.props.label, /test\.js \+5 -1/); await file.props.onPress(); await new Promise(setImmediate);
   tree = await draw(); const code = nodes(tree).find(node => node.type === 'Code');
-  assert.deepEqual(code.props, { key: 'file_code_a:t:f:file:0', source: diff, path: 'test.js', format: 'source', wrap: 'wrap' }, 'a partial detail page is source, not a complete patch');
-  await nodes(tree).find((node) => node.props.key?.startsWith('file_detail_')).props.onPress();
-  assert.equal(nodes(await draw()).find((node) => node.type === 'Code').props.format, 'source');
+  assert.equal(code.props.source, diff); assert.equal(code.props.format, 'source');
+  assert.ok(!nodes(tree).some(node => node.props.key?.startsWith('file_detail_')));
   assert.equal(nodes(tree).find((node) => node.props.key?.startsWith('codex_message_')).type, 'Input');
   closeUI();
 });
@@ -297,7 +297,7 @@ test('desktop file changes show a basename and diff rows with one icon copy acti
   await file.props.onPress();
   const tree = await draw(), all = nodes(tree);
   assertNativeDimensions(tree);
-  assert.ok(all.some(node => node.props.key === 'file_diff_a:t:file:file:0'));
+  assert.ok(all.some(node => node.props.key === 'file_diff_a:t:file:file:0:0'));
   assert.ok(all.some(node => node.type === 'Text' && node.props.children.includes('<literal html>')));
   assert.ok(all.some(node => node.props.backgroundColor === 'rgba(46,160,67,0.16)'));
   assert.ok(!JSON.stringify(tree).includes('复制文件路径'));
@@ -1027,7 +1027,7 @@ test('media traversal limit notice remains visible when no images were found', a
   assert.ok((await draw()).some(n => n.props.key === 'tool_media_scan_notice_a:t:limited' && n.props.children[0] === 'More media was not scanned.'));
 });
 
-test('file changes present native kinds, source additions, moves and paged diff rows', async (t) => {
+test('file changes present native kinds, source additions, moves and continuous diff rows', async (t) => {
   const hooks = [], copies = [], requests = [];
   const changes = [
     { path: 'C:/p/new.md', kind: 'add', content: `# List
@@ -1045,7 +1045,7 @@ test('file changes present native kinds, source additions, moves and paged diff 
     { path: 'C:/p/unknown.txt', diff: 'opaque content' },
   ];
   const entries = changes.map((change, i) => ({ id: `file${i}`, turn_id: 't', type: 'fileChange', ...(i === 3 ? { deferred: true } : {}), data: { changes: [change] } }));
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map(type => [type, props => ({ type, props })])), copy: async value => { copies.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])), copy: async value => { copies.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries }; if (op === 'ui_detail') { requests.push(args); return fileChangePage(changes[3], args.offset); } return { entries: [], next_cursor: null }; });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
@@ -1053,11 +1053,149 @@ test('file changes present native kinds, source additions, moves and paged diff 
   let tree = await draw(); assert.equal(tree.find(n => n.props.key === 'file_a:t:file0:file:0').props.label.replace(/ ›$/, ''), '已创建 new.md +3 -0'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file1:file:0').props.label.replace(/ ›$/, ''), '已删除 old.txt +0 -1'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file2:file:0').props.label.replace(/ ›$/, ''), '已编辑 oldname.txt → newname.txt +1 -1'); assert.equal(tree.find(n => n.props.key === 'file_a:t:file4:file:0').props.label.replace(/ ›$/, ''), '已更改 unknown.txt');
   await click('file_a:t:file0:file:0'); tree = await draw(); const added = tree.filter(n => n.type === 'Box' && n.props.backgroundColor?.includes('46,160,67')); assert.equal(added.length, 3); assert.ok(!tree.some(n => n.type === 'Box' && n.props.backgroundColor?.includes('248,81,73')));
   await click('file_a:t:file1:file:0'); tree = await draw(); assert.ok(tree.some(n => n.type === 'Box' && n.props.backgroundColor?.includes('248,81,73')));
-  await click('file_a:t:file4:file:0'); assert.ok((await draw()).some(n => n.props.key === 'file_code_a:t:file4:file:0' && n.props.format === 'source'));
-  await click('file_a:t:file3:file:0'); await new Promise(setImmediate); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0')); assert.ok(tree.some(n => n.props.label === '复制当前页差异'));
-  await tree.find(n => n.props.key === 'diff_copy_a:t:file3:file:0').props.onPress(); assert.equal(copies[0], fileChangePage(changes[3], 0).text);
-  await click('file_detail_a:t:file3:file:0'); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0')); assert.ok(tree.some(n => n.props.key === 'file_prev_a:t:file3:file:0'));
-  await click('file_prev_a:t:file3:file:0'); assert.equal(requests.at(-1).offset, 0);
+  await click('file_a:t:file4:file:0'); assert.ok((await draw()).some(n => n.props.key === 'file_code_a:t:file4:file:0:0' && n.props.format === 'source'));
+  await click('file_a:t:file3:file:0'); await new Promise(setImmediate); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0:0'));
+  assert.ok(!tree.some(n => ['下一页输出', '上一页输出', '复制当前页差异'].includes(n.props.label)));
+  await tree.find(n => n.props.key === 'diff_copy_a:t:file3:file:0').props.onPress();
+  let full = '', offset = 0;
+  do { const page = fileChangePage(changes[3], offset); full += page.text; offset = page.next_offset; } while (offset != null);
+  assert.equal(copies[0], full);
+  assert.equal(requests.filter(r => r.offset === 0).length, 1);
+});
+
+test('visible file buffer prefetches once and reuses cached pages after collapse', async (t) => {
+  const hooks = [], requests = [];
+  const change = { path: 'stream.txt', kind: 'add', content: Array.from({ length: 1200 }, (_, i) => `line ${i}\n`).join('') };
+  const entry = { id: 'stream', turn_id: 't', type: 'fileChange', deferred: true, data: { changes: [change] } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [entry] };
+    if (op === 'ui_detail') { requests.push(args.offset); return fileChangePage(change, args.offset); }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
+  const click = async () => (await draw()).find(n => n.props.key === 'file_a:t:stream:file:0').props.onPress();
+  const send = async control => hooks.find(h => h.event === 'ui.message').fn($, { element: control.props.key, data: { action: 'file-load', token: control.props.props.token } }, () => ({}));
+  await click(); let tree = await draw();
+  assert.equal(requests.length, 2);
+  const control = tree.find(n => n.type === 'Client' && n.props.key.startsWith('file_load_'));
+  assert.ok(control, 'the visible buffer exposes its prefetch control');
+  await send(control); assert.ok(requests.length > 2);
+  assert.ok((await draw()).filter(n => n.type === 'Box' && n.props.backgroundColor?.includes('46,160,67')).length < 1200, 'the history window mounts a bounded portion of a large file');
+  const afterPrefetch = requests.length;
+  await send(control); assert.equal(requests.length, afterPrefetch, 'a stale token cannot fetch twice');
+  await click(); await click(); assert.equal(requests.length, afterPrefetch, 'reopening uses the buffered pages');
+  tree = await draw(); assert.ok(!tree.some(n => ['下一页输出', '上一页输出', '获取更多'].includes(n.props.label)));
+});
+
+test('1200-line file beyond 100k characters remains continuous in both directions', async (t) => {
+  const hooks = [], requests = [], timers = new Set(); let painted = [], nativePainted = [], closed = false, queued = false, offset = 0;
+  const pending = new Set(), states = new Map(), seenForward = new Set(), seenBack = new Set();
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const change = { path: 'long.txt', kind: 'add', content: Array.from({ length: 1200 }, (_, i) => `line ${i} ${'x'.repeat(100)}\n`).join('') };
+  assert.ok(change.content.length > 100000);
+  const entry = { id: 'long', turn_id: 't', type: 'fileChange', deferred: true, data: { changes: [change] } };
+  const $ = { ui: {
+    resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])),
+    open: async () => { nativePainted = painted; return { isPlaced: true }; }, invalidate() {},
+    scroll: async args => {
+      if (args.to?.key) {
+        const marker = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
+        if (marker < 0) throw Error(`unpainted marker ${args.to.key}`);
+        const contentRows = Math.max(30, nativePainted.filter(n => n.type === 'Text').length + 10);
+        const preceding = nativePainted.slice(0, marker).filter(n => n.type === 'Text').length;
+        const destination = args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + preceding : 3;
+        const event = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
+        offset = (await host.dispatch('ui.scroll', event)).offset;
+      }
+      return {};
+    },
+  }, clock: { every: () => ({ cancel() {} }), after: (ms, fn) => { const timer = setTimeout(() => { timers.delete(timer); host.callback(fn); }, ms); timers.add(timer); return { cancel() { clearTimeout(timer); timers.delete(timer); } }; } },
+  state: { get: async () => ({ value: 0, version: 0 }), set: async () => { if (!queued) { queued = true; setImmediate(async () => { queued = false; if (!closed) await draw(); }); } return { isSet: true }; } } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [entry] };
+    if (op === 'ui_detail') { requests.push(args.offset); return fileChangePage(change, args.offset); }
+    return { entries: [], next_cursor: null };
+  });
+  const host = nativeHooks(hooks, $); closeUI(); registerUI(host.on);
+  t.after(() => { closed = true; for (const timer of timers) clearTimeout(timer); closeUI(); });
+  const draw = async () => {
+    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10 } } }, () => null));
+    assert.ok(painted.length <= 12000);
+    assert.ok(painted.filter(n => n.type === 'Text').reduce((sum, n) => sum + n.props.children.join('').length, 0) < 80000);
+    for (const client of painted.filter(n => n.type === 'Client')) {
+      const key = client.props.key;
+      const post = data => { const task = new Promise(resolve => setImmediate(resolve)).then(() => { if (!closed) return host.surface(() => host.dispatch('ui.message', { element: key, data })); }); pending.add(task); task.finally(() => pending.delete(task)); };
+      if (client.props.module === './navigation-sync.js') {
+        const surface = { state: states.get(key) ?? {}, setState(value) { states.set(key, value); }, post, elements: { Box: props => props } };
+        navigationSync(client.props.props, surface);
+      } else if (client.props.module === './file-stream-control.js') {
+        const token = client.props.props.token;
+        if (states.get(key) !== token) { states.set(key, token); post({ action: 'file-load', token }); }
+      }
+    }
+    return painted;
+  };
+  const settle = async () => { await wait(350); while (pending.size) await Promise.all([...pending]); await draw(); };
+  const collect = set => { for (const n of painted) if (n.type === 'Text') for (const child of n.props.children ?? []) { const match = /^line (\d+) x+$/.exec(child); if (match) set.add(Number(match[1])); } };
+  const wheel = async direction => {
+    const contentRows = Math.max(30, painted.filter(n => n.type === 'Text').length + 10);
+    const at = direction < 0 ? 0 : contentRows - 10;
+    const by = direction * Math.max(1, Math.abs(at - offset)); offset = at;
+    await host.dispatch('ui.scroll', { origin: { kind: 'person' }, by, offset: at, contentRows, bodyRows: 10 });
+    await settle();
+  };
+  await openAgent($, 'a'); await draw(); await settle();
+  await painted.find(n => n.props.key === 'file_a:t:long:file:0').props.onPress(); await settle();
+  for (let i = 0; i < 80 && !seenForward.has(1199); i++) { collect(seenForward); if (!seenForward.has(1199)) await wheel(1); }
+  assert.ok(seenForward.has(1199), `forward traversal stalled at ${Math.max(...seenForward)}; requests ${requests.length}`);
+  assert.deepEqual([...seenForward].sort((a, b) => a - b), Array.from({ length: 1200 }, (_, i) => i));
+  const fetched = requests.length;
+  for (let i = 0; i < 80 && !seenBack.has(0); i++) { collect(seenBack); if (!seenBack.has(0)) await wheel(-1); }
+  assert.ok(seenBack.has(0), `backward traversal stalled at ${Math.min(...seenBack)}`);
+  assert.deepEqual([...seenBack].sort((a, b) => a - b), Array.from({ length: 1200 }, (_, i) => i));
+  assert.equal(requests.length, fetched, 'backward traversal uses cached pages');
+});
+
+test('switching agents discards late file reads', async (t) => {
+  const hooks = []; let release;
+  const entry = { id: 'pending', turn_id: 't', type: 'fileChange', deferred: true, data: { changes: [{ path: 'pending.txt' }] } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a' }, { agent_id: 'b' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: args.target === 'a' ? [entry] : [] };
+    if (op === 'ui_detail') return new Promise(resolve => { release = () => resolve({ text: 'late file output', format: 'source', next_offset: null }); });
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
+  const pending = (await draw()).find(n => n.props.key === 'file_a:t:pending:file:0').props.onPress();
+  await new Promise(setImmediate); await openAgent($, 'b'); release(); await pending;
+  assert.ok(!JSON.stringify(await draw()).includes('late file output'));
+});
+
+test('collapsing a file discards a late page and allows a fresh read', async (t) => {
+  const hooks = [], requests = []; let release;
+  const change = { path: 'pending.txt', kind: 'add', content: Array.from({ length: 130 }, (_, i) => `line ${i}\n`).join('') };
+  const entry = { id: 'pending', turn_id: 't', type: 'fileChange', deferred: true, data: { changes: [change] } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] };
+    if (op === 'ui_revision') return { revision: 1, entries: [entry] };
+    if (op === 'ui_detail') { requests.push(args.offset); if (requests.length === 1) return new Promise(resolve => { release = () => resolve(fileChangePage(change, args.offset)); }); return fileChangePage(change, args.offset); }
+    return { entries: [], next_cursor: null };
+  });
+  closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
+  const click = async () => (await draw()).find(n => n.props.key === 'file_a:t:pending:file:0').props.onPress();
+  const pending = click(); await new Promise(setImmediate); assert.equal(requests.length, 1);
+  await click(); release(); await pending;
+  assert.ok(!(await draw()).some(n => n.props.key?.startsWith('file_diff_a:t:pending:file:0')));
+  await click(); assert.deepEqual(requests.slice(0, 2), [0, 0]);
+  assert.ok((await draw()).some(n => n.props.key?.startsWith('file_diff_a:t:pending:file:0')));
 });
 
 test('closed observation never redraws and starting agents do not read saved history', async () => {

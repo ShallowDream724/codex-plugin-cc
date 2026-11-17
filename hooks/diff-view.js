@@ -3,7 +3,7 @@ const PAGE_SIZE = 120;
 
 export const parseDiff = parseUnifiedDiff;
 
-export function renderDiff({ Box, Text, Button }, { key, source, rows: suppliedRows, page = 0, onPage, onCopy, copyControl }) {
+export function renderDiff({ Box, Text, Button }, { key, source, rows: suppliedRows, page = 0, onPage, onCopy, copyControl, framed = true, lineWidth: suppliedWidth = 2 }) {
   const detailed = suppliedRows == null ? parseUnifiedDiffDetailed(source) : null;
   const parsed = suppliedRows ?? detailed;
   if (!Array.isArray(parsed) || !parsed.length) return null;
@@ -11,7 +11,7 @@ export function renderDiff({ Box, Text, Button }, { key, source, rows: suppliedR
   // A valid empty diff still has a hunk, even though it has no visible rows.
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const current = Number.isFinite(page) ? Math.max(0, Math.min(pages - 1, Math.trunc(page))) : 0;
-  const lineWidth = rows.reduce((width, row) => Math.max(width, String(row.old ?? '').length, String(row.new ?? '').length), 2);
+  const lineWidth = rows.reduce((width, row) => Math.max(width, String(row.old ?? '').length, String(row.new ?? '').length), suppliedWidth);
   const visible = rows.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE);
   // Preserve exact raw patch bytes, including headers, delimiters and CRLF.
   // Server-supplied rows already correspond to the raw source page.
@@ -37,5 +37,5 @@ export function renderDiff({ Box, Text, Button }, { key, source, rows: suppliedR
     children.push(Box({ key: `${key}:pages`, flexDirection: 'row', gap: 'sm', children: navigation }));
   }
   if (copy) children.push(Box({ key: `${key}:copy_position`, position: 'absolute', right: 0, top: 0, children: [copy] }));
-  return Box({ key, position: 'relative', flexDirection: 'column', width: '100%', borderStyle: 'round', borderDimColor: true, children });
+  return Box({ key, position: 'relative', flexDirection: 'column', width: '100%', ...(framed ? { borderStyle: 'round', borderDimColor: true } : {}), children });
 }

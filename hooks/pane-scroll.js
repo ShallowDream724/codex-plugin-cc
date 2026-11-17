@@ -2,7 +2,7 @@
 // revision marker: Desktop's key table does not contain Box keys. Native leaf
 // layout can settle after that marker, so changed frames get another sample.
 // Never await network/history work in the wheel handler.
-export function paneScroll({ scroll, later, valid, position, refresh, settleBeforeCommit = false }) {
+export function paneScroll({ scroll, later, valid, position, refresh, settleBeforeCommit = false, synchronousLayout = () => false }) {
   let pending = null, serial = 0, disposed = false;
   const sample = e => ({ offset: Math.max(0, e.offset - (e.origin.kind === 'plugin' ? e.by : 0)), contentRows: e.contentRows, bodyRows: e.bodyRows, ...(e.origin.kind === 'plugin' ? { anchorOffset: e.offset } : {}) });
   let latest = null, intent = 0;
@@ -84,7 +84,8 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
           result = request.result;
           if (!atomic) position(result.offset);
           const stable = anchor ? previous?.anchorOffset === result.anchorOffset && (!atomic || previous?.contentRows === result.contentRows) : previous?.contentRows === result.contentRows;
-          if (!before || elapsed >= (anchor ? 224 : 96) && stable && previous.bodyRows === result.bodyRows) { settled = true; break; }
+          const minimum = atomic && synchronousLayout() ? 32 : anchor ? 224 : 96;
+          if (!before || elapsed >= minimum && stable && previous.bodyRows === result.bodyRows) { settled = true; break; }
           previous = result;
         } else previous = null;
       }

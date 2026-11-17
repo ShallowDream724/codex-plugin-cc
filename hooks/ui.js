@@ -10,6 +10,8 @@ import { nativeRenderBudget } from './render-budget.js';
 import { paneScroll } from './pane-scroll.js';
 import { planHistoryWindow } from './history-window.js';
 import { renderAgentDirectory } from './agent-directory.js';
+import { fileViewEntries, appendFilePage } from './file-stream.js';
+import { parseUnifiedDiffDetailed } from '../shared/unified-diff.mjs';
 
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
@@ -35,6 +37,20 @@ const detailFor = (page, entry, filePath, view) => page.details.get(detailKey(en
 function cacheDetail(page, key, value) {
   page.details.delete(key); page.details.set(key, value);
   while (page.details.size > MAX_DETAILS) page.details.delete(page.details.keys().next().value);
+}
+function cacheFileDetail(page, key, value, foldKey) {
+  page.fileDetails ??= new Map();
+  page.fileDetails.delete(key); page.fileDetails.set(key, { ...value, foldKey });
+  // Tool-output cache churn must never evict a file being read. Reclaim only
+  // closed files; their next expansion can reload them without moving a reader.
+  const files = [...page.fileDetails];
+  let size = files.reduce((sum, [, detail]) => sum + (detail.chunks ?? []).reduce((n, chunk) => n + chunk.text.length, 0), 0);
+  for (const [candidate, detail] of files) {
+    if (page.fileDetails.size <= MAX_DETAILS && size <= 16 * 1024 * 1024) break;
+    if (candidate === key || state.folds.has(detail.foldKey)) continue;
+    page.fileDetails.delete(candidate);
+    size -= (detail.chunks ?? []).reduce((n, chunk) => n + chunk.text.length, 0);
+  }
 }
 const groupable = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch']);
 const outputTypes = new Set(['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'functionCallOutput']);
@@ -184,7 +200,16 @@ function mergeLive(page, entries, prepend = false) {
   if (changed) page.timeline = null;
   return changed;
 }
-function conversationEntries(all) {
+function fileStreamDetail(page, entry, path) {
+  const loaded = page.fileDetails?.get(detailKey(entry, path));
+  if (loaded?.chunks) return loaded;
+  const change = entry.data?.changes?.find(item => item.path === path);
+  const raw = change?.content ?? change?.unified_diff ?? change?.diff;
+  if (entry.file_preview?.complete === false || entry.deferred || typeof raw !== 'string' || raw.length >= 4096 || raw.includes('[truncated]')) return loaded;
+  const source = fileChangeSource(change);
+  return { chunks: [{ offset: 0, ...source, rows: source.format === 'diff' ? parseUnifiedDiffDetailed(source.text) : undefined }], next_offset: null, offset: 0 };
+}
+function conversationEntries(all, page) {
   const messageKey = (entry) => {
     if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) return null;
     const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
@@ -195,15 +220,32 @@ function conversationEntries(all) {
     const key = messageKey(entry);
     if (key && !String(entry.id).startsWith('action:')) nativeCopies.set(key, (nativeCopies.get(key) ?? 0) + 1);
   }
-  return orderWaits(all.filter((entry) => {
+  const entries = orderWaits(all.filter((entry) => {
     if (!String(entry.id).startsWith('action:')) return true;
     const key = messageKey(entry), count = nativeCopies.get(key) ?? 0;
     if (!count) return true;
     nativeCopies.set(key, count - 1); return false;
   }));
+  return page ? entries.flatMap(entry => fileViewEntries(entry, page.agentId, { isOpen: key => state.folds.has(key), getDetail: path => fileStreamDetail(page, entry, path) })) : entries;
+}
+function refreshFileTimeline(page) {
+  const old = drawnWindow(page), first = old.entries[0] && entryKey(old.entries[0]);
+  page.timeline = conversationEntries(page.live, page);
+  if (page.navigationTimeline) return;
+  const size = Math.min(RAW_WINDOW_LIMIT, Math.max(1, old.entries.length + Math.max(0, page.timeline.length - old.total)));
+  if (!page.followTail && first) {
+    const start = page.timeline.findIndex(entry => entryKey(entry) === first);
+    if (start >= 0) {
+      page.windowStart = start; page.windowEnd = start + size;
+      page.windowSize = size;
+    }
+  }
+  const indices = new Map(page.timeline.map((entry, index) => [entryKey(entry), index]));
+  page.renderedGroups = page.renderedGroups?.flatMap(group => indices.has(group.key) ? [{ ...group, start: indices.get(group.key), end: indices.get(group.key) + group.end - group.start }] : []);
+  page.renderedWindow = null;
 }
 function timelineWindow(page, count = page.windowSize ?? VISIBLE_ENTRIES, from) {
-  const all = page.navigationTimeline ?? (page.timeline ??= conversationEntries(page.live)), lastStart = Math.max(0, all.length - count);
+  const all = page.navigationTimeline ?? (page.timeline ??= conversationEntries(page.live, page)), lastStart = Math.max(0, all.length - count);
   const anchor = page.windowAnchor ? all.findIndex(entry => entryKey(entry) === page.windowAnchor) : -1;
   // Budget retries shrink the count and pass the previous start. In tail mode
   // recalculate from the end for each retry, unless an expanded item is held.
@@ -294,6 +336,7 @@ function scrollController($, id, page) {
     position: offset => state.scroll.set(id, offset),
     refresh: () => refreshPaneGeometry($, page),
     settleBeforeCommit: page.surface === 'desktop',
+    synchronousLayout: () => page.synchronousFileLayout === true,
   });
   return page.scroller = controller;
 }
@@ -301,7 +344,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   // Height differences must describe this navigation only. Polls may keep
   // merging into the data cache, but cannot append/resize a different record
   // in the middle of our two measured frames.
-  page.navigationTimeline ??= page.timeline ??= conversationEntries(page.live);
+  page.navigationTimeline ??= page.timeline ??= conversationEntries(page.live, page);
   const scroller = scrollController($, id, page), gen = state.generation;
   const oldView = drawnWindow(page);
   const oldGroups = page.renderedGroups;
@@ -387,7 +430,7 @@ async function browseHistory($, id, direction) {
     page.layoutFloor = null;
     page.edgeCooldownUntil = Date.now() + 150;
     if (!page.followTail && first && last) {
-      const all = page.timeline ??= conversationEntries(page.live), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
+      const all = page.timeline ??= conversationEntries(page.live, page), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
       if (start >= 0 && end >= start) { page.windowStart = start; page.windowEnd = end + 1; page.windowSize = end - start + 1; }
     }
     if (state.opened && state.selected === id && gen === state.generation) void invalidate($);
@@ -492,7 +535,7 @@ async function chooseAttachments($, id, source = 'file') {
   finally { control.picking = false; if (state.opened && state.selected === id) await invalidate($); }
 }
   const pageFor = (id) => {
-    if (!state.pages.has(id)) state.pages.set(id, { live: [], windowStart: 0, followTail: true, revision: undefined, historyChecked: false, cursor: null, liveError: '', historyError: '', busy: false, historyLoading: false, historyGeneration: 0, scrollGeneration: 0, detailSequence: 0, details: new Map(), detailRequests: new Map() });
+    if (!state.pages.has(id)) state.pages.set(id, { agentId: id, live: [], windowStart: 0, followTail: true, revision: undefined, historyChecked: false, cursor: null, liveError: '', historyError: '', busy: false, historyLoading: false, historyGeneration: 0, scrollGeneration: 0, detailSequence: 0, details: new Map(), detailRequests: new Map() });
     const page = state.pages.get(id); state.pages.delete(id); state.pages.set(id, page);
     while (state.pages.size > 16) {
       const old = state.pages.keys().next().value; state.pages.delete(old); state.scroll.delete(old);
@@ -795,6 +838,58 @@ async function chooseAttachments($, id, source = 'file') {
     await invalidate($);
     if (!background) await fetch();
   }
+  async function loadFileStream($, id, entry, path, foldKey, expectedOffset) {
+    const page = pageFor(id), key = detailKey(entry, path), gen = state.generation;
+    const cached = fileStreamDetail(page, entry, path);
+    const offset = cached?.chunks?.length ? cached.next_offset : 0;
+    if (page.detailRequests.has(key) || offset == null || expectedOffset !== undefined && expectedOffset !== offset) return;
+    const request = ++page.detailSequence;
+    page.detailRequests.set(key, request);
+    const current = () => page.detailRequests.get(key) === request && state.selected === id && state.opened && state.generation === gen && state.folds.has(foldKey);
+    try {
+      let position = offset;
+      // Two transport pages ahead: reading the next screen normally uses cache.
+      for (let ahead = 0; ahead < 2 && position != null; ahead++) {
+        const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, file_path: path, offset: position });
+        if (!current()) return;
+        if (result.error || result.offline || typeof result.text !== 'string') throw new Error(failureText(result));
+        const next = appendFilePage(fileStreamDetail(page, entry, path), result, position);
+        cacheFileDetail(page, key, next, foldKey);
+        refreshFileTimeline(page);
+        await invalidate($);
+        position = next.next_offset;
+      }
+    } catch (error) {
+      if (current()) {
+        cacheFileDetail(page, key, { ...fileStreamDetail(page, entry, path), error: `无法读取文件内容：${failureText(error)}` }, foldKey);
+      }
+    } finally {
+      if (current()) {
+        page.detailRequests.delete(key);
+        refreshFileTimeline(page);
+        await invalidate($);
+      } else if (page.detailRequests.get(key) === request) page.detailRequests.delete(key);
+    }
+  }
+  async function copyFile($, id, entry, path, foldKey, surface) {
+    return copyWithFeedback($, id, `diff:${foldKey}`, surface, async valid => {
+      const cached = fileStreamDetail(pageFor(id), entry, path);
+      let text = cached?.chunks?.map(chunk => chunk.text).join('') ?? '';
+      let offset = cached?.chunks?.length ? cached.next_offset : 0, count = 0;
+      while (offset != null) {
+        if (++count > MAX_COPY_PAGES) throw new Error('文件超过剪贴板大小限制');
+        const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, file_path: path, offset });
+        if (!valid()) return;
+        if (result.error || result.offline || typeof result.text !== 'string') throw new Error(failureText(result));
+        text += result.text;
+        if (text.length > MAX_COPY_LENGTH) throw new Error('文件超过剪贴板大小限制');
+        if (result.next_offset != null && (!Number.isSafeInteger(result.next_offset) || result.next_offset <= offset)) throw new Error('读取位置未推进');
+        offset = result.next_offset;
+      }
+      if (text.length > MAX_COPY_LENGTH) throw new Error('文件超过剪贴板大小限制');
+      return text;
+    });
+  }
   async function copyWithFeedback($, id, key, surface, read) {
     const page = pageFor(id), gen = state.generation, intent = ++copyIntent;
     const valid = () => intent === copyIntent && state.opened && state.selected === id && state.generation === gen;
@@ -1044,6 +1139,11 @@ export function registerUI(on) {
       await browseHistory($, state.selected, request.direction);
       return {};
     }
+    const file = controlFor(state.selected).fileActions?.get(e.element);
+    if (file && e.data?.action === 'file-load' && file.token === e.data.token) {
+      await loadFileStream($, state.selected, file.source, file.path, file.key, file.offset);
+      return {};
+    }
     const preview = controlFor(state.selected).imageActions?.get(e.element);
     if (preview && e.data?.action === 'preview' && state.folds.has(preview.foldKey) && !state.imagePreview) {
       await showImagePreview($, state.selected, preview); return {};
@@ -1120,6 +1220,7 @@ function renderPane($, e, next) {
     page.surface = e.surface;
     control.iconActions = new Map();
     control.imageActions = new Map();
+    control.fileActions = new Map();
     control.navigationActions = new Map();
     if (state.imagePreview?.agentId === id) {
       const preview = state.imagePreview, columns = e.props?.bodyColumns, rows = e.props?.scroll?.bodyRows;
@@ -1270,7 +1371,7 @@ function renderPane($, e, next) {
           ] })] }));
         };
         const node = paginate();
-        return { node, cost: budget.cost(node), paginate };
+        return { node, cost: budget.cost(node), ...(first.fileView ? {} : { paginate }) };
       };
       if (group.items.length > 1 || group.integration) {
         const groupLabel = group.integration ? `已使用 ${safe(group.integration)} 集成` : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
@@ -1322,45 +1423,44 @@ function renderPane($, e, next) {
           itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', justifyContent: incoming ? 'flex-end' : 'flex-start', children: [bounded] }));
           continue;
         }
-        const fileList = entry.data?.fileSummary?.length ? entry.data.fileSummary : entry.data?.changes;
-        if (entry.type === 'fileChange' && Array.isArray(fileList) && fileList.length) {
-          fileList.forEach((change, index) => {
-            const fileKey = `${key}:file:${index}`, open = state.folds.has(fileKey);
-            const rawChange = entry.data?.changes?.find((item) => item.path === change.path) ?? change;
-            const diff = rawChange.content ?? rawChange.unified_diff ?? rawChange.diff;
-            const filePath = typeof change.path === 'string' ? change.path : '';
-            const deferred = entry.file_preview?.complete === false || entry.deferred || typeof diff !== 'string' || diff.length >= 4096 || diff.includes('[truncated]');
-            const summary = entry.data?.fileSummary?.length ? change : fileChangeSummary(deferred ? { ...rawChange, diff: undefined, content: undefined, unified_diff: undefined } : rawChange);
-            itemRows.push(disclosure(`file_${fileKey}`, changeLabel(summary), () => {
+        if (entry.fileView) {
+          const file = entry.fileView, fileKey = file.key, original = file.source;
+          const loaded = fileStreamDetail(page, original, file.path);
+          if (file.kind === 'header') {
+            const open = state.folds.has(fileKey);
+            const deferred = original.deferred || original.file_preview?.complete === false;
+            const summary = file.summary ?? fileChangeSummary(deferred ? { ...file.change, diff: undefined, content: undefined, unified_diff: undefined } : file.change);
+            itemRows.push(disclosure(`file_${fileKey}`, changeLabel(summary), async () => {
+              if (!page.followTail) holdWindow(page);
               toggle(fileKey);
-              if (open) page.detailRequests.delete(detailKey(entry, filePath));
-              else if (deferred && !detailFor(page, entry, filePath)) return detail($, id, entry, 0, fileKey, filePath, true);
-              return invalidate($);
-            }, entry, false, open));
-            if (open) {
-              const loaded = detailFor(page, entry, filePath);
-              const inline = !deferred ? fileChangeSource(rawChange) : { text: null, format: 'source' };
-              const rawSource = loaded && !loaded.error ? loaded.text : inline.text;
-              const source = safe(rawSource ?? '');
-              const format = loaded && !loaded.error ? loaded.format : inline.format;
-              const paged = loaded && !loaded.error && (loaded.previous_offset != null || loaded.next_offset != null);
-              const copyControl = (copyText, localPaged) => {
-                const label = paged || localPaged ? '复制当前页差异' : '复制差异';
-                const copy = (press = {}) => copyWithFeedback($, id, `diff:${fileKey}`, press.surface ?? e.surface, copyText);
-                return copyButton(`diff_copy_${fileKey}`, `diff:${fileKey}`, label, copy);
-              };
-              const diffView = e.surface === 'desktop' && format === 'diff' ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}`, source: rawSource, rows: loaded && !loaded.error ? loaded.rows : undefined, page: page.diffPages?.get(fileKey) ?? 0, copyControl, onPage: (value) => {
-                page.diffPages ??= new Map(); page.diffPages.set(fileKey, value);
-                if (page.diffPages.size > 64) page.diffPages.delete(page.diffPages.keys().next().value);
-                return invalidate($);
-              } }) : null;
-              if (rawSource != null) itemRows.push(diffView ?? (typeof Code === 'function' ? Code({ key: `file_code_${fileKey}`, source, ...(filePath ? { path: filePath.split(/[\\/]/).at(-1) } : {}), ...(Number.isSafeInteger(loaded?.startLine) && loaded.startLine > 0 ? { startLine: loaded.startLine } : {}), format: format === 'diff' && (!loaded || (loaded.offset === 0 && loaded.next_offset == null)) ? 'diff' : 'source', wrap: 'wrap' }) : Text({ key: `file_code_${fileKey}`, mono: true, size: 'caption', children: [source] })));
-              if (page.copyError?.key === `diff:${fileKey}`) itemRows.push(caption(`diff_copy_error_${fileKey}`, page.copyError.text));
-              if (loaded?.error) itemRows.push(caption(`file_error_${fileKey}`, loaded.text));
-              if (loaded?.previous_offset != null) itemRows.push(disclosure(`file_prev_${fileKey}`, '上一页输出', () => detail($, id, entry, loaded.previous_offset, fileKey, filePath)));
-              if (!page.detailRequests.has(detailKey(entry, filePath)) && !String(entry.id).startsWith('action:') && ((!loaded && deferred) || loaded?.error || loaded?.next_offset != null)) itemRows.push(disclosure(`file_detail_${fileKey}`, loaded?.error ? '重试获取内容' : loaded ? '下一页输出' : '获取更多', () => detail($, id, entry, loaded?.error ? loaded.offset : loaded?.next_offset ?? 0, fileKey, filePath)));
-            }
-          });
+              if (open) page.detailRequests.delete(detailKey(original, file.path));
+              refreshFileTimeline(page);
+              await invalidate($);
+              if (!open && !loaded?.chunks) await loadFileStream($, id, original, file.path, fileKey);
+            }, { ...entry, type: 'fileChange' }, false, open));
+          } else if (file.kind === 'chunk') {
+            const copy = file.isFirst ? copyButton(`diff_copy_${fileKey}`, `diff:${fileKey}`, '复制差异', (press = {}) => copyFile($, id, original, file.path, fileKey, press.surface ?? e.surface)) : undefined;
+            const diff = file.format === 'diff' && Array.isArray(file.rows)
+              ? renderDiff({ Box, Text, Button }, { key: `file_diff_${fileKey}:${file.chunkIndex}`, rows: file.rows, source: file.text, framed: false, lineWidth: file.lineWidth, copyControl: copy })
+              : null;
+            if (diff) itemRows.push(diff);
+            else if (file.format !== 'diff') itemRows.push(Box({ key: `file_source_${key}`, flexDirection: 'column', children: [
+              ...(copy ? [copy] : []), sourceCode(`file_code_${fileKey}:${file.chunkIndex}`, file.text),
+            ] }));
+          } else if (file.error) {
+            itemRows.push(caption(`file_error_${fileKey}`, file.error));
+            itemRows.push(disclosure(`file_retry_${fileKey}`, '重试读取', () => loadFileStream($, id, original, file.path, fileKey)));
+          } else {
+            itemRows.push(caption(`file_loading_${fileKey}`, '正在读取文件内容…'));
+          }
+          if ((file.prefetch || file.kind === 'tail') && !loaded?.error && (loaded?.next_offset != null || !loaded?.chunks)) {
+            const offset = loaded?.chunks?.length ? loaded.next_offset : 0;
+            const token = JSON.stringify([state.generation, fileKey, offset]);
+            const controlKey = `file_load_${key}`;
+            control.fileActions.set(controlKey, { ...file, token, offset });
+            if (typeof Client === 'function') itemRows.push(Box({ position: 'relative', height: 0, children: [Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 1, children: [Client({ key: controlKey, module: './file-stream-control.js', width: 1, height: 1, props: { token } })] })] }));
+          }
+          if (file.isFirst && page.copyError?.key === `diff:${fileKey}`) itemRows.push(caption(`diff_copy_error_${fileKey}`, page.copyError.text));
           continue;
         }
         const toolStart = itemRows.length;
@@ -1574,10 +1674,23 @@ function renderPane($, e, next) {
     }
     if (selectedGroups.length) { plan.start = selectedGroups[0].start; plan.end = selectedGroups.at(-1).end; }
     entries = entries.slice(plan.start - candidateStart, plan.end - candidateStart);
+    page.synchronousFileLayout = entries.length > 0 && entries.every(entry => entry.fileView && (entry.fileView.kind !== 'chunk' || entry.fileView.format === 'diff'));
     view = { ...view, start: plan.start, entries };
     hasEarlier = view.start > 0 || !!page.cursor;
     hasLater = view.start + entries.length < view.total;
-    const tree = root([timeline(selectedGroups.map(group => group.node))]);
+    // Adjacent chunks are one visual file, with no paragraph gap at buffer edges.
+    const visualGroups = [];
+    let cluster = null;
+    for (const group of selectedGroups) {
+      const file = group.group.items[0]?.fileView;
+      if (file?.kind === 'chunk') {
+        if (!cluster || cluster.key !== file.key) {
+          cluster = { key: file.key, nodes: [] }; visualGroups.push(cluster);
+        }
+        cluster.nodes.push(group.node);
+      } else { cluster = null; visualGroups.push({ node: group.node }); }
+    }
+    const tree = root([timeline(visualGroups.map(group => group.node ?? Box({ key: `file_buffer_${group.key}`, flexDirection: 'column', gap: 0, minWidth: 0, children: group.nodes })))]);
     page.renderedGroups = selectedGroups.map(({ start, end, key, cost }) => ({ start, end, key, cost }));
     page.renderedWindow = { ...view, entries, timeline: page.navigationTimeline ?? page.timeline }; page.renderCost = budget.cost(tree);
     if (!page.followTail) { page.windowStart = view.start; page.windowEnd = view.start + entries.length; page.windowSize = Math.max(1, entries.length); }

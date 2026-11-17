@@ -126,6 +126,36 @@ test('settled measurement holds the viewport through changing geometry and commi
   assert.deepEqual(positions, [45]);
 });
 
+test('synchronous layout commits two stable anchor samples after 32ms', async () => {
+  let controller, calls = 0; const delays = [], positions = [];
+  controller = paneScroll({ settleBeforeCommit: true, synchronousLayout: () => true, valid: () => true,
+    later: (ms, fn) => { delays.push(ms); fn(); }, position: n => positions.push(n),
+    scroll: async () => { calls++; controller.observe(event('plugin', 30, -5, 140)); return {}; },
+  });
+  const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
+  controller.stage(before, true, true);
+  const result = await controller.measure('marker', before, true, true);
+  assert.deepEqual(delays, [32]); assert.equal(calls, 3);
+  assert.equal(result.offset, 45); assert.deepEqual(positions, [45]);
+});
+
+test('synchronous layout retries when geometry changes before committing', async () => {
+  let controller, calls = 0; const delays = [], positions = [];
+  const frames = [[20, 130], [30, 150], [30, 150]];
+  controller = paneScroll({ settleBeforeCommit: true, synchronousLayout: () => true, valid: () => true,
+    later: (ms, fn) => { delays.push(ms); fn(); }, position: n => positions.push(n),
+    scroll: async () => {
+      const [marker, rows] = frames[Math.min(calls++, frames.length - 1)];
+      controller.observe(event('plugin', marker, marker - 35, rows)); return {};
+    },
+  });
+  const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
+  controller.stage(before, true, true);
+  const result = await controller.measure('marker', before, true, true);
+  assert.deepEqual(delays, [32, 64]); assert.equal(calls, 4);
+  assert.equal(result.offset, 45); assert.deepEqual(positions, [45]);
+});
+
 test('cancelling settlement prevents a stale final commit', async () => {
   let controller, release, calls = 0;
   controller = paneScroll({ settleBeforeCommit: true, valid: () => true, position: () => assert.fail('cancelled position'),

@@ -150,40 +150,47 @@ test('private sidebar followup keeps native history and Claude can reuse the sam
   assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /PRIVATE/);
 });
 
-test('successful user steer suppresses even a result received before its RPC response', async t => {
+test('user steer preserves the parent task when completion crosses its response', async t => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn();
   let accept; client.handler = method => method === 'turn/steer' ? new Promise(resolve => { accept = resolve; }) : undefined;
   const sending = controller.dispatch('ui_send', { target: agent.id, message: 'Private steer' });
   await tick();
   client.note('item/completed', { threadId: agent.thread_id, turnId: agent.turn_id, item: { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'Private steered answer' } });
   client.complete();
-  assert.deepEqual(controller.eventsAfter(), []);
+  assert.equal(controller.eventsAfter()[0].result, 'Private steered answer');
   accept({ turnId: agent.turn_id }); await sending;
-  assert.deepEqual(controller.eventsAfter(), []); assert.equal(controller.find(agent.id).turnOrigin, 'user');
+  assert.equal(controller.find(agent.id).turnOrigin, 'parent');
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /"Private steer"/);
 });
 
-test('parent followup waits for a separate turn boundary when a private turn is active', async t => {
+test('user message does not disrupt parent control, waiting, or completion', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  await controller.dispatch('ui_send', { target: agent.id, message: 'PRIVATE USER BODY' });
+  assert.equal(controller.hasParentWork(), true);
+  assert.equal(controller.find(agent.id).turnOrigin, 'parent');
+  await controller.dispatch('send_message', { target: agent.id, message: 'Parent steer' });
+  await controller.dispatch('followup_task', { target: agent.id, message: 'Parent followup' });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: agent.turn_id, item: { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'Parent result' } });
+  client.complete();
+  assert.equal(controller.eventsAfter()[0].result, 'Parent result');
+  assert.equal(controller.hasParentWork(), false);
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /PRIVATE USER BODY/);
+});
+
+test('parent followup explicitly assigns work on an active private turn', async t => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
   await controller.ackEvents(controller.nextSeq - 1);
   await controller.dispatch('ui_send', { target: agent.id, message: 'Private active task' });
-  const count = client.calls.length;
-  await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'New parent task' }), error => {
-    assert.equal(error.code, 'private_turn_active'); assert.equal(error.agent_id, agent.id);
-    assert.equal(error.thread_id, agent.thread_id); assert.match(error.recovery, /same agent/); return true;
-  });
-  assert.equal(client.calls.length, count); assert.equal(controller.find(agent.id).turnOrigin, 'user');
-  assert.equal(controller.find(agent.id).status, 'running');
   await controller.dispatch('send_message', { target: agent.id, message: 'Coordination only' });
   assert.equal(client.calls.at(-1).method, 'turn/steer'); assert.equal(controller.find(agent.id).turnOrigin, 'user');
-  client.note('item/completed', { threadId: agent.thread_id, turnId: 'turn-2', item: { id: 'private-final', type: 'agentMessage', phase: 'final_answer', text: 'PRIVATE ANSWER' } });
-  client.complete(agent.thread_id, 'turn-2'); assert.deepEqual(controller.eventsAfter(), []);
   await controller.dispatch('followup_task', { target: agent.id, message: 'New parent task' });
-  assert.equal(client.calls.at(-1).method, 'turn/start'); assert.equal(client.calls.at(-1).params.threadId, agent.thread_id);
+  assert.equal(client.calls.at(-1).method, 'turn/steer'); assert.equal(client.calls.at(-1).params.threadId, agent.thread_id);
   assert.equal(controller.find(agent.id).turnOrigin, 'parent');
-  client.note('item/completed', { threadId: agent.thread_id, turnId: 'turn-3', item: { id: 'parent-final', type: 'agentMessage', phase: 'final_answer', text: 'Parent task answer' } });
-  client.complete(agent.thread_id, 'turn-3');
+  assert.equal(controller.hasParentWork(), true);
+  client.note('item/completed', { threadId: agent.thread_id, turnId: 'turn-2', item: { id: 'parent-final', type: 'agentMessage', phase: 'final_answer', text: 'Parent task answer' } });
+  client.complete(agent.thread_id, 'turn-2');
   assert.equal(controller.eventsAfter()[0].result, 'Parent task answer');
-  assert.equal(client.calls.filter(c => c.method === 'thread/start').length, 1);
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /Private active task/);
 });
 
 test('private completion racing a parent followup starts its own parent turn and retains no private final', async t => {
@@ -206,8 +213,64 @@ test('failed ordinary parent steering never changes a private turn recipient', a
   await controller.dispatch('ui_send', { target: agent.id, message: 'Private task' });
   client.handler = method => method === 'turn/steer' ? Promise.reject(new Error('Steer failed')) : undefined;
   await assert.rejects(controller.dispatch('send_message', { target: agent.id, message: 'Coordination' }), /Steer failed/);
+  await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'Assign work' }), /Steer failed/);
   assert.equal(controller.find(agent.id).turnOrigin, 'user');
   client.complete(agent.thread_id, 'turn-2'); assert.deepEqual(controller.eventsAfter(), []);
+});
+
+test('private completion crossing an accepted parent steer is not delivered to the parent', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+  await controller.ackEvents(controller.nextSeq - 1);
+  await controller.dispatch('ui_send', { target: agent.id, message: 'Private task' });
+  let accept; client.handler = method => method === 'turn/steer' ? new Promise(resolve => { accept = resolve; }) : undefined;
+  const followup = controller.dispatch('followup_task', { target: agent.id, message: 'Parent task' });
+  await tick();
+  client.note('item/completed', { threadId: agent.thread_id, turnId: 'turn-2', item: { id: 'private-final', type: 'agentMessage', phase: 'final_answer', text: 'PRIVATE FINAL' } });
+  client.complete(agent.thread_id, 'turn-2');
+  accept({ turnId: 'turn-2' }); const result = await followup;
+  assert.match(result.recovery, /outcome is unknown/);
+  assert.equal(controller.find(agent.id).turnOrigin, 'user');
+  assert.deepEqual(controller.eventsAfter(), []);
+});
+
+test('parent turn completion before steer acknowledgement reports unknown outcome', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  let accept; client.handler = method => method === 'turn/steer' ? new Promise(resolve => { accept = resolve; }) : undefined;
+  const followup = controller.dispatch('followup_task', { target: agent.id, message: 'Additional parent work' });
+  await tick(); client.complete(); accept({ turnId: agent.turn_id });
+  const result = await followup;
+  assert.match(result.recovery, /outcome is unknown/);
+  assert.equal(controller.eventsAfter()[0].kind, 'completed');
+});
+
+test('late parent steer acknowledgement cannot take over a newer user turn', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+  await controller.ackEvents(controller.nextSeq - 1);
+  await controller.dispatch('ui_send', { target: agent.id, message: 'First private task' });
+  const actions = []; controller.on('agentAction', action => actions.push(action));
+  let accept; client.handler = method => method === 'turn/steer' ? new Promise(resolve => { accept = resolve; }) : undefined;
+  const followup = controller.dispatch('followup_task', { target: agent.id, message: 'Parent assignment' });
+  await tick(); client.complete(agent.thread_id, 'turn-2');
+  await controller.dispatch('ui_send', { target: agent.id, message: 'Second private task' });
+  assert.equal(controller.find(agent.id).turnId, 'turn-3');
+  accept({ turnId: 'turn-2' }); const result = await followup;
+  assert.match(result.recovery, /outcome is unknown/);
+  assert.equal(controller.find(agent.id).turnOrigin, 'user');
+  assert.equal(controller.find(agent.id).turnId, 'turn-3');
+  assert.equal(actions.find(action => action.message === 'Parent assignment')?.turn_id, 'turn-2');
+  client.complete(agent.thread_id, 'turn-3');
+  assert.deepEqual(controller.eventsAfter(), []);
+});
+
+test('a private final observed before parent assignment is not reused on completion', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
+  await controller.ackEvents(controller.nextSeq - 1);
+  await controller.dispatch('ui_send', { target: agent.id, message: 'Private task' });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: 'turn-2', item: { id: 'private-final', type: 'agentMessage', phase: 'final_answer', text: 'PRIVATE FINAL' } });
+  await controller.dispatch('followup_task', { target: agent.id, message: 'Parent task' });
+  client.complete(agent.thread_id, 'turn-2');
+  assert.equal(controller.eventsAfter()[0].kind, 'completed');
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /PRIVATE FINAL/);
 });
 
 test('rejected or unconfirmed user steer preserves the original parent turn result', async t => {
@@ -216,7 +279,7 @@ test('rejected or unconfirmed user steer preserves the original parent turn resu
     let reject; client.handler = method => method === 'turn/steer' ? new Promise((resolve, fail) => { reject = fail; }) : undefined;
     const sending = controller.dispatch('ui_send', { target: agent.id, message: 'PRIVATE FAILED STEER' });
     const rejected = assert.rejects(sending, new RegExp(error.message)); await tick();
-    client.complete(); assert.deepEqual(controller.eventsAfter(), []);
+    client.complete(); assert.equal(controller.eventsAfter()[0].kind, 'completed');
     reject(error); await rejected;
     assert.equal(controller.find(agent.id).turnOrigin ?? 'parent', 'parent');
     assert.equal(controller.eventsAfter()[0].kind, 'completed');
@@ -246,14 +309,14 @@ test('private native failure details stay in the local snapshot rather than pare
   assert.equal(controller.snapshot().agents[0].error.message, 'PRIVATE NATIVE FAILURE');
 });
 
-test('restart restores deferred parent results when a user steer never received confirmation', async t => {
+test('restart retains parent results when a user steer never received confirmation', async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-steer-restart-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const statePath = path.join(dir, 'state.json');
   const { client, controller, spawn } = await setup(t, { statePath }); const agent = await spawn();
   client.handler = method => method === 'turn/steer' ? new Promise(() => {}) : undefined;
   const sending = controller.dispatch('ui_send', { target: agent.id, message: 'Private pending steer' }); sending.catch(() => {});
   await tick(); client.complete(); await controller.persist();
-  assert.deepEqual(controller.eventsAfter(), []);
+  assert.equal(controller.eventsAfter()[0].kind, 'completed');
   const restored = new AgentController({ client: new MockClient(), statePath, nativeRoleResolver: async () => undefined });
   await restored.init(); t.after(() => restored.close());
   assert.equal(restored.find(agent.id).turnOrigin, 'parent');
@@ -290,6 +353,22 @@ test('private turn scope survives restart and legacy pending sends migrate by ex
   assert.doesNotMatch(JSON.stringify(restored.eventsAfter()), /PRIVATE/);
   const durable = JSON.parse(await readFile(statePath, 'utf8'));
   assert.equal(durable.agents[0].turnOrigin, 'user');
+});
+
+test('legacy active turns labeled user remain usable by explicit parent followup', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-legacy-owner-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: [{ id: 'legacy', threadId: 'thread-1', turnId: 'turn-1', turnOrigin: 'user', status: 'running' }] }));
+  const client = new MockClient();
+  client.handler = method => method === 'thread/read' || method === 'thread/resume' ? { thread: { status: { type: 'active' } } }
+    : method === 'thread/turns/list' ? { data: [{ id: 'turn-1', status: 'inProgress' }] } : undefined;
+  const controller = new AgentController({ client, statePath, nativeRoleResolver: async () => undefined });
+  await controller.init(); t.after(() => controller.close());
+  assert.equal(controller.hasParentWork(), false);
+  await controller.dispatch('followup_task', { target: 'legacy', message: 'Continue parent work' });
+  assert.equal(controller.hasParentWork(), true);
+  client.complete('thread-1', 'turn-1');
+  assert.equal(controller.eventsAfter().at(-1).kind, 'completed');
 });
 
 test('direct user attachments steer as native images and file paths without forwarding file contents', async t => {

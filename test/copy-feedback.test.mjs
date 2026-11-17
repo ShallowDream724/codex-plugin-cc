@@ -63,11 +63,11 @@ test('clipped short diff previews fetch exact detail and never paint partial pat
   const change = { path: 'x.py', kind: 'update', diff: full };
   const entry = { id: 'file', turn_id: 't', type: 'fileChange', file_preview: { complete: false }, data: { fileSummary: [{ path: 'x.py', kind: 'update', added: 1, removed: 1 }], changes: [{ ...change, diff: '@@ -1 +1 @@\n-old\n+ne…' }] } };
   const f = await fixture(t, [entry], async () => ({ isCopied: true }), () => new Promise(resolve => { finish = resolve; }));
-  await f.press('file_a:t:file:file:0'); await new Promise(setImmediate);
+  const reading = f.press('file_a:t:file:file:0'); await new Promise(setImmediate);
   assert.ok(!(await f.draw()).some(n => n.type === 'Code'));
-  finish(fileChangePage(change)); await new Promise(setImmediate); await new Promise(setImmediate);
+  finish(fileChangePage(change)); await reading;
   const all = await f.draw();
-  assert.ok(all.some(n => n.props.key === 'file_diff_a:t:file:file:0'));
+  assert.ok(all.some(n => n.props.key === 'file_diff_a:t:file:file:0:0'));
   assert.ok(hasText(all, 'new'));
   assert.equal(f.requests.filter(r => r.operation === 'ui_detail').length, 1);
 });

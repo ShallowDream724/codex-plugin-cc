@@ -40,7 +40,7 @@ test('wait returns queryable private-agent status without awaiting its private w
   controller.hasActiveWork = () => true;
   controller.dispatch = async operation => ({ agents: [{ agent_id: 'a', status: 'running', turn_origin: 'user' }] });
   const waited = await post({ operation: 'wait' });
-  assert.equal(waited.body.idle, true); assert.deepEqual(waited.body.events, []);
+  assert.equal(waited.body.idle, false); assert.equal(waited.body.parent_idle, true); assert.equal(waited.body.active, true); assert.deepEqual(waited.body.events, []);
   assert.equal(waited.body.agents[0].turn_origin, 'user');
   assert.equal((await post({ operation: 'idle_shutdown' })).body.reason, 'active');
 });
@@ -194,6 +194,27 @@ test('compaction alone does not prompt Claude or finish its wait, but a question
   const result = (await waiting).body;
   assert.deepEqual(result.events.map(e => e.kind), ['question']);
   assert.ok(result.delivery_id);
+});
+
+test('wait continues to observe parent work after a private user message', async t => {
+  class Client extends EventEmitter {
+    async request(method) {
+      if (method === 'thread/start') return { thread: { id: 'root' } };
+      if (method === 'turn/start') return { turn: { id: 'root-turn', status: 'inProgress' } };
+      return {};
+    }
+  }
+  const client = new Client(), controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  await controller.init(); t.after(() => controller.close());
+  const { post } = await setup(t, { controller, waitTimeoutMs: 1000 });
+  const agent = await controller.dispatch('spawn_agent', { message: 'Task', cwd: '/workspace', context_mode: 'none' });
+  await controller.dispatch('ui_send', { target: agent.id, message: 'PRIVATE USER BODY' });
+  const waiting = post({ operation: 'wait', args: { timeout_ms: 500 } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  client.emit('notification', { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'root-turn', status: 'completed' } } });
+  const result = (await waiting).body;
+  assert.equal(result.events[0].kind, 'completed');
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE USER BODY/);
 });
 
 test('wait wakes when the last matching descendant turn completes', async t => {
