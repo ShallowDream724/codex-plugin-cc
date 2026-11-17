@@ -76,6 +76,57 @@ test('adoption validates metadata, serializes first adoption, and retains native
   assert.equal(client.calls.filter(x => x.method === 'turn/start').length, 1);
 });
 
+test('unmatched UUID read failures explain session scope without diagnosing a fork', async t => {
+  for (const message of [
+    'App-server thread/read failed (RPC -32600).',
+    'App-server request timed out.',
+    'App-server thread/read failed (RPC -32600). This thread is archived. Unarchive it in Codex before resuming.',
+  ]) {
+    const { client, c } = await setup(t);
+    const cause = new Error(message);
+    client.handler = method => { if (method === 'thread/read') throw cause; };
+    await assert.rejects(c.dispatch('followup_task', { target: UUID, message: 'continue' }), error => {
+      assert.equal(error.cause, cause);
+      assert.ok(error.message.includes(message), 'the original failure must remain visible');
+      assert.match(error.message, /No agent .* is registered in this Claude session/);
+      assert.match(error.message, /current agent_id from list_agents/);
+      assert.match(error.message, /original Codex thread_id\/link/);
+      assert.doesNotMatch(error.message, /fork|branch|history.*lost/i);
+      return true;
+    });
+    assert.equal(c.agents.size, 0);
+    assert.deepEqual(client.calls.map(call => call.method), ['thread/read'], 'guidance must not start or resume work');
+  }
+});
+
+test('explicit thread link lookup failure keeps the native cause without agent-ID advice', async t => {
+  const { client, c } = await setup(t);
+  const cause = new Error('App-server thread/read failed (RPC -32600). This thread already has an active native writer.');
+  client.handler = method => { if (method === 'thread/read') throw cause; };
+  await assert.rejects(c.dispatch('followup_task', { target: `codex://threads/${UUID}`, message: 'continue' }), error => {
+    assert.equal(error.cause, cause);
+    assert.match(error.message, /Could not read Codex thread/);
+    assert.match(error.message, /active native writer/);
+    assert.doesNotMatch(error.message, /fork|branch|list_agents|another session/i);
+    return true;
+  });
+  assert.equal(c.agents.size, 0);
+  assert.deepEqual(client.calls.map(call => call.method), ['thread/read']);
+});
+
+test('post-registration send failure still identifies the registered agent', async t => {
+  const { client, c } = await setup(t);
+  client.handler = method => { if (method === 'turn/start') throw new Error('turn request rejected'); };
+  await assert.rejects(c.dispatch('followup_task', { target: UUID, message: 'continue' }), error => {
+    assert.match(error.message, /is registered as agent/);
+    assert.match(error.message, /retry using this agent ID/);
+    assert.doesNotMatch(error.message, /No agent .* is registered|another session|fork/i);
+    return true;
+  });
+  assert.equal(c.agents.size, 1);
+  assert.equal(client.calls.filter(call => call.method === 'thread/read').length, 1);
+});
+
 test('bulk close snapshots selectors and skips active agents', async t => {
   const { client, c, spawn } = await setup(t); const a = await spawn(), b = await spawn(), d = await spawn();
   client.finish(a); client.finish(d);

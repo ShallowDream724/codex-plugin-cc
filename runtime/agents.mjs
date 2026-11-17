@@ -415,7 +415,8 @@ export class AgentController extends EventEmitter {
 
   async followup(target, message) {
     if (!nonempty(message)) throw new TypeError('message must be nonempty.');
-    let id = typeof target === 'string' && target.startsWith('codex://threads/') ? target.slice('codex://threads/'.length) : target;
+    const threadLink = typeof target === 'string' && target.startsWith('codex://threads/');
+    let id = threadLink ? target.slice('codex://threads/'.length) : target;
     if (typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) id = id.toLowerCase();
     const matches = [...this.agents.values()].filter((a) => a.id === id || a.threadId === id || a.name === id);
     if (matches.length > 1) throw new Error('Ambiguous agent target. Use an agent ID.');
@@ -428,7 +429,14 @@ export class AgentController extends EventEmitter {
     const stopAllEpoch = this.stopAllEpoch;
     this.adoptions.set(id, true);
     try {
-      const response = await this.rpc('thread/read', { threadId: id, includeTurns: false });
+      const response = await this.rpc('thread/read', { threadId: id, includeTurns: false }).catch(error => {
+        // An unknown UUID may be a session-local agent ID or a native thread
+        // ID. A read failure does not establish that Claude was forked.
+        const message = threadLink
+          ? `Could not read Codex thread ${id}: ${error.message} Verify the thread link and its state in Codex before retrying.`
+          : `No agent ${id} is registered in this Claude session, and native thread lookup failed: ${error.message} Use a current agent_id from list_agents, or the original Codex thread_id/link for an agent from another session.`;
+        throw new Error(message, { cause: error });
+      });
       const thread = response?.thread;
       if (thread?.id !== id || !nonempty(thread.cwd) || !path.posix.isAbsolute(thread.cwd) && !path.win32.isAbsolute(thread.cwd)) throw new Error('Native thread metadata has no matching ID and absolute cwd.');
       if (!['idle', 'notLoaded'].includes(thread.status?.type)) throw new Error(`Native thread status is ${thread.status?.type ?? 'unknown'}; active or unconfirmed external threads cannot be adopted.`);
