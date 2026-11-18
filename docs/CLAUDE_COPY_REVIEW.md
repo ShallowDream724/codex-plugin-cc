@@ -782,7 +782,7 @@ Codex 已在此线程接收了使用 `gpt-6.2-sol` 的轮次 `019a6d28-51fe-7c59
 
 ## 其他报错及触发场景
 
-核对的是 `0.2.0-rc.27` 的本地候选代码。表格保留英文原句，翻译与触发条件并列。`path:line` 相对于插件根目录，多数引自审阅起点 `924fbe8`，修订分支以当前代码行号标明。带具体值的例子以 `4f937aa0-f132-4a60-8a1a-32c37cee2b74` 为原生 thread ID。注明“实测”的文案由实际 hook、HTTP broker、controller、`AppServerClient` 或交付函数生成，底层使用本地模拟的 Codex JSON-RPC，不涉及在线模型或当前用户会话。
+核对的是 `0.2.0-rc.28` 的本地候选代码。表格保留英文原句，翻译与触发条件并列。`path:line` 相对于插件根目录，多数引自审阅起点 `924fbe8`，修订分支以当前代码行号标明。带具体值的例子以 `4f937aa0-f132-4a60-8a1a-32c37cee2b74` 为原生 thread ID。注明“实测”的文案由实际 hook、HTTP broker、controller、`AppServerClient` 或交付函数生成，底层使用本地模拟的 Codex JSON-RPC，不涉及在线模型或当前用户会话。
 
 ## Claude 接收面
 
