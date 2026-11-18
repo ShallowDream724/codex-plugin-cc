@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { messageDeliveries } from '../hooks/delivery.js';
+import { call } from '../runtime/bridge.mjs';
 
 const cli = process.env.CODEX_SUBAGENTS_TEST_CLAUDE;
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -102,7 +103,8 @@ async function startProvider(contextMode) {
       const latest = values.at(-1);
       const errors = values.filter(value => value.error);
       const canHaveRecoveryError = checkModelRecovery && (resumedHost || count >= 5);
-      assert.ok(errors.length === 0 || canHaveRecoveryError && errors.length === 1 && errors[0].error.code === 'agent_model_unavailable', 'native plugin tools must only return the expected model recovery error');
+      assert.ok(errors.length === 0 || canHaveRecoveryError && errors.length === 1 && errors[0].error.code === 'agent_model_unavailable',
+        `Unexpected native plugin tool errors: ${JSON.stringify(errors.map(value => value.error))}`);
       const agent = values.find((value) => value.agent_id && value.thread_id);
       const deliveries = [...values, ...promptDeliveries(messages)];
       const events = deliveries.flatMap(value => value.events || []);
@@ -139,6 +141,8 @@ async function startProvider(contextMode) {
         assert.equal(error.agent_id, agent.agent_id);
         assert.equal(error.thread_id, agent.thread_id);
         assert.equal(error.model_turn_started, false);
+        assert.equal(error.turn_id, undefined);
+        assert.deepEqual([...error.available_models].sort(), [replacementModel, 'gpt-6.2-sol']);
         assert.equal(error.recommended_model, replacementModel);
         assert.ok(Array.isArray(error.recovery_choices), 'the provider must receive selectable recovery targets');
         assert.deepEqual(error.recovery_choices.map(choice => choice.model).sort(), [replacementModel, 'gpt-6.2-sol']);
@@ -192,7 +196,7 @@ async function cleanupBrokers(base) {
   for (const dir of dirs.filter((item) => item.isDirectory() && /^[a-f0-9]{32}$/.test(item.name))) {
     const endpoint = await readFile(path.join(base, dir.name, 'endpoint.json'), 'utf8').then(JSON.parse).catch(() => null);
     if (!endpoint) continue;
-    await fetch(`http://127.0.0.1:${endpoint.port}/`, { method: 'POST', headers: { authorization: `Bearer ${endpoint.token}`, 'content-type': 'application/json' }, body: '{"operation":"shutdown"}', signal: AbortSignal.timeout(2000) }).catch(() => {});
+    await call(endpoint, { operation: 'shutdown' }, 2000).catch(() => {});
     for (let attempt = 0; attempt < 30; attempt++) {
       try { process.kill(endpoint.pid, 0); } catch { break; }
       await pause(50);

@@ -1,5 +1,13 @@
 # 验证记录
 
+## rc.27 原生目录、候选及错误交付（2026-11-18，本地候选）
+
+Codex CLI 0.170.0 使用本机原有 openai 配置读取可见目录，共 4 项；包含隐藏项时为 14 项。将可见目录交给插件控制器，接入模拟的旧 Astra 线程时只产生 thread/read 和 model/list，返回完整 4 项和可能的后继 gpt-6.2-astra。目录及控制器输出见 `artifacts/rc27-model-list-0170.log` 和 `artifacts/rc27-0170-recovery-probe.json`。
+
+回归覆盖同系列严格升版、低版本和跨系列仅供选择、可见但被上游拒绝的模型、访问修复后的显式重试、只读刷新、已消费的恢复选项、后台轮询和实际失败交付的区别。已确认的模型拒绝与 API 目录协议错误有各自的诊断。异步通知与有回执的轮次关联，预检查失败不借用上一轮的 ID。
+
+常规回归 549 项通过、2 项跳过，语法、元数据与生成指引检查通过。独立运行的离线 Claude 宿主套件 4 项通过，覆盖同一线程恢复及会话重开后不重派。结果见 `artifacts/rc27-catalog-policy-full.log` 和 `artifacts/rc27-catalog-policy-host.log`。此前在 Windows 临时端口复现了 fetch 的 bad port 拒绝，本机桥接改用 Node 原生 HTTP 后，受影响端口的完整模型错误也能送达。未派发真实推理，未覆盖安装 Claude 插件。
+
 ## rc.27 文案审阅后：故障提示与恢复选项（2026-11-18，本地候选）
 
 本机 `codex-cli 0.169.0` 的 `model/list` 返回 4 个可见模型，包含隐藏项时返回 14 个。旧 `gpt-6-astra` 仅出现在含隐藏项的结果中。把可见目录传给真实插件控制器，续接模拟的旧 Astra 线程时得到 `agent_model_unavailable / model_not_listed`，推荐 `gpt-6.2-astra`；此次失败未调用 `turn/start`。

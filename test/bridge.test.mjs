@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { configureBridge, requestBridge } from '../hooks/bridge.js';
+import { call } from '../runtime/bridge.mjs';
+import { createBroker } from '../runtime/broker.mjs';
 
 const names = ['id', 'cwd', 'CODEX_SUBAGENTS_NODE_COMMAND', 'CODEX_SUBAGENTS_STATE_DIR', 'CODEX_SUBAGENTS_CODEX_COMMAND', 'CODEX_SUBAGENTS_SETTINGS'];
 const deferred = () => {
@@ -64,4 +67,20 @@ test('failed setting reads do not start the process', async () => {
   };
   await assert.rejects(requestBridge($, 'list'), error => error === failure);
   assert.equal(processStarted, false);
+});
+
+test('the runtime bridge preserves broker errors on a port blocked by fetch', async t => {
+  const port = 10080;
+  const token = 'test-auth';
+  const error = { code: 'model_catalog_unavailable', message: 'Catalog unavailable.' };
+  const controller = { async dispatch() { throw Object.assign(new Error(error.message), error); } };
+  const server = createBroker({ controller, token, requiredProtocol: 2 });
+  t.after(() => server.close());
+  try { await once(server.listen(port, '127.0.0.1'), 'listening'); }
+  catch (err) {
+    if (['EADDRINUSE', 'EACCES'].includes(err.code)) return t.skip(`Port ${port} is unavailable.`);
+    throw err;
+  }
+  await assert.rejects(fetch(`http://127.0.0.1:${port}/`), err => err.cause?.message === 'bad port');
+  assert.deepEqual(await call({ port, token }, { operation: 'list_models' }), { error });
 });

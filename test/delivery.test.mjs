@@ -98,6 +98,55 @@ test('projected wire confirms only exact retained business content and supports 
   assert.deepEqual(c.events, []);
 });
 
+test('only deliverable model failures gain diagnostics and expired batches keep their exact confirmation hashes', async () => {
+  const c = controller(0);
+  const failure = { seq: 1, agent_id: 'a', kind: 'failed', code: 'agent_model_unavailable', turn_id: 'failed-turn', available_models: [] };
+  const empty = { ...failure, seq: 3, recovery_choices: [] };
+  c.events = [failure, { ...failure, seq: 2, turn_origin: 'user' }, empty];
+  let now = 0, catalog = ['new-model'];
+  const reads = [];
+  c.enrichModelFailureEvent = async event => {
+    reads.push(event.seq);
+    return { ...event, available_models: catalog, recovery_choices: catalog.map(model => ({ model, target: `choice-${model}` })) };
+  };
+  const store = new DeliveryStore({ controller: c, leaseMs: 10, now: () => now });
+  const first = await store.claim({ channel: 'prompt' });
+  assert.deepEqual(first.events.map(event => event.seq), [1, 3]);
+  assert.deepEqual(first.events[0].available_models, ['new-model']);
+  assert.equal(first.events[0].turn_id, undefined);
+  assert.deepEqual(reads, [1]);
+  assert.deepEqual(c.events, [failure, empty]);
+  assert.equal((await store.claim()).busy, true);
+  assert.deepEqual(reads, [1]);
+
+  now = 11;
+  catalog = ['another-model'];
+  const replay = await store.claim();
+  assert.deepEqual(replay.events[0].available_models, ['another-model']);
+  const confirm = events => store.confirm({ observations: [{ delivery_id: first.delivery_id, sequences: [1], events }] });
+  assert.deepEqual((await confirm(replay.events)).rejected, [{ delivery_id: first.delivery_id, sequences: [1] }]);
+  await confirm(first.events);
+  assert.deepEqual(c.events, [empty]);
+});
+
+test('closing an agent during diagnostic enrichment retires its event before delivery', async () => {
+  const c = controller(1);
+  c.events.push({ seq: 2, agent_id: 'closing', kind: 'failed', code: 'agent_model_unavailable' });
+  const entered = Promise.withResolvers(), catalog = Promise.withResolvers();
+  c.enrichModelFailureEvent = async event => {
+    entered.resolve();
+    return { ...event, available_models: await catalog.promise };
+  };
+  const store = new DeliveryStore({ controller: c });
+  const claiming = store.claim();
+  await entered.promise;
+  await c.ackSequences([2]);
+  catalog.resolve(['another-model']);
+  const batch = await claiming;
+  assert.deepEqual(batch.events.map(event => event.seq), [1]);
+  assert.deepEqual((await store.records.get(batch.delivery_id)).sequences, [1]);
+});
+
 test('old full-event receipt hashes still require and confirm the exact old wire without migration', async () => {
   const c = controller(0);
   const old = { seq: 1, agent_id: 'agent', name: 'worker', turn_id: 'old-turn', kind: 'message', message: 'Old retained message' };

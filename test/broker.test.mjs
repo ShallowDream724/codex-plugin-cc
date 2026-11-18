@@ -5,6 +5,7 @@ import { request } from 'node:http';
 import { createBroker } from '../runtime/broker.mjs';
 import { AgentController } from '../runtime/agents.mjs';
 import { DeliveryStore } from '../runtime/delivery.mjs';
+import { postLoopbackJson } from '../runtime/loopback-http.mjs';
 
 class FakeController extends EventEmitter {
   constructor() { super(); this.events = []; this.calls = []; this.acks = []; this.status = 'running'; this.nextSeq = 1; }
@@ -20,17 +21,18 @@ async function setup(t, options = {}) {
   const server = createBroker({ controller, token, waitTimeoutMs: 100, ...options });
   await new Promise(done => server.listen(0, '127.0.0.1', done));
   t.after(() => { server.closeAllConnections(); server.close(); });
-  const url = `http://127.0.0.1:${server.address().port}/`;
-  const post = async (body, extra = {}) => {
-    const response = await fetch(url, { method: 'POST', headers: { authorization: 'Bearer ' + token }, body: JSON.stringify(body), ...extra });
-    return { status: response.status, body: await response.json() };
+  const port = server.address().port;
+  const url = `http://127.0.0.1:${port}/`;
+  const post = async (body, { signal } = {}) => {
+    const { status, text } = await postLoopbackJson(port, body, { token, signal });
+    return { status, body: JSON.parse(text) };
   };
   return { controller, post, url, server };
 }
 
 test('local transport requires a session secret', async t => {
-  const { url, controller } = await setup(t);
-  const response = await fetch(url, { method: 'POST', body: '{}' });
+  const { server, controller } = await setup(t);
+  const response = await postLoopbackJson(server.address().port, {});
   assert.equal(response.status, 403); assert.equal(controller.calls.length, 0);
 });
 
@@ -88,24 +90,81 @@ test('model recovery errors retain options and distinguish confirmed rejection f
   const { post, controller } = await setup(t, { activity: { list: () => ({ agents: [{ agent_id: 'a', status: 'failed' }] }) } });
   let calls = 0;
   const choices = [{ model: 'new', target: 'codex-recovery:example/new' }];
+  const afterAccessFix = [{ model: 'old', target: 'codex-recovery:example/old' }];
   controller.dispatch = async (_, args) => {
     calls++;
     if (args.target === 'catalog-offline') throw Object.assign(new Error('Could not verify the Codex model catalog. No turn was started.'), { code: 'model_catalog_unavailable', model_turn_started: false });
-    throw Object.assign(new Error('Model unavailable'), { code: 'agent_model_unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', recovery_choices: choices, model_turn_started: args.target === 'certain' ? false : true, recovery: 'Choose a replacement.' });
+    if (args.target === 'consumed') throw Object.assign(new Error('This replacement was accepted earlier. No new turn was started.'), { code: 'model_recovery_consumed', model_turn_started: false, turn_id: 'recovered-turn' });
+    const started = args.target !== 'certain';
+    throw Object.assign(new Error('Model unavailable'), { code: 'agent_model_unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', reason: 'provider_model_unavailable', model: 'old', available_models: ['old', 'new'], recommended_model: 'new', recovery_choices: choices, retry_after_access_fix: afterAccessFix, model_turn_started: started, ...(started ? { turn_id: 'failed-turn' } : {}), recovery: 'Choose a replacement.' });
   };
   const request = target => ({ operation: 'followup_task', requestId: target, args: { target, message: 'Continue' }, ui_summary: true });
   const first = (await post(request('certain'))).body;
-  assert.deepEqual(first.error, { code: 'agent_model_unavailable', message: 'Model unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', recovery: 'Choose a replacement.', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', recovery_choices: choices, model_turn_started: false });
+  assert.deepEqual(first.error, { code: 'agent_model_unavailable', message: 'Model unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', recovery: 'Choose a replacement.', reason: 'provider_model_unavailable', model: 'old', available_models: ['old', 'new'], recommended_model: 'new', recovery_choices: choices, retry_after_access_fix: afterAccessFix, model_turn_started: false });
   assert.equal(first.ui_summary.agents[0].status, 'failed');
   assert.deepEqual((await post(request('certain'))).body.error, first.error);
   assert.equal(calls, 1);
-  assert.equal((await post(request('uncertain'))).body.error.model_turn_started, true);
+  const uncertain = (await post(request('uncertain'))).body.error;
+  assert.equal(uncertain.model_turn_started, true);
+  assert.equal(uncertain.turn_id, 'failed-turn');
   assert.equal((await post(request('uncertain'))).body.error.code, 'ambiguous_action');
   assert.equal(calls, 2);
   const offline = (await post(request('catalog-offline'))).body.error;
   assert.equal(offline.code, 'model_catalog_unavailable');
   assert.deepEqual((await post(request('catalog-offline'))).body.error, offline);
   assert.equal(calls, 3);
+  const consumed = (await post(request('consumed'))).body.error;
+  assert.equal(consumed.code, 'model_recovery_consumed');
+  assert.equal(consumed.turn_id, 'recovered-turn');
+  assert.equal(consumed.model_turn_started, false);
+  assert.deepEqual((await post(request('consumed'))).body.error, consumed);
+  assert.equal(calls, 4);
+});
+
+test('model diagnostics are read by explicit list_agents and failure delivery, with no background catalog polling', async t => {
+  class Client extends EventEmitter {
+    calls = [];
+    successor = 'gpt-6.2-astra';
+    async request(method, params) {
+      this.calls.push({ method, params });
+      if (method === 'thread/start') return { thread: { id: 'root', model: 'gpt-6.1-astra', modelProvider: 'fixture' } };
+      if (method === 'turn/start') return { turn: { id: 'failed-turn', status: 'inProgress' } };
+      if (method === 'model/list') return params.cursor
+        ? { data: [{ model: 'gpt-6.2-sol' }], nextCursor: null }
+        : { data: [{ model: 'gpt-6.1-astra' }, { model: this.successor }, { model: 'gpt-6.9-astra', hidden: true }], nextCursor: 'next' };
+      return {};
+    }
+  }
+  const client = new Client(), controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  await controller.init(); t.after(() => controller.close());
+  const { post } = await setup(t, { controller });
+  await controller.dispatch('spawn_agent', { message: 'Task', cwd: '/workspace', model: 'gpt-6.1-astra', context_mode: 'none' });
+  client.calls.length = 0;
+  client.emit('notification', { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'failed-turn', status: 'failed', error: { codexErrorInfo: 'modelNotFound', message: 'Provider rejected the model.' } } } });
+
+  const background = (await post({ operation: 'observe', args: { deliver: false } })).body;
+  assert.equal(background.agents[0].status, 'failed');
+  assert.deepEqual(background.events, []);
+  assert.deepEqual(client.calls, []);
+  const delivered = (await post({ operation: 'wait', args: { timeout_ms: 0 } })).body;
+  assert.equal(delivered.events[0].code, 'agent_model_unavailable');
+  assert.deepEqual(delivered.events[0].available_models, ['gpt-6.1-astra', 'gpt-6.2-astra', 'gpt-6.2-sol']);
+  assert.deepEqual(delivered.events[0].recovery_choices.map(choice => choice.model), ['gpt-6.2-astra', 'gpt-6.2-sol']);
+  assert.deepEqual(delivered.events[0].retry_after_access_fix.map(choice => choice.model), ['gpt-6.1-astra']);
+  assert.deepEqual(client.calls, [{ method: 'model/list', params: { includeHidden: false, modelProvider: 'fixture' } },
+    { method: 'model/list', params: { includeHidden: false, modelProvider: 'fixture', cursor: 'next' } }]);
+
+  const confirmation = (await post({ operation: 'confirm', args: { observations: [{ delivery_id: delivered.delivery_id, events: delivered.events }] } })).body;
+  assert.deepEqual(confirmation, { confirmed: [delivered.delivery_id] });
+  assert.deepEqual(controller.eventsAfter(0), []);
+  assert.equal((await post({ operation: 'wait', args: { timeout_ms: 0 } })).body.idle, true);
+  assert.equal(client.calls.length, 2);
+
+  client.successor = 'gpt-6.3-astra';
+  const listed = (await post({ operation: 'list_agents' })).body;
+  assert.deepEqual(listed.agents[0].model_recovery.available_models, ['gpt-6.1-astra', 'gpt-6.3-astra', 'gpt-6.2-sol']);
+  assert.equal(listed.agents[0].model_recovery.recommended_model, 'gpt-6.3-astra');
+  assert.deepEqual(client.calls.map(call => call.method), ['model/list', 'model/list', 'model/list', 'model/list']);
 });
 
 test('direct user controls use durable receipts without acknowledging Claude events', async t => {
@@ -379,6 +438,25 @@ test('disconnecting a waiter leaves the Codex task running', async t => {
   await assert.rejects(pending);
   assert.equal(controller.status, 'running');
   assert.equal(controller.calls.filter(c => c.op === 'interrupt_agent').length, 0);
+});
+
+test('broker shutdown releases a prompt claim while model diagnostics are pending', async t => {
+  const controller = new FakeController(), deliveryStore = new DeliveryStore({ controller });
+  const reading = Promise.withResolvers(), finishCatalog = Promise.withResolvers();
+  controller.events.push({ seq: controller.nextSeq++, agent_id: 'a', kind: 'failed', code: 'agent_model_unavailable' });
+  controller.enrichModelFailureEvent = async event => {
+    reading.resolve();
+    return { ...event, available_models: await finishCatalog.promise };
+  };
+  const { post, server } = await setup(t, { controller, deliveryStore });
+  const prompt = post({ operation: 'observe', args: { deliver: true } });
+  await reading.promise;
+  server.close();
+  finishCatalog.resolve(['replacement']);
+  assert.deepEqual((await prompt).body, { cancelled: true });
+  assert.equal(deliveryStore.remaining(), 0);
+  assert.deepEqual((await deliveryStore.claim()).events[0].available_models, ['replacement']);
+  assert.deepEqual(controller.acks, []);
 });
 
 test('shutdown releases local waiters but drains accepted disconnected mutations before releasing ownership', async t => {

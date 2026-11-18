@@ -7,7 +7,7 @@ import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 import { prepareAttachments, directUserInput } from './attachments.mjs';
 import { AUTOMATIC_TURN_EVENTS, isCompactionStatus, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
-import { MODEL_RECOVERY_TARGET_PREFIX, modelRecoveryDetails, modelRecoveryError, pendingModelRecovery, providerModelUnavailable, readVisibleModels, replacementEffort, selectModelRecovery } from './model-recovery.mjs';
+import { MODEL_RECOVERY_TARGET_PREFIX, modelRecoveryDetails, modelRecoveryError, modelRecoveryOptions, pendingModelRecovery, providerModelUnavailable, readVisibleModels, replacementEffort, selectModelRecovery, unsupportedChatGPTLogin } from './model-recovery.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const STARTED_TURN_ID = Symbol('startedTurnId');
@@ -26,7 +26,18 @@ function storedContextSource(a) {
 const copy = (x) => structuredClone(x);
 const input = (text) => [{ type: 'text', text }];
 const now = () => Date.now();
-const staleModelRecoveryTarget = () => new Error('This model recovery target is invalid or no longer active. Use list_agents to find the original agent. If it shows model_recovery and its status is failed, interrupted, or completed, call followup_task with its agent ID and your intended message to get current choices. If a turn may already have started, inspect it in Codex before resending.');
+const staleModelRecoveryTarget = () => new Error('This recovery choice is invalid or expired. No message was sent. Use list_agents to check the original agent and get any current recovery choices.');
+function catalogFailureHint(code) {
+  if (code === -32601) return 'The external Codex app-server does not implement model/list. Check which Codex CLI executable the plugin starts and update it to a version that supports this method.';
+  if (code === -32602) return 'The app-server rejected the model/list parameters. Check the thread provider ID and the protocol supported by the installed Codex CLI.';
+  if (code === 'ETIMEDOUT') return 'The external Codex app-server did not answer model/list in time. Check its connection before retrying.';
+  return '';
+}
+function consumedModelRecovery(a) {
+  const receipt = a.lastModelRecovery;
+  return Object.assign(new Error(`Codex already accepted turn ${receipt.turnId} on this thread using ${receipt.model}. This repeated recovery choice did not send another message. Use list_agents to see the current agent status.`),
+    { code: 'model_recovery_consumed', agent_id: a.id, thread_id: a.threadId, model: receipt.model, turn_id: receipt.turnId, model_turn_started: false });
+}
 const pendingModelRecoveryRequest = () => new Error('This agent has a pending approval or question, so model recovery cannot start. Use answer_agent with the pending request_id, then retry followup_task once the agent and its descendants are idle.');
 const isOverflow = (error) => error?.codexErrorInfo === 'contextWindowExceeded' || error?.code === 'contextWindowExceeded';
 const roleConfig = (role) => role === 'default' ? { 'features.default_mode_request_user_input': false, 'features.multi_agent': false, 'features.multi_agent_v2': false, 'features.image_generation': false } : undefined;
@@ -169,7 +180,7 @@ export class AgentController extends EventEmitter {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
     switch (operation) {
       case 'spawn_agent': return this.spawn(args);
-      case 'list_agents': return { agents: [...this.agents.values()].map((a) => this.view(a)) };
+      case 'list_agents': return this.listAgents(args.includeModelDiagnostics !== false);
       case 'list_models': return this.models();
       case 'send_message': return this.send(this.find(args.target), args.message);
       case 'followup_task': return this.followup(args.target, args.message, args.replacement_model);
@@ -244,23 +255,66 @@ export class AgentController extends EventEmitter {
     return this.modelCatalogRequests.get(key);
   }
 
-  async prepareTurnModel(a, replacementModel, { duringCompaction = false } = {}) {
+  async failureCatalog(a) {
+    // A diagnostic read must not hold notifications for the full RPC timeout.
+    let timer;
+    try {
+      const catalog = await Promise.race([this.visibleModels(a.modelProvider), new Promise(resolve => {
+        timer = setTimeout(() => resolve(null), 1500);
+      })]);
+      return { catalog };
+    } catch (error) { return { catalog: null, hint: catalogFailureHint(error.code) }; }
+    finally { clearTimeout(timer); }
+  }
+
+  async listAgents(includeModelDiagnostics) {
+    const agents = [...this.agents.values()];
+    if (!includeModelDiagnostics) return { agents: agents.map(a => this.view(a)) };
+    const rows = await Promise.all(agents.map(async a => {
+      const gate = a.modelRecovery;
+      const diagnosis = gate ? await this.failureCatalog(a) : null;
+      if (this.agents.get(a.id) !== a) return null;
+      const row = this.view(a);
+      if (gate && a.modelRecovery === gate) {
+        Object.assign(row.model_recovery, modelRecoveryOptions(a, diagnosis.catalog));
+        if (diagnosis.hint) row.model_recovery.message = diagnosis.hint + ' ' + row.model_recovery.message;
+      }
+      return row;
+    }));
+    return { agents: rows.filter(Boolean) };
+  }
+
+  async enrichModelFailureEvent(event) {
+    const a = this.agents.get(event.agent_id);
+    const gate = a?.modelRecovery;
+    if (!gate || event.model !== gate.model || a.error?.code !== 'agent_model_unavailable' || event.turn_id && event.turn_id !== a.lastTurnId) return event;
+    const { catalog, hint } = await this.failureCatalog(a);
+    if (this.agents.get(a.id) !== a || a.modelRecovery !== gate) return event;
+    if (!catalog) return hint ? { ...event, message: event.message + ' ' + hint } : event;
+    const enriched = modelRecoveryDetails(a, catalog, event.model_turn_started, { turnId: event.turn_id, duringCompaction: event.during_compaction, chatgptLoginUnsupported: event.access_hint === 'unsupported_chatgpt_login' });
+    return { ...event, ...enriched };
+  }
+
+  async prepareTurnModel(a, replacementModel, { duringCompaction = false, retryAfterFix = false } = {}) {
     if (!nonempty(a.model)) return { effort: a.effort };
     let catalog;
     try { catalog = await this.visibleModels(a.modelProvider); }
     catch (cause) {
       const explanation = duringCompaction ? 'Context recovery stopped before starting a new turn.' : 'No turn was started.';
-      const recovery = `Retry followup_task with ${replacementModel !== undefined ? 'the same recovery target and message' : `target set to agent ID ${a.id} and your intended message`} once the model catalog is available.`;
-      throw Object.assign(new Error(`Could not verify the Codex model catalog for agent ${a.name ?? a.id}. ${explanation} ${recovery}`, { cause }),
-        { code: 'model_catalog_unavailable', agent_id: a.id, thread_id: a.threadId, model: a.model, model_turn_started: duringCompaction });
+      const diagnosis = catalogFailureHint(cause.code);
+      const recovery = a.modelRecovery ? 'Use list_agents to refresh the recovery choices without sending the task.'
+        : `Retry followup_task with target set to agent ID ${a.id} and your intended message once the model catalog is available.`;
+      throw Object.assign(new Error([`Could not verify the Codex model catalog for agent ${a.name ?? a.id}.`, explanation, diagnosis, recovery].filter(Boolean).join(' '), { cause }),
+        { code: 'model_catalog_unavailable', agent_id: a.id, thread_id: a.threadId, model: a.model, model_turn_started: false, ...(duringCompaction ? { during_compaction: true } : {}) });
     }
     if (replacementModel !== undefined) {
       if (a.modelRecovery.reason === 'model_not_listed' && catalog.has(a.model)) {
         a.modelRecovery = null;
         await this.persist();
-        throw new Error(`Model ${a.model} is visible again for this Codex thread. No turn was started. Retry followup_task with target set to agent ID ${a.id} and the same message to continue with ${a.model}.`);
+        throw new Error(`Model ${a.model} is visible again. The unused recovery choices have expired. No model was changed or turn started. To send your task with ${a.model}, use the original agent ID ${a.id} and your intended message.`);
       }
-      if (replacementModel === a.modelRecovery.model || !catalog.has(replacementModel)) {
+      const rejected = a.modelRecovery.rejectedModels?.includes(replacementModel) || replacementModel === a.modelRecovery.model && a.modelRecovery.reason === 'provider_model_unavailable';
+      if (!catalog.has(replacementModel) || (retryAfterFix ? !rejected : rejected || replacementModel === a.modelRecovery.model)) {
         throw modelRecoveryError(a, catalog, false, { invalidReplacement: replacementModel });
       }
       return { model: replacementModel, effort: replacementEffort(catalog.get(replacementModel), a.effort), catalog, replacement: true };
@@ -270,18 +324,28 @@ export class AgentController extends EventEmitter {
       await this.persist();
     }
     if (a.modelRecovery && (a.modelRecovery.reason === 'provider_model_unavailable' || !catalog.has(a.model))) {
-      throw modelRecoveryError(a, catalog, duringCompaction, { duringCompaction });
+      throw modelRecoveryError(a, catalog, false, { duringCompaction });
     }
     return { model: a.model, effort: a.effort, catalog };
   }
 
-  acceptTurnModel(a, plan) {
-    if (plan.replacement) { a.model = plan.model; a.effort = plan.effort; }
+  acceptTurnModel(a, plan, turnId) {
+    if (plan.replacement) {
+      const gate = a.modelRecovery;
+      if (gate) {
+        const rejected = new Set(gate.rejectedModels);
+        if (gate.reason === 'provider_model_unavailable') rejected.add(gate.model);
+        rejected.delete(plan.model);
+        a.lastModelRecovery = { ticket: gate.ticket, model: plan.model, turnId, rejectedModels: [...rejected] };
+      }
+      a.model = plan.model; a.effort = plan.effort;
+    }
     a.replacementAttempt = null;
     if (plan.model) a.modelRecovery = null;
   }
 
   requireModelRecovery(a, recoveryTicket) {
+    if (recoveryTicket && a.lastModelRecovery?.ticket === recoveryTicket) throw consumedModelRecovery(a);
     if (recoveryTicket !== undefined && a.modelRecovery?.ticket !== recoveryTicket) throw staleModelRecoveryTarget();
     if (a.modelRecovery?.model !== a.model || !a.modelRecovery || !a.threadId) {
       throw new Error(`Agent ${a.id} has no pending model recovery. Call followup_task with this agent ID as the target and your intended message to continue with its current model.`);
@@ -294,9 +358,17 @@ export class AgentController extends EventEmitter {
     return page.data[0];
   }
 
-  noteUnavailableModel(a, plan, modelTurnStarted) {
+  noteUnavailableModel(a, plan, cause) {
     if (!plan.replacement) a.modelRecovery = pendingModelRecovery(plan.model, 'provider_model_unavailable');
-    return modelRecoveryError(a, plan.catalog, modelTurnStarted, { rejectedReplacement: plan.replacement ? plan.model : undefined });
+    else a.modelRecovery.rejectedModels = [...new Set([...(a.modelRecovery.rejectedModels ?? []), plan.model])];
+    return modelRecoveryError(a, plan.catalog, false, { rejectedReplacement: plan.replacement ? plan.model : undefined, chatgptLoginUnsupported: unsupportedChatGPTLogin(cause) });
+  }
+
+  recordRejectedTurnModel(a, turnId) {
+    a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
+    if (turnId && a.lastModelRecovery?.turnId === turnId && a.lastModelRecovery.rejectedModels?.length) {
+      a.modelRecovery.rejectedModels = [...a.lastModelRecovery.rejectedModels];
+    }
   }
 
   async spawn({ message, cwd, model, reasoning_effort, name, context_mode, snapshot, role }) {
@@ -407,7 +479,7 @@ export class AgentController extends EventEmitter {
         ...(plan.model ? { model: plan.model } : {}), ...(plan.effort ? { effort: plan.effort } : {}), serviceTierForTurn: 'default' });
       if (!nonempty(response?.turn?.id)) throw new Error('turn/start returned no turn id; start outcome is unknown.');
       boundTurnId = response.turn.id;
-      this.acceptTurnModel(a, plan);
+      this.acceptTurnModel(a, plan, boundTurnId);
       a.startingTurn = false;
       await this.replayTurnStart(a, response.turn.id);
       if (response.turn.status === 'failed' && providerModelUnavailable(response.turn.error)) this.turnCompleted(a, response.turn);
@@ -419,11 +491,11 @@ export class AgentController extends EventEmitter {
       const observed = [...new Set((a.startEvents ?? []).filter((entry) => !entry.request && entry.message.method === 'turn/started')
         .map((entry) => entry.message.params.turn.id).filter((id) => id !== plan.priorTurnId && !a.completedTurns.has(id)))];
       boundTurnId ??= observed.length === 1 ? observed[0] : null;
-      if (boundTurnId && a.startEvents) this.acceptTurnModel(a, plan);
+      if (boundTurnId && a.startEvents) this.acceptTurnModel(a, plan, boundTurnId);
       await this.replayTurnStart(a, boundTurnId);
       if (!boundTurnId && plan.model && providerModelUnavailable(error)) {
         a.replacementAttempt = null;
-        const unavailable = this.noteUnavailableModel(a, plan, false);
+        const unavailable = this.noteUnavailableModel(a, plan, error);
         this.finish(a, 'failed', { ...unavailable, message: unavailable.message });
         await this.persist();
         throw unavailable;
@@ -469,7 +541,7 @@ export class AgentController extends EventEmitter {
     if (a.interrupted && a.turnId) await this.requestTreeInterrupt(a, a.threadId, a.turnId);
     await this.persist();
     if (a.lastTurnId === turn.id && a.error?.code === 'agent_model_unavailable' && a.modelRecovery) {
-      const error = modelRecoveryError(a, plan.catalog, true);
+      const error = modelRecoveryError(a, plan.catalog, true, { turnId: turn.id, chatgptLoginUnsupported: a.error.access_hint === 'unsupported_chatgpt_login' });
       error[STARTED_TURN_ID] = turn.id;
       throw error;
     }
@@ -521,12 +593,12 @@ export class AgentController extends EventEmitter {
           if (idle && (turn?.id ?? null) === attempt.priorTurnId) {
             a.replacementAttempt = null;
           } else if (nonempty(turn?.id) && turn.id !== attempt.priorTurnId && model === attempt.model && (idle ? ['completed', 'failed', 'interrupted'].includes(turn.status) : turn.status === 'inProgress')) {
-            this.acceptTurnModel(a, { ...attempt, replacement: true });
+            this.acceptTurnModel(a, { ...attempt, replacement: true }, turn.id);
             a.lastTurnId = turn.id;
             if (idle && turn.status === 'failed' && providerModelUnavailable(turn.error)) {
-              a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
+              this.recordRejectedTurnModel(a, turn.id);
               a.terminalEmitted = false;
-              this.finish(a, 'failed', modelRecoveryDetails(a, null, true));
+              this.finish(a, 'failed', modelRecoveryDetails(a, null, true, { turnId: turn.id, chatgptLoginUnsupported: unsupportedChatGPTLogin(turn.error) }));
               await this.persist();
               return { resumed };
             }
@@ -582,7 +654,8 @@ export class AgentController extends EventEmitter {
     if (typeof target === 'string' && target.startsWith(MODEL_RECOVERY_TARGET_PREFIX)) {
       const selection = selectModelRecovery(this.agents.values(), target);
       if (!selection) throw staleModelRecoveryTarget();
-      return this.send(selection.agent, message, { followup: true, replacementModel: selection.model, recoveryTicket: selection.ticket });
+      if (selection.consumed) throw consumedModelRecovery(selection.agent);
+      return this.send(selection.agent, message, { followup: true, replacementModel: selection.model, recoveryTicket: selection.ticket, retryAfterFix: selection.retryAfterFix });
     }
     if (replacementModel !== undefined && !nonempty(replacementModel)) throw new TypeError('replacement_model must be nonempty.');
     const threadLink = typeof target === 'string' && target.startsWith('codex://threads/');
@@ -635,7 +708,7 @@ export class AgentController extends EventEmitter {
     } finally { const a = this.threads.get(id); if (a) a.adopting = false; this.reservations.delete(reservation); this.adoptions.delete(id); }
   }
 
-  async send(a, message, { followup = false, existingReservation, origin, resumeToken, attachments = [], replacementModel, recoveryTicket } = {}) {
+  async send(a, message, { followup = false, existingReservation, origin, resumeToken, attachments = [], replacementModel, recoveryTicket, retryAfterFix } = {}) {
     if (!nonempty(message) && !(origin === 'user' && attachments.length)) throw new TypeError('message must be nonempty.');
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
     if (a.userPaused) throw new Error('This agent is paused by the user. The user can resume it with a direct message in the Codex interface.');
@@ -679,7 +752,7 @@ export class AgentController extends EventEmitter {
     a.resuming = true;
     this.reservations.delete(reservation);
     try {
-      let plan = followup ? await this.prepareTurnModel(a, replacementModel) : { model: a.model };
+      let plan = followup ? await this.prepareTurnModel(a, replacementModel, { retryAfterFix }) : { model: a.model };
       const wasLoaded = a.loaded;
       if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('The agent was paused by the user before the message could be sent. The user can resume it with a direct message in the Codex interface.');
       if (plan.replacement) this.requireIdleReplacement(a, { allowResume: true });
@@ -692,7 +765,7 @@ export class AgentController extends EventEmitter {
             ...(plan.model ? { model: plan.model } : {}), ...(a.modelProvider ? { modelProvider: a.modelProvider } : {}), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
         } catch (error) {
           if (followup && plan.model && providerModelUnavailable(error)) {
-            const unavailable = this.noteUnavailableModel(a, plan, false);
+            const unavailable = this.noteUnavailableModel(a, plan, error);
             await this.persist();
             throw unavailable;
           }
@@ -709,6 +782,7 @@ export class AgentController extends EventEmitter {
         const resumedModel = response?.model ?? response?.thread?.model;
         const resumedProvider = response?.modelProvider ?? response?.thread?.modelProvider;
         if (followup && plan.model && nonempty(resumedModel) && resumedModel !== plan.model) {
+          a.loaded = false;
           throw new Error(`Codex resumed thread ${a.threadId} with model ${resumedModel} instead of ${plan.model}. No task was sent. Check the thread's model configuration in Codex before retrying.`);
         }
         if (followup && a.modelProvider && nonempty(resumedProvider) && resumedProvider !== a.modelProvider) {
@@ -1156,8 +1230,9 @@ export class AgentController extends EventEmitter {
     this.pruneRequestEvents(a);
     if (this.closing || a.interrupted || turn.status === 'interrupted') { a.recovery = null; this.finish(a, 'interrupted', {}); return; }
     if (turn.status === 'failed' && nonempty(a.model) && (providerModelUnavailable(turn.error) || !turn.error?.codexErrorInfo && a.modelUnavailableTurnId === turn.id)) {
-      a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
-      this.finish(a, 'failed', modelRecoveryDetails(a, null, true));
+      this.recordRejectedTurnModel(a, turn.id);
+      const chatgptLoginUnsupported = unsupportedChatGPTLogin(turn.error) || a.modelUnavailableTurnId === turn.id && unsupportedChatGPTLogin(a.lastError);
+      this.finish(a, 'failed', modelRecoveryDetails(a, null, true, { turnId: turn.id, duringCompaction: !!a.recovery, chatgptLoginUnsupported }));
       return;
     }
     if (a.recovery) {
@@ -1188,7 +1263,7 @@ export class AgentController extends EventEmitter {
       if (!a.recovery || a.interrupted || this.closing) return;
       if (nonempty(a.model) && providerModelUnavailable(error)) {
         a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
-        this.finish(a, 'failed', modelRecoveryDetails(a, null, true, { duringCompaction: true }));
+        this.finish(a, 'failed', modelRecoveryDetails(a, null, false, { duringCompaction: true, chatgptLoginUnsupported: unsupportedChatGPTLogin(error) }));
       } else this.finishCompactionError(a, error);
     }
   }
@@ -1309,7 +1384,7 @@ export class AgentController extends EventEmitter {
   publish(a, kind, details) {
     if (isUserSend({ kind, ...details })) return;
     if (isCompactionStatus({ kind }) || AUTOMATIC_TURN_EVENTS.has(kind) && a.turnOrigin === 'user') { this.persist().then(() => this.emit('state')).catch(() => {}); return; }
-    const event = { seq: this.nextSeq++, agent_id: a.id, name: a.name ?? null, turn_id: details.turnId ?? a.turnId ?? a.lastTurnId ?? null, kind, ...details };
+    const event = { seq: this.nextSeq++, agent_id: a.id, name: a.name ?? null, turn_id: details.model_turn_started === false ? null : details.turnId ?? a.turnId ?? a.lastTurnId ?? null, kind, ...details };
     this.pendingEvents.push(event);
     // Keep every important event until a future explicit retention policy exists.
     // No tool output, thinking, or input prompt enters this durable journal.
@@ -1326,7 +1401,7 @@ export class AgentController extends EventEmitter {
     const write = this.persistTail.then(() => {
       this.persistScheduled = null;
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
-      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, modelProvider: a.modelProvider, modelRecovery: a.modelRecovery, replacementAttempt: a.replacementAttempt, effort: a.effort, role: a.role, status: a.status,
+      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, modelProvider: a.modelProvider, modelRecovery: a.modelRecovery, replacementAttempt: a.replacementAttempt, lastModelRecovery: a.lastModelRecovery, effort: a.effort, role: a.role, status: a.status,
       activity: a.activity, createdAtMs: a.createdAtMs, lastActivityAtMs: a.lastActivityAtMs, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
       snapshot: a.snapshot, injected: a.injected, contextSource: a.contextSource, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus,
     })) };

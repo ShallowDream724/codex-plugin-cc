@@ -13,6 +13,7 @@ import { DeliveryStore } from './delivery.mjs';
 import { ActivityStore } from './activity.mjs';
 import { loadSettings } from './settings.mjs';
 import { ownerDirectory, ensureDirectory, readJson, writeJson, acquireOwnedLock } from './storage.mjs';
+import { postLoopbackJson } from './loopback-http.mjs';
 
 const entry = fileURLToPath(import.meta.url);
 const sleep = ms => new Promise(done => setTimeout(done, ms));
@@ -37,12 +38,11 @@ export function runtimeSignature() {
 }
 
 export async function call(endpoint, body, timeout = 35000) {
-  const response = await fetch(`http://127.0.0.1:${endpoint.port}/`, {
-    method: 'POST', headers: { authorization: 'Bearer ' + endpoint.token, 'content-type': 'application/json' },
-    body: JSON.stringify({ ...body, protocolVersion: PROTOCOL }), signal: AbortSignal.timeout(timeout),
+  const { status, text } = await postLoopbackJson(endpoint.port, { ...body, protocolVersion: PROTOCOL }, {
+    token: endpoint.token, signal: AbortSignal.timeout(timeout),
   });
-  const result = await response.json();
-  if (!response.ok && !result.error) throw new Error('Local bridge refused the request.');
+  const result = JSON.parse(text);
+  if ((status < 200 || status >= 300) && !result.error) throw new Error('Local bridge refused the request.');
   return result;
 }
 

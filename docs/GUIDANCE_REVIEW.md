@@ -52,7 +52,7 @@ Claude is your parent agent. When important design questions, disagreements or b
 原始 description 与可用模型、档位由 Codex 目录提供。以下为额外的默认使用建议，可以修改 `config/guidance.json`；选型建议不表示能力等价。不隐藏其他模型，不强制所列模型或档位。
 
 - **gpt-6-luna**：Read-only scout for lookup, extraction and factual checks. The default preset uses medium.
-- **gpt-6.1-terra**：For tasks with clear steps and directly checkable results, including image reading and authorized interface operations. Usually high; xhigh for deeper verification.
+- **gpt-6.1-terra**：For execution tasks with straightforward troubleshooting, clear steps and directly checkable results, including image reading and authorized interface operations. Usually high; xhigh for deeper verification.
 - **gpt-6.2-sol**：For independently designing, implementing and validating changes in existing repositories, and everyday professional delivery. Usually high; xhigh for cross-module or hard-to-locate regressions. If capability is limiting, choose Astra for a new delegation.
 - **gpt-6.2-astra**：For demanding development, research design, complex diagnosis, architecture and coordination of multiple deliverables. Use medium/high when lengthy reasoning is unnecessary; ultra for deep reasoning, decomposition and coordinating multiple subtasks.
 

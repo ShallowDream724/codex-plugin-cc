@@ -10,7 +10,7 @@ const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
 const errorBody = error => ({ code: error.code || 'bridge_error', message: error.message,
-  ...Object.fromEntries(['agent_id', 'thread_id', 'status', 'recovery', 'reason', 'model', 'available_models', 'recommended_model', 'recovery_choices', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
+  ...Object.fromEntries(['agent_id', 'thread_id', 'turn_id', 'status', 'recovery', 'reason', 'model', 'available_models', 'recommended_model', 'recovery_choices', 'retry_after_access_fix', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
   ...(error.code === 'invalid_answer' ? { request_id: error.request_id, reply_format: error.reply_format } : {}) });
 
 function authorized(value, token) {
@@ -76,8 +76,12 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     if (operation === 'release') return delivery.release(args.delivery_id);
     if (operation === 'observe') {
       if (args.lease_id) await delivery.renew(args.lease_id);
-      const listed = await controller.dispatch('list_agents', {});
+      const listed = await controller.dispatch('list_agents', { includeModelDiagnostics: false });
       const batch = args.deliver && !waiting ? await delivery.claim({ channel: 'prompt' }) : { events: [] };
+      if (signal.aborted && batch.delivery_id) {
+        await delivery.release(batch.delivery_id);
+        return { cancelled: true };
+      }
       return { ...listed, ...(activity ? activity.list() : {}), ...(batch.busy ? { events: [], delivery_pending: true } : batch), waiting };
     }
     if (operation === 'wait') {
@@ -99,7 +103,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
             const batch = await delivery.claim({ channel: 'wait', toolUseId: requestId });
             if (signal.aborted) { if (batch.delivery_id) await delivery.release(batch.delivery_id); break; }
             if (batch.events?.length) return batch;
-            const listed = await controller.dispatch('list_agents', {});
+            const listed = await controller.dispatch('list_agents', { includeModelDiagnostics: false });
             const active = controller.hasParentWork ? controller.hasParentWork() : controller.hasActiveWork ? controller.hasActiveWork()
               : listed.agents?.some(agent => activeStatuses.has(agent.status) || agent.pending_requests?.length);
             if (!batch.busy && !active) {
@@ -145,7 +149,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       catch (error) {
         // These validations fail before any wire response. Other errors may have
         // ambiguous side effects, so retain their inflight receipt and never retry.
-        const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable'].includes(error.code) && error.model_turn_started === false;
+        const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable', 'model_recovery_consumed'].includes(error.code) && error.model_turn_started === false;
         if (['invalid_answer', 'private_turn_active'].includes(error.code) || modelPreflightFailed) await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
         throw error;
       }

@@ -140,17 +140,19 @@ test('only decisive model errors on model-bearing RPCs expose a recovery reason'
   } });
   await client.start();
   try {
-    for (const [method, message, data, confirmed] of [
+    for (const [method, message, data, confirmed, accessHint] of [
       ['turn/start', 'request rejected', { codexErrorInfo: 'modelNotFound', details: 'SENSITIVE' }, true],
       ['thread/resume', 'provider refused', { error: { code: 'model_not_found' } }, true],
       ['thread/compact/start', 'provider refused compaction', { codexErrorInfo: 'modelNotFound' }, true],
       ['turn/start', 'The model `private-model` does not exist or you do not have access to it.', null, true],
+      ['turn/start', "The 'private-model' model is not supported when using Codex with a ChatGPT account.", null, true, 'unsupported_chatgpt_login'],
       ['turn/start', 'model temporarily unavailable', { status: 503 }, false],
       ['thread/resume', 'bad effort for this model', { codexErrorInfo: 'badRequest' }, false],
       ['thread/read', 'opaque', { code: 'model_not_found' }, false],
     ]) {
       await assert.rejects(client.request(method, { simulate: { code: -32600, message, data } }), error => {
         assert.equal(error.reason, confirmed ? 'provider_model_unavailable' : undefined);
+        assert.equal(error.accessHint, accessHint);
         assert.doesNotMatch(error.message, /private-model|SENSITIVE/);
         return true;
       });

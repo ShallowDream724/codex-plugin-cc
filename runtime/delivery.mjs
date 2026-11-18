@@ -14,6 +14,12 @@ function projectDeliveryEvent(event) {
   return Object.fromEntries(Object.entries(event).filter(([key]) => !INTERNAL_EVENT_FIELDS.has(key)));
 }
 
+function needsModelDiagnostics(event) {
+  // Legacy failures represented an unverified catalog as [] with no choices.
+  return event.kind === 'failed' && event.code === 'agent_model_unavailable'
+    && (event.available_models === undefined || event.available_models?.length === 0 && event.recovery_choices === undefined);
+}
+
 // Only user stop facts are parent receipts. Activity and private chats stay in Codex.
 export function formatDeliveryEvent(event) {
   if (isCompactionStatus(event) || isUserSend(event)) return null;
@@ -57,15 +63,23 @@ export class DeliveryStore extends EventEmitter {
       const allowed = new Set(eligible.map(event => event.seq));
       const excluded = captured.filter(event => !allowed.has(event.seq) && live.has(event.seq)).map(event => event.seq);
       if (excluded.length) await this.controller.ackSequences(excluded);
-      const events = eligible.filter(event => live.has(event.seq));
+      let events = eligible.filter(event => live.has(event.seq));
       if (this.lease && this.remaining()) {
         const record = await this.records.get(this.lease.id);
         const retained = events.filter(event => record?.sequences?.includes(event.seq));
         if (retained.length) return { busy: true };
       }
-      if (!events.length) { this.lease = null; await this.saveLease(); return { events: [] }; }
       // Page whole events, never truncate their content or drop an unconfirmed result.
-      const selected = events.slice(0, 32).map(event => projectDeliveryEvent(formatDeliveryEvent(event))), id = randomUUID();
+      let page = events.slice(0, 32);
+      if (this.controller.enrichModelFailureEvent && page.some(needsModelDiagnostics)) {
+        page = await Promise.all(page.map(event => needsModelDiagnostics(event) ? this.controller.enrichModelFailureEvent(event) : event));
+        // Agent close and request resolution can retire events during the catalog read.
+        const retained = new Set(this.controller.eventsAfter(0).map(event => event.seq));
+        page = page.filter(event => retained.has(event.seq));
+        events = events.filter(event => retained.has(event.seq));
+      }
+      if (!page.length) { this.lease = null; await this.saveLease(); return { events: [] }; }
+      const selected = page.map(event => projectDeliveryEvent(formatDeliveryEvent(event))), id = randomUUID();
       await this.records.put(id, { status: 'issued', channel, toolUseId, sequences: selected.map(event => event.seq),
         hashes: Object.fromEntries(selected.map(event => [event.seq, requestFingerprint('event', event)])), acknowledged: [] });
       this.lease = { id, expiresAt: this.now() + this.leaseMs };

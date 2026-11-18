@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { unsupportedChatGPTLogin } from './model-recovery.mjs';
 
 const CLIENT_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -16,10 +17,10 @@ const threadIdPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 // may contain tool input, prompts, paths, or credentials and must stay private.
 function rpcDiagnostic(method, { message, data }) {
   if (['turn/start', 'thread/resume', 'thread/start', 'thread/compact/start'].includes(method)) {
+    if (unsupportedChatGPTLogin({ message })) return { reason: 'provider_model_unavailable', accessHint: 'unsupported_chatgpt_login', message: 'Codex reports that this model does not support ChatGPT account login.' };
     const missing = data?.codexErrorInfo === 'modelNotFound'
       || data?.code === 'model_not_found' || data?.error?.code === 'model_not_found'
-      || /^The model [`'"][\w.:/-]+[`'"] does not exist or you do not have access to it\.?$/i.test(message)
-      || /^The '[\w.:/-]+' model is not supported when using Codex with a ChatGPT account\.?$/i.test(message);
+      || /^The model [`'"][\w.:/-]+[`'"] does not exist or you do not have access to it\.?$/i.test(message);
     if (missing) return { reason: 'provider_model_unavailable', message: 'The provider reported that this model is unavailable for this account.' };
   }
   if (new RegExp(`^thread ${threadIdPattern} already has an active writer$`, 'i').test(message)) {
@@ -281,6 +282,7 @@ export class AppServerClient extends EventEmitter {
       error.rpcCode = rpc?.code;
       error.rpcMethod = pending.method;
       if (diagnostic) error.reason = diagnostic.reason;
+      if (diagnostic?.accessHint) error.accessHint = diagnostic.accessHint;
       pending.reject(error);
     } else pending.resolve(message.result);
   }
