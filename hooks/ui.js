@@ -273,9 +273,9 @@ async function refreshPaneGeometry($, page) {
   await $.ui.open({ id: PANE, title: geometryPulse ? 'Codex ' : 'Codex', closeOnEscape: true, rows: 24 });
   await new Promise(resolve => $.clock.after(16, resolve));
 }
-function scrollPane($, args, valid = () => true, controller = null, observe = null) {
+function scrollPane($, args, valid = () => true, controller = null, targetOffset = null) {
   const id = state.selected, generation = state.generation;
-  const request = { controller, observe, restore: state.restore, valid: () => state.opened && state.selected === id && state.generation === generation && valid() };
+  const request = { controller, targetOffset, restore: state.restore, valid: () => state.opened && state.selected === id && state.generation === generation && valid() };
   const run = async () => {
     if (!request.valid()) return { deny: 'obsolete navigation' };
     state.programmaticScroll = request;
@@ -296,10 +296,21 @@ function cancelNavigation(page) {
   page.layoutFloor = null;
   page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel();
 }
-function requestTail($, id, placement = false) {
+function resetTailWindow(page) {
+  cancelNavigation(page);
+  page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++;
+  page.upwardRead = null;
+  page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
+}
+function atPaneBottom(offset, contentRows, bodyRows, surface) {
+  // Desktop floors viewport rows, rounds scrollTop, and rounds content height
+  // up. The physical end can be two cells short of the reported row maximum.
+  return offset >= contentRows - bodyRows - (surface === 'desktop' ? 2 : 1);
+}
+function requestTail($, id, placement = false, markerToken = null) {
   const page = pageFor(id);
   page.tailRequest = { token: ++navigationSequence, generation: state.generation, scrollGeneration: page.scrollGeneration, placement };
-  page.tailMarkerToken = page.tailRequest.token;
+  page.tailMarkerToken = markerToken ?? page.tailRequest.token;
   return invalidate($);
 }
 async function requestHistoryNavigation($, id, direction) {
@@ -670,7 +681,7 @@ async function chooseAttachments($, id, source = 'file') {
     const id = state.selected, gen = state.generation;
     if (!state.opened || !id) return;
     const page = pageFor(id), control = controlFor(id), mutationEpoch = control.mutationEpoch;
-    if (afterSend) { page.afterSendGeneration = gen; page.followTail = true; page.awayFromBottom = false; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.scrollGeneration++; page.afterSendScrollGeneration = page.scrollGeneration; }
+    if (afterSend) { resetTailWindow(page); page.afterSendGeneration = gen; page.afterSendScrollGeneration = page.scrollGeneration; }
     if (page.busy) { if (afterSend) page.refreshAfterPoll = true; return; }
     page.busy = true;
     try {
@@ -689,7 +700,7 @@ async function chooseAttachments($, id, source = 'file') {
         dirty ||= entriesChanged;
       }
       if (appended && page.followTail) page.windowAnchor = null;
-      if (entriesChanged && hadRevision && page.followTail && !page.navigating && !page.scroller?.pending && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
+      if (entriesChanged && hadRevision && !state.opening && page.followTail && !page.navigating && !page.scroller?.pending && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
         // Install the tail request before the changed tree can emit layout
         // scroll events. One invalidation paints both content and its request.
         await requestTail($, id);
@@ -790,10 +801,11 @@ async function chooseAttachments($, id, source = 'file') {
     }
   }
   async function select($, id, gen) {
-    const previous = state.pages.get(state.selected); if (previous) cancelNavigation(previous);
     state.selected = id; state.imagePreview = null;
     const page = pageFor(id); page.historyLoading = false; page.historyRequest = null;
-    state.restore = state.scroll.has(id) && !page.followTail;
+    resetTailWindow(page);
+    page.scrollGeometry = null;
+    state.scroll.delete(id);
     page.detailRequests.clear();
     await poll($);
     if (state.opened && state.generation === gen && state.selected === id) await invalidate($);
@@ -826,7 +838,7 @@ async function chooseAttachments($, id, source = 'file') {
     const previous = state.pages.get(state.selected);
     if (previous) { cancelNavigation(previous); previous.tailRequest = null; }
     state.view = 'agent';
-    state.opened = true; state.selected = null; state.opening = true; state.requested = id || null; state.error = ''; const gen = ++state.generation;
+    state.opened = true; state.selected = null; state.opening = true; state.restore = false; state.requested = id || null; state.error = ''; const gen = ++state.generation;
     const current = () => state.opened && state.generation === gen && state.view === 'agent';
     await invalidate($);
     if (!current()) return;
@@ -839,17 +851,16 @@ async function chooseAttachments($, id, source = 'file') {
     if (!state.opened || state.generation !== gen) return;
     await invalidateEntry($);
     if (!current()) return;
-    state.opening = false;
     const selected = id ? state.agents.find((agent) => idOf(agent) === id) : [...state.agents].reverse().find(active) || state.agents.at(-1);
     if (selected) await select($, idOf(selected), gen);
-    else { state.selected = null; if (!state.error) state.error = id ? '未找到此代理。请重新读取代理列表。' : '当前会话没有可打开的 Codex 代理。'; await invalidate($); }
+    else { state.selected = null; state.opening = false; if (!state.error) state.error = id ? '未找到此代理。请重新读取代理列表。' : '当前会话没有可打开的 Codex 代理。'; await invalidate($); }
     if (!current()) return;
     const result = await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
     if (!current()) return;
     geometryPulse = false;
+    state.opening = false;
     if (result.isPlaced === false) { state.opened = false; state.generation++; return; }
-    if (state.restore) await scrollPane($, { to: 'start' }).catch(() => {});
-    else if (state.selected) await requestTail($, state.selected, true);
+    if (state.selected) await requestTail($, state.selected, true);
     if (!current()) return;
     startPanePolling($);
   }
@@ -1022,7 +1033,7 @@ export function registerUI(on) {
       if (!directory.restore) directory.offset = e.offset;
       return next(e);
     }
-    if (state.imagePreview || state.restoringPreview) return next(e);
+    if (state.opening || state.imagePreview || state.restoringPreview) return next(e);
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
     if (page?.navigating && page.surface === 'desktop') {
@@ -1032,16 +1043,25 @@ export function registerUI(on) {
     }
     const oldGeometry = page?.scrollGeometry;
     if (page) page.scrollGeometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
+    const atBottom = atPaneBottom(e.offset, e.contentRows, e.bodyRows, page?.surface);
     // Before the new tail marker is painted, native layout/clamping may emit
     // "person" scroll events. They cannot cancel the requested initial/jump
     // placement; after the first reveal, genuine upward input owns it again.
     const tail = page?.tailRequest;
-    if (tail?.placement && (!tail.revealed || tail.geometry && (e.contentRows !== tail.geometry.contentRows || e.bodyRows !== tail.geometry.bodyRows))) return next(e);
+    if (tail?.placement) {
+      const layoutChanged = tail.geometry && (e.contentRows !== tail.geometry.contentRows || e.bodyRows !== tail.geometry.bodyRows);
+      if (!tail.revealed || layoutChanged && (e.by >= 0 || atBottom)) return next(e);
+    }
     // Desktop reports content growth/resizing as person scrolls even when the
     // viewport did not move. That is not an instruction to stop live following.
-    if (page?.followTail && e.by === 0 && !page.scroller?.pending) return next(e);
+    if (page?.followTail && e.by === 0 && !page.scroller?.pending) {
+      // A mounted Markdown leaf can grow after the first placement and before
+      // any new message arrives. One request covers repeated resize reports.
+      if (oldGeometry && e.contentRows > oldGeometry.contentRows && !atBottom && state.opened &&
+          !tail && !page.navigating && !page.navigationRequest && !page.windowAnchor) void requestTail($, id);
+      return next(e);
+    }
     const view = page && drawnWindow(page);
-    const atBottom = Number.isFinite(e.contentRows) && Number.isFinite(e.bodyRows) && e.offset >= e.contentRows - e.bodyRows - 1;
     const controller = page && scrollController($, id, page);
     const intent = controller?.intent, observed = controller?.observe(e);
     if (controller && controller.intent === intent) return next(observed);
@@ -1050,8 +1070,14 @@ export function registerUI(on) {
       page.browseTimer?.cancel();
       page.tailRequest = null;
       if (page.navigationRequest && e.by !== 0 && Math.sign(e.by) !== page.navigationRequest.direction) page.navigationRequest = null;
+      const previousOffset = state.scroll.get(id);
       state.scroll.set(id, e.offset); page.scrollGeneration++;
       const stableGeometry = !oldGeometry || oldGeometry.contentRows === e.contentRows && oldGeometry.bodyRows === e.bodyRows;
+      // An actual upward move is observable even inside the rounding margin.
+      if (e.by !== 0 || !stableGeometry) {
+        page.upwardRead = atBottom && e.by < 0 && stableGeometry && e.offset < (previousOffset ?? e.offset)
+          ? { offset: e.offset, contentRows: e.contentRows, bodyRows: e.bodyRows } : null;
+      }
       if (!page.navigating && !page.navigationRequest && !page.historyLoading && Date.now() >= (page.edgeCooldownUntil || 0) && stableGeometry && e.by !== 0) {
         // A new wheel/key gesture can retry the same edge. Requiring the reader
         // to leave three rows first permanently locks short panes and failures.
@@ -1061,9 +1087,10 @@ export function registerUI(on) {
       page.windowAnchor = null;
       holdWindow(page);
       if (page.windowEnd == null) page.windowStart = view.start;
-      // DOM resize/anchor adjustments also arrive as "person" scrolls on the
-      // desktop. They may not re-enable following after an upward read.
-      page.followTail = wasFollowing && e.by >= 0 && atBottom && view.start + view.entries.length >= view.total;
+      // A downward move to the end of the newest window resumes following.
+      // Layout clamps and repeated reports at an unchanged offset do not.
+      const movedDown = e.by > 0 && stableGeometry && (previousOffset == null || e.offset > previousOffset);
+      page.followTail = atBottom && view.start + view.entries.length >= view.total && (wasFollowing && e.by >= 0 || movedDown);
       page.awayFromBottom = !page.followTail;
     }
     // Return the wheel dispatch immediately. History, state writes and paint
@@ -1094,7 +1121,11 @@ export function registerUI(on) {
     const transfer = state.programmaticScroll;
     if (transfer && !transfer.valid()) return next({ ...e, offset: state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
     page.scrollGeometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
-    transfer?.observe?.(e);
+    if (transfer?.targetOffset) {
+      const offset = transfer.targetOffset(e);
+      state.scroll.set(id, offset);
+      return next({ ...e, offset });
+    }
     if (transfer?.controller?.pending) return next(transfer.controller.observe(e));
     if (page.scroller?.pending) return next(page.scroller.observe(e));
     if (state.restore) return next({ ...e, offset: state.scroll.get(id) || 0 });
@@ -1138,9 +1169,11 @@ export function registerUI(on) {
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'tail') {
       const id = state.selected, page = pageFor(id), request = page.tailRequest;
       if (!request || request.token !== e.data.token || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) return {};
-      // to:'end' also enables native followEnd(), which can pull a later upward
-      // scroll back down. A keyed reveal is strictly a single movement.
+      // The key proves this transcript has painted. Its own rectangle can end
+      // before a native Markdown leaf or the composer has finished laying out.
+      // Use the whole pane's measured end without enabling native followEnd().
       let previousGeometry = null, elapsed = 0;
+      const markerToken = page.tailMarkerToken;
       for (const delay of [0, 32, 64, 128]) {
         if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
         elapsed += delay;
@@ -1148,17 +1181,34 @@ export function registerUI(on) {
         await refreshPaneGeometry($, page);
         if (state.selected !== id || page.tailRequest !== request || !page.followTail) break;
         let geometry;
-        const result = await scrollPane($, { to: { key: tailKey(id, request.token) }, block: 'end' }, () => page.tailRequest === request && request.scrollGeneration === page.scrollGeneration && page.followTail, null, event => {
+        const result = await scrollPane($, { to: { key: tailKey(id, markerToken) }, block: 'end' }, () => page.tailRequest === request && request.scrollGeneration === page.scrollGeneration && page.followTail, null, event => {
           geometry = { contentRows: event.contentRows, bodyRows: event.bodyRows };
           request.geometry = geometry;
+          return Math.max(0, event.contentRows - event.bodyRows);
         }).catch(() => ({ deny: 'not painted' }));
-        if (!result?.deny) {
+        if (!result?.deny && geometry) {
           request.revealed = true;
-          if (elapsed >= 96 && geometry && previousGeometry && geometry.contentRows === previousGeometry.contentRows && geometry.bodyRows === previousGeometry.bodyRows) break;
+          if (request.token !== markerToken) break; // One late check of an existing marker.
+          if (elapsed >= 96 && previousGeometry &&
+              geometry.contentRows === previousGeometry.contentRows && geometry.bodyRows === previousGeometry.bodyRows &&
+              geometry.contentRows === page.scrollGeometry?.contentRows && geometry.bodyRows === page.scrollGeometry.bodyRows) break;
           previousGeometry = geometry;
         }
       }
-      if (page.tailRequest === request) { page.tailRequest = null; await invalidate($); }
+      if (page.tailRequest === request) {
+        page.tailRequest = null;
+        if (request.placement && page.surface === 'desktop') {
+          // Late native leaves can grow without changing scrollTop or emitting
+          // a scroll event. Recheck the same painted transcript once in a fresh
+          // dispatch, after returning this hook and without delaying input.
+          $.clock.after(384, () => {
+            if (state.opened && state.selected === id && state.generation === request.generation &&
+                page.scrollGeneration === request.scrollGeneration && page.tailMarkerToken === markerToken &&
+                page.followTail && !page.tailRequest && !page.windowAnchor && !state.imagePreview) return requestTail($, id, false, markerToken);
+          });
+        }
+        await invalidate($);
+      }
       return {};
     }
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'navigate') {
@@ -1285,8 +1335,7 @@ function renderPane($, e, next) {
     }
     let view = timelineWindow(page), entries = view.entries;
     const jump = async () => {
-      cancelNavigation(page);
-      page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++; page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
+      resetTailWindow(page);
       await requestTail($, id, true);
     };
     const navigation = [], composer = [];
@@ -1638,8 +1687,11 @@ function renderPane($, e, next) {
     const settling = e.surface === 'desktop' && page.navigating;
     const overlay = scroll => {
       const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
-      const visible = hasLater || page.awayFromBottom || (Number.isFinite(scroll?.contentRows) && offset < scroll.contentRows - bodyRows - 1);
-      return Box({ key: `codex_jump_overlay_${id}`, position: 'absolute', left: 0, right: 0, top: Math.max(0, offset + bodyRows - 3), height: 2, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', display: visible ? 'flex' : 'none', children: [jumpNode] });
+      const contentRows = scroll?.contentRows ?? page.scrollGeometry?.contentRows;
+      const reading = page.upwardRead;
+      const aboveEnd = reading?.offset === offset && reading.contentRows === contentRows && reading.bodyRows === bodyRows;
+      const visible = hasLater || aboveEnd || (Number.isFinite(contentRows) ? !atPaneBottom(offset, contentRows, bodyRows, e.surface) : page.awayFromBottom);
+      return Box({ key: `codex_jump_overlay_${id}`, position: 'absolute', alignSelf: 'center', width: 4, top: Math.max(0, offset + bodyRows - 3), height: 2, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', display: visible ? 'flex' : 'none', children: [jumpNode] });
     };
     const headerNode = Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation });
     const composerNode = Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer });

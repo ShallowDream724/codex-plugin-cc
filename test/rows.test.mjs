@@ -8,7 +8,7 @@ const full = name => 'mcp__codex-subagents__' + name;
 const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 function setup() {
   closeUI();
-  const hooks = new Map(), opened = [];
+  const hooks = new Map(), opened = [], panes = [];
   registerRows((event, match, handler) => hooks.set(match.component, handler));
   const $ = {
     session: { id: async () => 'owner', cwd: async () => '/work' }, env: { get: async () => undefined }, plugin: { root: '/plugin' },
@@ -19,9 +19,9 @@ function setup() {
       if (body.operation === 'ui_revision') opened.push(body.args.target);
       return { stdout: JSON.stringify(body.operation === 'ui_list' ? { agents: Array.from({ length: 5 }, (_, i) => ({ agent_id: `id-${i}` })) } : { entries: [], revision: 0 }), exitCode: 0 };
     } },
-    ui: { open: async () => ({ isPlaced: true }), scroll: async () => ({}), invalidate() {}, resolve: () => Object.fromEntries(['Box', 'Text', 'Button'].map(type => [type, props => ({ type, props })])) },
+    ui: { open: async ({ id }) => { panes.push(id); return { isPlaced: true }; }, scroll: async () => ({}), invalidate() {}, resolve: () => Object.fromEntries(['Box', 'Text', 'Button'].map(type => [type, props => ({ type, props })])) },
   };
-  return { opened, render: (component, props) => hooks.get(component)($, { component, requestId: 'call', props }, () => 'native') };
+  return { opened, panes, render: (component, props) => hooks.get(component)($, { component, requestId: 'call', props }, () => 'native') };
 }
 test('five long bilingual agent names retain five independent clickable entries without changing output', async () => {
   const h = setup();
@@ -51,6 +51,29 @@ test('wrapped MCP results decode; oversized or invalid results preserve native f
   assert.deepEqual(parseDisplayResult({ content: [{ type: 'text', text: '{"agent_id":"a"}' }] }), { agent_id: 'a' });
   assert.equal(describeCall(full('wait_agent'), {}, 'not JSON'), null);
   assert.equal(describeCall(full('wait_agent'), {}, 'x'.repeat(524289)), null);
+});
+
+test('listing agents reports the query count and never announces a status transition', async () => {
+  const h = setup();
+  const agents = Array.from({ length: 4 }, (_, i) => ({ agent_id: `id-${i}`, status: 'completed' }));
+  const list = { tool: full('list_agents'), output: { agents } };
+  const wait = { tool: full('wait_agent'), output: { events: [{ agent_id: 'id-3', name: 'Reviewer', kind: 'completed' }] } };
+  const models = { tool: full('list_models'), output: { models: Array(4).fill({}) } };
+  const labels = tree => nodes(tree).filter(node => node.type === 'Text').flatMap(node => node.props.children);
+  const summary = '已列出 4 个 Codex 代理';
+  const tree = h.render('ToolResult', list);
+  assert.deepEqual(labels(tree), [summary]);
+  assert.deepEqual(labels(h.render('ToolUse', list)), [summary]);
+  assert.deepEqual(labels(h.render('ToolResult', list)), []);
+  assert.deepEqual(labels(h.render('ToolGroup', { calls: [models, list] })), ['4 个 Codex 模型可用', summary]);
+  const mixed = h.render('ToolGroup', { calls: [list, wait] });
+  assert.equal(labels(mixed).filter(text => text === '已完成').length, 1);
+  assert.deepEqual(nodes(mixed).filter(node => node.type === 'Button').map(node => node.props.label), [summary, 'Reviewer']);
+  assert.equal(h.render('ToolUse', { ...list, isExpanded: true }), 'native');
+  assert.deepEqual(labels(h.render('ToolUse', { ...list, output: { agents: [] } })), ['已列出 0 个 Codex 代理']);
+  await nodes(tree).find(node => node.type === 'Button').props.onPress();
+  assert.equal(h.panes.length, 1);
+  assert.deepEqual(h.opened, []);
 });
 
 test('compact send and followup rows show unconfirmed delivery without implying receipt', () => {

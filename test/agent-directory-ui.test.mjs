@@ -6,10 +6,57 @@ import { nativeHooks } from './native-hooks.mjs';
 const PANE = 'codex_subagent_activity';
 const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 const settle = async () => { for (let n = 0; n < 5; n++) await new Promise(setImmediate); };
-function harness(t) {
+const shows = (tree, key) => Boolean(tree?.props && tree.props.display !== 'none'
+  && (tree.props.key === key || tree.props.children?.some(child => shows(child, key))));
+
+const cellHeight = 24;
+
+function desktopViewport({ clientHeight = 216, paddingY = 0, chromeHeight = 196 } = {}) {
+  const bodyRows = Math.floor((clientHeight - paddingY) / cellHeight);
+  let painted = [], scrollTop = 0, delayedHeight = 0;
+  const scrollHeight = () => {
+    const answer = painted.find(node => node.type === 'Markdown' && node.props.text.startsWith('Answer line'));
+    return paddingY + (answer ? chromeHeight + answer.props.text.split('\n\n').length * cellHeight + delayedHeight : 1500);
+  };
+  const offsetAt = top => Math.round(top / cellHeight);
+  const contentRows = () => Math.ceil((scrollHeight() - paddingY - 1) / cellHeight);
+  const maxScrollTop = () => scrollHeight() - clientHeight;
+  const clamp = (value, max) => Math.max(0, Math.min(value, max));
+  const event = (kind, offset) => ({ origin: { kind }, offset, by: offset - offsetAt(scrollTop), contentRows: contentRows(), bodyRows });
+  const personScroll = async (top, emit) => {
+    const target = clamp(top, maxScrollTop());
+    const sample = event('person', offsetAt(target));
+    const result = await emit(sample);
+    scrollTop = result.offset === sample.offset ? target : clamp(result.offset * cellHeight, maxScrollTop());
+  };
+  return {
+    paint(tree) { painted = nodes(tree); },
+    get renderScroll() { return { offset: offsetAt(scrollTop), bodyRows }; },
+    get atBottom() { return scrollTop === maxScrollTop(); },
+    get personBottom() { return offsetAt(maxScrollTop()); },
+    get reportedEnd() { return contentRows() - bodyRows; },
+    commit(offset) { scrollTop = clamp(offset * cellHeight, maxScrollTop()); },
+    personScroll,
+    reflow(height, emit) {
+      delayedHeight += height;
+      return personScroll(scrollTop, emit);
+    },
+    pluginEvent({ to, block }) {
+      if (to === 'start' || to === 'end') return event('plugin', to === 'end' ? contentRows() - bodyRows : 0);
+      if (!painted.some(node => node.type === 'Button' && node.props.key === to.key)) return null;
+      // Exercise a keyed target that still ends above the long Markdown leaf.
+      // The pane's measured scroll height already includes the full answer.
+      const top = 7, bottom = 8;
+      return event('plugin', clamp(block === 'end' ? bottom - bodyRows : top, contentRows() - bodyRows));
+    },
+  };
+}
+
+function harness(t, { viewportGeometry } = {}) {
   closeUI(); t.after(closeUI);
   const writes = [], calls = [], panes = new Map(), timers = [], scrolls = [];
-  const fixture = { agents: [], list: null, stopAll: null };
+  const viewport = viewportGeometry ? desktopViewport(viewportGeometry) : null;
+  const fixture = { agents: [], list: null, stopAll: null, answer: 'Finished.' };
   const $ = {
     state: { get: async () => undefined, set: async (key, value) => { writes.push({ key: key.key, value }); } },
     session: { id: async () => 'session', cwd: async () => 'C:/work' }, env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
@@ -22,7 +69,7 @@ function harness(t) {
       const op = request.operation;
       const result = op === 'ui_list' ? await (fixture.list ? fixture.list() : { agents: fixture.agents })
         : op === 'ui_interrupt_all' ? await fixture.stopAll?.(request)
-          : op === 'ui_revision' ? { revision: 1, entries: [{ id: 'answer', turn_id: 'turn', type: 'agentMessage', data: { text: 'Finished.' } }] }
+          : op === 'ui_revision' ? { revision: 1, entries: [{ id: 'answer', turn_id: 'turn', type: 'agentMessage', data: { text: fixture.answer } }] }
             : op === 'ui_history' ? { entries: [], next_cursor: null } : {};
       return { stdout: JSON.stringify(result), exitCode: 0 };
     } },
@@ -32,13 +79,20 @@ function harness(t) {
       open: async args => { panes.set(args.id, args); return { isPlaced: true }; },
       close: async args => { await host.dispatch('ui.close', { id: args.id }, () => { panes.delete(args.id); }); },
       scroll: async args => {
-        const e = await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, by: -100, offset: 0, contentRows: 500, bodyRows: 24 }, e => e);
+        const event = viewport ? viewport.pluginEvent(args) : { origin: { kind: 'plugin' }, by: -100, offset: 0, contentRows: 500, bodyRows: 24 };
+        if (!event) return { deny: 'no element of its own is drawn under that key' };
+        const e = await host.dispatch('ui.scroll', event, e => e);
+        viewport?.commit(e.offset);
         scrolls.push(e.offset); return {};
       },
     },
   };
   const host = nativeHooks([], $); registerUI(host.on);
-  const draw = (component = 'Pane', props = {}) => host.dispatch('ui.render', { component, requestId: component === 'Pane' ? PANE : 'above-prompt', surface: 'desktop', props: { bodyColumns: 64, scroll: { offset: 0, bodyRows: 24, contentRows: 500 }, ...props } }, () => null);
+  const draw = async (component = 'Pane', props = {}) => {
+    const tree = await host.dispatch('ui.render', { component, requestId: component === 'Pane' ? PANE : 'above-prompt', surface: 'desktop', props: { bodyColumns: 64, scroll: viewport?.renderScroll ?? { offset: 0, bodyRows: 24, contentRows: 500 }, ...props } }, () => null);
+    if (component === 'Pane') viewport?.paint(tree);
+    return tree;
+  };
   const press = async key => {
     const tree = await draw(key === 'codex_directory_toggle' ? 'SessionMode' : 'Pane');
     const node = nodes(tree).find(node => node.type === 'Button' && node.props.key === key);
@@ -49,7 +103,16 @@ function harness(t) {
     const node = nodes(await draw()).find(node => node.props.key === 'codex_directory_sync');
     if (node) await host.dispatch('ui.message', { element: node.props.key, data: { action: 'navigate', token: node.props.props.token } });
   };
-  return { $, host, draw, press, fixture, calls, writes, panes, timers, scrolls, syncDirectory };
+  const tailSyncNode = async () => nodes(await draw()).find(node => node.props.key === 'codex_navigation_sync_a');
+  const syncTail = async () => {
+    const node = await tailSyncNode();
+    assert.ok(node?.props.props.tailToken, 'the pane requests a tail reveal');
+    await host.surface(() => host.dispatch('ui.message', { element: node.props.key, data: { action: 'tail', token: node.props.props.tailToken } }));
+  };
+  const emitPerson = event => host.surface(() => host.dispatch('ui.scroll', event));
+  const scrollTo = top => viewport.personScroll(top, emitPerson);
+  const reflow = height => viewport.reflow(height, emitPerson);
+  return { $, host, draw, press, fixture, calls, writes, panes, timers, scrolls, syncDirectory, syncTail, tailSyncNode, scrollTo, reflow, viewport };
 }
 
 test('desktop entry composes SessionMode without an icon, while AbovePrompt passes through and terminal retains its entry', async t => {
@@ -188,25 +251,77 @@ test('directory shows mixed stop outcomes and allows retry when stopping is unco
   assert.ok(frame.some(node => node.props.key === 'directory_stop_all'));
 });
 
-test('directory to agent and back preserve drafts and independent reading offsets', async t => {
-  const h = harness(t);
+const answerWithLines = lines => Array.from({ length: lines }, (_, i) => `Answer line ${i + 1}`).join('\n\n');
+
+test('opening and reopening a long conversation from the directory shows its end and preserves the draft', async t => {
+  const h = harness(t, { viewportGeometry: {} });
   h.fixture.agents = [{ agent_id: 'a', name: 'Agent', status: 'completed', last_activity_at_ms: Date.now() }];
+  h.fixture.answer = answerWithLines(42);
   await openDirectory(h.$); await settle(); await h.syncDirectory();
-  await h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, offset: 23, by: 23 });
+  await h.scrollTo(23 * cellHeight);
   await h.press('directory_open_a');
+  await h.syncTail();
+  assert.ok(h.viewport.atBottom, 'opening the chat reveals the end of the long answer and the composer');
   let tree = await h.draw();
   await nodes(tree).find(n => n.type === 'Input').props.onInput('Unsent draft');
-  // Complete the normal initial tail reveal, then read upwards.
-  const tail = nodes(tree).find(n => n.props.key === 'codex_navigation_sync_a');
-  if (tail?.props.props.tailToken) await h.host.dispatch('ui.message', { element: tail.props.key, data: { action: 'tail', token: tail.props.props.tailToken } });
-  await h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, offset: 37, by: -5, contentRows: 500, bodyRows: 24 });
-  await h.press('codex_back_directory_footer'); await settle(); await h.syncDirectory();
+  await h.scrollTo(0);
+  await h.press('codex_back_directory'); await settle(); await h.syncDirectory();
   assert.equal(h.scrolls.at(-1), 23);
   await h.press('directory_open_a');
-  assert.equal(h.scrolls.at(-1), 37);
+  await h.syncTail();
+  assert.ok(h.viewport.atBottom, 'explicitly reopening the same chat returns to its latest content');
   tree = await h.draw();
   assert.equal(nodes(tree).find(n => n.type === 'Input').props.value, 'Unsent draft');
   assert.ok(h.calls.every(c => ['ui_list', 'ui_revision', 'ui_history'].includes(c.operation)));
+});
+
+for (const { gap, lines, viewportGeometry } of [
+  { gap: 1, lines: 42, viewportGeometry: {} },
+  { gap: 2, lines: 19, viewportGeometry: { clientHeight: 247, paddingY: 16, chromeHeight: 194 } },
+]) test(`scrolling to the physical desktop bottom hides the jump arrow with a ${gap}-row rounding gap`, async t => {
+  const h = harness(t, { viewportGeometry });
+  h.fixture.agents = [{ agent_id: 'a', status: 'completed' }];
+  h.fixture.answer = answerWithLines(lines);
+  await openDirectory(h.$); await settle(); await h.syncDirectory();
+  await h.press('directory_open_a'); await h.syncTail();
+  // Desktop rounds scrollTop and rounds up the scroll height, so its physical
+  // bottom can report an offset before the maximum implied by the row counts.
+  assert.equal(h.viewport.reportedEnd - h.viewport.personBottom, gap);
+  await h.scrollTo(Infinity);
+  await h.scrollTo((h.viewport.personBottom - 1) * cellHeight);
+  assert.ok(shows(await h.draw(), 'codex_jump_a_viewport'), 'a small upward move leaves the bottom');
+  const previousScrolls = h.scrolls.length;
+  await h.scrollTo(Infinity);
+  assert.ok(h.viewport.atBottom);
+  assert.equal(h.scrolls.length, previousScrolls, 'the reader never needs to activate the jump arrow');
+  const bottomFrame = await h.draw();
+  assert.equal(shows(bottomFrame, 'codex_jump_a_viewport'), false);
+  assert.ok(shows(bottomFrame, 'codex_back_directory_footer'));
+  await h.press('codex_back_directory_footer'); await settle();
+  assert.ok(shows(await h.draw(), 'directory_open_a'));
+});
+
+test('late Markdown layout follows the bottom only while the reader is at the end', async t => {
+  const h = harness(t, { viewportGeometry: {} });
+  h.fixture.agents = [{ agent_id: 'a', status: 'completed' }];
+  h.fixture.answer = answerWithLines(42);
+  await openDirectory(h.$); await settle(); await h.syncDirectory();
+  await h.press('directory_open_a'); await h.syncTail();
+  assert.ok(h.viewport.atBottom);
+  assert.equal((await h.tailSyncNode()).props.props.tailToken, 0);
+  const bridgeCalls = h.calls.length;
+
+  await h.reflow(18 * cellHeight);
+  assert.equal(h.viewport.atBottom, false, 'the newly laid-out answer extends beyond the old bottom');
+  await settle(); await h.syncTail();
+  assert.ok(h.viewport.atBottom, 'late growth reveals the new end without another backend revision');
+  assert.equal(h.calls.length, bridgeCalls);
+
+  await h.scrollTo((h.viewport.personBottom - 5) * cellHeight);
+  const readingOffset = h.viewport.renderScroll.offset;
+  await h.reflow(12 * cellHeight); await settle();
+  assert.equal((await h.tailSyncNode()).props.props.tailToken, 0, 'layout growth must not queue a jump while reading');
+  assert.equal(h.viewport.renderScroll.offset, readingOffset);
 });
 
 test('selected agent ignores a late list response and remains reachable from directory after completion', async t => {

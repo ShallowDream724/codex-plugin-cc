@@ -55,17 +55,18 @@ const assertTailReveal = scrolls => {
   assert.ok(scrolls.every(call => call.to.key === scrolls[0].to.key));
 };
 
-test('first open starts at the end and reopening restores the saved reading position', async (t) => {
+test('first open and explicit reopening both reveal the end', async (t) => {
   t.after(closeUI);
   const ui = await setup(async (op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_history' ? { entries: [entry('saved', 'agentMessage', 'saved')], next_cursor: null } : { revision: 1, entries: [] });
   await flushTimers(ui);
   assertTailReveal(ui.scrolls);
-  await ui.scroll(1, 42);
+  await ui.scroll(-48, 42);
   await ui.close();
+  const before = ui.scrolls.length, originalTail = tailCalls(ui.scrolls).at(-1).to.key;
   await ui.open('a');
-  assert.deepEqual(ui.scrolls.at(-1), { in: 'codex_subagent_activity', to: 'start' });
-  const restored = await ui.scrollEvent({ origin: { kind: 'plugin' }, by: 0, offset: 0, contentRows: 100, bodyRows: 10 });
-  assert.equal(restored.offset, 42);
+  await flushTimers(ui);
+  assertTailReveal(ui.scrolls.slice(before));
+  assert.notEqual(tailCalls(ui.scrolls).at(-1).to.key, originalTail);
 });
 
 test('live messages continue while an MCP group and cached tool output remain expanded', async (t) => {
@@ -247,7 +248,7 @@ test('jump waits for its new tail marker even when an older marker was painted',
   assertTailReveal(ui.scrolls.slice(before));
   assert.equal(ui.scrolls.at(-1).to.key, attempted.at(-1));
 });
-test('new activity pauses for reading and resumes after an explicit jump', async (t) => {
+test('new activity pauses for reading and resumes after a real scroll to the bottom', async (t) => {
   t.after(closeUI);
   const tool = { id: 'tool', turn_id: 'turn', type: 'commandExecution', data: { command: 'test', aggregatedOutput: 'output' } };
   let revision = 1, entries = [tool];
@@ -258,17 +259,18 @@ test('new activity pauses for reading and resumes after an explicit jump', async
   entries = [...entries, entry('one', 'agentMessage', 'first')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), ++count, 'opening a tool at the bottom does not disable following');
   entries = [...entries, entry('two', 'agentMessage', 'second')]; revision++; await ui.tick();
-  await ui.scrollEvent({ origin: { kind: 'person' }, by: -1, offset: 12, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: -78, offset: 12, contentRows: 100, bodyRows: 10 }); await flushTimers(ui);
   assert.equal(countEnd(), count, 'a pending follow is cancelled by a user scroll');
-  entries = [...entries, entry('three', 'agentMessage', 'third')]; revision++; await ui.tick(); await flushTimers(ui);
+  entries = [tool, entry('one', 'agentMessage', 'first'), entry('two', 'agentMessage', 'second is still streaming')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), count, 'new activity does not interrupt reading');
   assert.ok(ui.scrolls.every(s => s.to !== 'end'), 'tail positioning never enables native follow-end');
-  await ui.scrollEvent({ origin: { kind: 'person' }, by: 1, offset: 80, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
-  await ui.scrollEvent({ origin: { kind: 'person' }, by: 1, offset: 80, contentRows: 100, bodyRows: 20 }); await flushTimers(ui);
-  entries = [...entries, entry('layout', 'agentMessage', 'layout update')]; revision++; await ui.tick(); await flushTimers(ui);
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: 0, offset: 12, contentRows: 22, bodyRows: 10 }); await flushTimers(ui);
+  entries = [tool, entry('one', 'agentMessage', 'first'), entry('two', 'agentMessage', 'second now complete')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), count, 'a bottom-position layout event does not resume following');
-  await (await ui.item('codex_jump_a_viewport')).props.onPress(); await flushTimers(ui);
-  count = countEnd(); entries = [...entries, entry('four', 'agentMessage', 'fourth')]; revision++; await ui.tick(); await flushTimers(ui);
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: 0, offset: 12, contentRows: 100, bodyRows: 10 });
+  await ui.scrollEvent({ origin: { kind: 'person' }, by: 78, offset: 90, contentRows: 100, bodyRows: 10 }); await flushTimers(ui);
+  assert.equal(countEnd(), count, 'scrolling to the end requires no additional jump');
+  entries = [...entries, entry('four', 'agentMessage', 'fourth')]; revision++; await ui.tick(); await flushTimers(ui);
   assert.equal(countEnd(), count + 1, 'reaching the bottom resumes following');
 });
 

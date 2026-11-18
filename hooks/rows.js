@@ -1,5 +1,5 @@
 import { messageDeliveries } from './delivery.js';
-import { openAgent } from './ui.js';
+import { openAgent, openDirectory } from './ui.js';
 import { agentIcon, agentVisual, agentDisplayName } from './presentation.js';
 
 const PREFIX = 'mcp__codex-subagents__';
@@ -50,7 +50,7 @@ export function describeCall(tool, input = {}, output, isRunning = false) {
     return [{ id: value.agent_id, name: value.name, text: '消息投递未确认' }];
   }
   if (operation === 'spawn_agent' || operation === 'followup_task') return [{ id: value?.agent_id, name: value?.name || input?.name, text: isRunning ? '正在启动' : operation === 'spawn_agent' ? '开始工作' : '已收到任务' }];
-  if (operation === 'list_agents' && Array.isArray(value?.agents)) return value.agents.map(agent => ({ id: agent.agent_id || agent.id, name: agent.name, text: ({ running: '工作中', starting: '正在启动', waiting: '等待中', completed: '已完成', interrupted: '本轮已停止', failed: '失败', unknown: '状态未知', compacting: '正在压缩上下文' })[agent.status] || '已保存' }));
+  if (operation === 'list_agents' && Array.isArray(value?.agents)) return [{ kind: 'directory', text: `已列出 ${value.agents.length} 个 Codex 代理` }];
   if (operation === 'close_agent') return [{ text: isRunning ? '正在关闭代理' : value?.closed_count !== undefined ? `已关闭 ${value.closed_count} 个代理${value.skipped?.length ? `，保留 ${value.skipped.length} 个` : ''}` : '代理已关闭，历史已保留' }];
   if (operation === 'list_models' && Array.isArray(value?.models)) return [{ text: `${value.models.length} 个 Codex 模型可用` }];
   const action = { send_message: '已收到消息', answer_agent: '已收到答复', interrupt_agent: '已请求停止' }[operation];
@@ -70,6 +70,7 @@ function draw($, e, entries) {
     else groups.push({ text: entry.text, kind: entry.kind, entries: [entry] });
   }
   return Box({ key: `codex_rows_${e.requestId || 'events'}`, flexDirection: 'column', gap: 'xs', children: groups.map((group, index) => {
+    if (group.kind === 'directory') return Button({ key: `codex_directory_${index}`, plain: true, label: group.text, onPress: () => openDirectory($), children: [Text({ size: 'footnote', dimColor: true, children: [group.text] })] });
     const buttons = group.entries.filter(entry => entry.id).flatMap((entry, position) => [...(position ? [Text({ key: `join_${entry.id}`, size: 'footnote', dimColor: true, children: ['和'] })] : []), icon(entry.id), Button({
       key: `${e.requestId || 'codex'}:${index}:${position}:${entry.id}`,
       label: safe(agentDisplayName(entry.name || entry.id || 'Codex')),
