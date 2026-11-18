@@ -5,7 +5,10 @@ import { agentIcon, agentVisual, agentDisplayName } from './presentation.js';
 const PREFIX = 'mcp__codex-subagents__';
 const EVENTS = { completed: '已完成', failed: '失败', interrupted: '本轮已停止', unknown: '需要关注', question: '有问题', approval: '需要批准', message: '发送了消息', compacting: '正在压缩上下文' };
 function eventText(event) {
-  if (event.origin === 'user' && event.action === 'interrupt') return ({ requested: '你已请求停止', stopping: '正在停止', confirmed: '已按你的要求停止', unconfirmed: '停止状态未确认' })[event.phase] || '停止状态已更新';
+  if (event.origin === 'user' && event.action === 'interrupt') {
+    if (event.kind === 'user_action_receipt' && event.scope === 'session' && typeof event.summary === 'string' && event.summary.trim()) return event.summary;
+    return ({ requested: '你已请求停止', stopping: '正在停止', confirmed: '已按你的要求停止', unconfirmed: '停止状态未确认' })[event.phase] || '停止状态已更新';
+  }
   if (event.origin === 'user' && event.action === 'send') return event.phase === 'delivered' ? '已收到你的消息' : '消息发送状态未确认';
   return EVENTS[event.kind] || '已更新';
 }

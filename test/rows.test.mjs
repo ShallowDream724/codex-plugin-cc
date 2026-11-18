@@ -100,3 +100,39 @@ test('user interruption and message events have accurate distinct timeline label
   const tree = h.render('UserMessage', { origin: { kind: 'plugin', name: 'codex-subagents' }, text: EVENT_PREFIX + JSON.stringify({ events }) });
   assert.ok(nodes(tree).some(node => node.type === 'Text' && node.props.children[0] === '停止状态未确认'));
 });
+
+test('pause receipts render once in a wait result or automatic notification', () => {
+  const origin = { kind: 'plugin', name: 'codex-subagents' };
+  const buttons = tree => nodes(tree).filter(node => node.type === 'Button').map(node => node.props.label);
+  const labels = tree => nodes(tree).filter(node => node.type === 'Text').flatMap(node => node.props.children);
+
+  for (const [phase, singleLabel, summary] of [
+    ['confirmed', '已按你的要求停止', '已暂停本会话中的全部 Codex 代理。'],
+    ['unconfirmed', '停止状态未确认', '本会话中的 Codex 代理暂停结果未全部确认。'],
+  ]) {
+    for (const [scope, label, expectedButtons] of [
+      [{ agent_id: 'id-0', name: 'worker', summary: `Worker：${singleLabel}。` }, singleLabel, ['Worker', 'Reviewer']],
+      [{ scope: 'session', summary }, summary, ['Reviewer']],
+    ]) {
+      const h = setup();
+      const events = [{ ...scope, seq: 1, kind: 'user_action_receipt', origin: 'user', action: 'interrupt', phase },
+        { seq: 2, agent_id: 'id-1', name: 'reviewer', kind: 'completed', result: 'genuine result' }];
+      const output = { result: JSON.stringify({ idle: true, events }) };
+      const original = structuredClone(output);
+      const props = { tool: full('wait_agent'), tool_use_id: 'pause', output };
+      const prompt = EVENT_PREFIX + JSON.stringify({ events });
+
+      for (const tree of [h.render('ToolResult', props), h.render('ToolUse', props), h.render('UserMessage', { origin, text: prompt })]) {
+        assert.deepEqual(buttons(tree), expectedButtons);
+        assert.equal(labels(tree).filter(text => text === label).length, 1);
+        assert.equal(labels(tree).filter(text => text === '已完成').length, 1);
+        assert.ok(!labels(tree).includes('Codex 空闲'));
+      }
+      assert.equal(h.render('ToolResult', props).props.children.length, 0);
+      assert.equal(h.render('ToolUse', { ...props, isExpanded: true }), 'native');
+      assert.equal(h.render('ToolResult', props), 'native');
+      assert.equal(h.render('UserMessage', { origin, text: prompt, isExpanded: true }), 'native');
+      assert.deepEqual(output, original);
+    }
+  }
+});

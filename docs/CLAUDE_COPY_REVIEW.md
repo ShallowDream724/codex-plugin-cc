@@ -2,7 +2,7 @@
 
 日常调用从[工具说明](#tools)和[调度 Skill](#skill)看起。模型或线程续接失败时，直接看[模型故障](#models)或[其他报错](#errors)。[工具结果与通知](#results)列出 Codex 在什么时候把什么内容交给 Claude。
 
-英文是插件发出的文字，中文供审阅。JSON 示例使用本地模拟的线程、账号和任务。代理回答、用户输入、供应商模型描述和操作系统错误随实际调用变化。Claude Code 在插件消息前后添加的说明单独标明来源。
+英文为插件原文，旁列中文释义。用户暂停结果使用中文原文。JSON 示例使用本地模拟的线程、账号和任务。代理回答、用户输入、供应商模型描述和操作系统错误随实际调用变化。Claude Code 在插件消息前后添加的说明单独标明来源。
 
 | 想审核的内容 | 位置 |
 | --- | --- |
@@ -179,9 +179,9 @@ Claude Code 可发现的技能名为 `codex-delegation`。使用 `/codex-subagen
 
 ### 派发后等待
 
-> After dispatch, continue independent work or call `wait_agent` once for all agents. A timeout leaves them running. Match events by `agent_id` and handle each `seq` once. If the user pauses an agent, wait for them to resume it.
+> After dispatch, continue independent work or call `wait_agent` once for all agents. A timeout leaves them running. Match agent events by `agent_id`. A pause result with `scope: "session"` applies to all agents. Handle each `seq` once. If the user pauses an agent, wait for them to resume it.
 
-派发后，继续可独立完成的工作，或调用一次 `wait_agent` 等待所有代理中的任意事件。等待超时后，代理会继续运行。按 `agent_id` 匹配事件，每个 `seq` 只处理一次。用户暂停某个代理时，等待用户自行恢复。
+派发后，继续可独立完成的工作，或调用一次 `wait_agent` 等待所有代理中的任意事件。等待超时后，代理会继续运行。用 `agent_id` 匹配代理事件。`scope: "session"` 的暂停结果适用于全部代理。每个 `seq` 只处理一次。用户暂停代理后，等待用户自行恢复。
 
 ### 继续与接管
 
@@ -351,7 +351,7 @@ Claude Code 可发现的技能名为 `codex-delegation`。使用 `/codex-subagen
 {"agent_id":"6264227e-386f-4c8c-b3f9-0d830d022b46","status":"interrupting"}
 ```
 
-若返回时树中没有运行工作，`status` 为 `not_running`。如果目标已经被用户暂停，取当前用户控制状态 `stopping`、`stopped` 或 `unconfirmed`；停止未确认时还可附原生 `error` 字符串。`interrupting` 仅为动作回执，之后可另收到 `interrupted` 事件；用户界面操作用下文的停机通知表示。［`runtime/agents.mjs` · `interrupt, uiInterrupt, stopTree, interruptUnconfirmed`］
+若返回时树中没有运行工作，`status` 为 `not_running`。如果目标已经被用户暂停，取当前用户控制状态 `stopping`、`stopped` 或 `unconfirmed`；停止未确认时还可附原生 `error` 字符串。Claude 调用 `interrupt_agent` 后先收到动作回执 `interrupting`，之后可能收到 `interrupted` 事件。用户从界面暂停时使用下文的暂停结果。［`runtime/agents.mjs` · `interrupt, uiInterrupt, stopTree, interruptUnconfirmed`］
 
 ### `close_agent`
 
@@ -396,11 +396,13 @@ Claude Code 可发现的技能名为 `codex-delegation`。使用 `/codex-subagen
 
 ### 交付信封与宿主措辞
 
-Claude 工作时，插件在根模型响应结束或工具结果保留后追加一条 user-role 注记；Claude 空闲时经宿主 `prompt.submit` 提交。同一事件由 `wait_agent` 或通知交付。等待信封是上节的 `{events, delivery_id, more}`，通知正文是插件固定前缀、一行换行和 `{delivery_id, events}`。两者保留完整事件；每个批次最多 32 项。以下是一条实际形状的裸追加正文，Codex 自由填写消息内容。
+同一代理在同一轮用 `notify_parent` 发出的原文若与最终回复完全相同，两者尚在同一待交付批次时只发最终回复。暂停发生后，此前尚未交付的问题或审批会撤下；暂停中的该轮新到的审批也不会叫 Claude 去回答。
+
+Claude 工作时，插件在主模型响应请求工具调用后，或该轮保留工具结果后，追加一条供模型读取的 user-role 注记。Claude 空闲时经宿主 `prompt.submit` 提交。自动领取前用 250 毫秒收集相邻事件，显式等待直接领取已有事件。两者共用交付记录，按 128 KiB 事件数组大小分批，超出预算的单条结果保持完整。等待信封为 `{events, delivery_id, more}`，自动通知正文为固定前缀、换行和 `{delivery_id, events}`。在本地模拟中，Windows 结果已排队，Linux 结果在 broker 开始观察约 25 毫秒后到达，两项结果进入同一条通知。
 
 ```text
 [codex-subagents:events:v1]
-{"delivery_id":"6f5b99ed-6dad-4e61-9a5a-c6c0f8cb5dcc","events":[{"seq":16,"agent_id":"6264227e-386f-4c8c-b3f9-0d830d022b46","name":"export-review","kind":"message","message":"The Windows fixture is ready."}]}
+{"delivery_id":"52818267-5723-4b24-a9ef-b5649c1a0d1e","events":[{"seq":2,"agent_id":"bdf87517-dd82-4421-ae97-e82827545c50","name":"export-review","kind":"completed","result":"The Windows export passed."},{"seq":3,"agent_id":"36e2e149-7e39-4608-aade-fbc828988c4f","name":"linux-review","kind":"completed","result":"The Linux export passed."}]}
 ```
 
 以下四句是 Claude Code 宿主文字；插件识别其精确形式以确认宿主保留的交付。实际正文嵌在开头和结尾之间。工作中插件常用的 `session.append` 路径直接附上述裸正文。
@@ -412,24 +414,24 @@ Claude 工作时，插件在根模型响应结束或工具结果保留后追加�
 | 轮内开头 | The codex-subagents plugin sent a message while you were working: | 你工作时，codex-subagents 插件发来一条消息。 |
 | 轮内结尾 | This is how Claude Code surfaces prompts a plugin submits mid-turn — within the running turn, often alongside the next tool result. Address the message above as you continue this turn. | Claude Code 以此展示正在进行的轮次中的插件提示，常与下一条工具结果同到。继续本轮时处理上面的消息。 |
 
-如果已追加通知的 Claude 轮次紧接着正常结束，期间没再发出模型步骤，插件提交下面一句固定的唤醒提示，原事件留在此前的注记中。用户取消 Claude 的轮次后，插件暂停自动交付和唤醒，直到用户开启新的根轮次。
+只有问题或审批已留存在 Claude 对话中，该轮随后直接正常结束，同一请求仍待回答且当前无新批次可交付时，插件才补充下面的提示。若另有新事件，该批事件自然进入下一轮。Claude 的最终答复期间到达的结果留到轮次结束后提交。用户取消 Claude 的轮次后，自动交付和补充提示等到用户开启新轮次。
 
-> A Codex subagent notification was added to the conversation during the previous turn. Review it and act on any result you have not already addressed.
+> A Codex subagent is waiting for a reply. Review the preceding Codex subagent notification for the question or approval request.
 
-中文：“上一轮向对话添加了一条 Codex 子代理通知。请查看，并处理尚未处理的结果。”成功保留只证明通知已进入 Claude 的历史窗口。宿主拒收、改写有效负载或中断交付时，插件通过租约和准确回执保留可重投的原事件。［`hooks/register.js:163–245,268–307`，`hooks/delivery.js:1–15,36–81`，`runtime/delivery.mjs:54–87,104–134`］
+中文「Codex 子代理正在等待回复。请查看上一条 Codex 子代理通知中的问题或审批请求。」通知进入 Claude 的历史窗口后才确认交付。宿主拒收、改写有效负载或中断交付时，插件通过租约和准确回执保留可重投的原事件。［`hooks/register.js` · `observe, wake, handleAppend`，`hooks/delivery.js`，`runtime/delivery.mjs`］
 
 ### 事件和可选择的回复
 
-示例批次以 `seq` 定位一条事件，以 `agent_id` 标识代理，`name` 是用户或 Claude 指定的名字，未指定时为 `null`。投影剥离顶层 `turn_id`、`turnId`、`thread_id`、`threadId`、`source_thread_id`、`item_id`、`itemId`，保留业务字段、其完整嵌套值、`request_id` 及 Codex 原文。已关闭代理的未交付事件被退休。［`runtime/agents.mjs` · `closeAgent, publish`，`runtime/delivery.mjs:8–15,54–87`，`hooks/register.js:75–81,153–157`］
+批次以 `seq` 标识一条事件。代理事件的 `agent_id` 标识代理，`name` 是用户或 Claude 指定的名字，未指定时为 `null`。`scope: "session"` 的暂停结果适用于整个会话，省略 `agent_id` 和 `name`。投影剥离顶层 `turn_id`、`turnId`、`thread_id`、`threadId`、`source_thread_id`、`item_id`、`itemId`，保留业务字段、其完整嵌套值、`request_id` 及 Codex 原文。关闭代理时清理该代理未交付的事件。［`runtime/agents.mjs` · `closeAgent, publish`，`runtime/delivery.mjs`，`hooks/delivery.js`］
 
 | `kind` | Claude 收到的正文字段与用途 |
 | --- | --- |
-| `completed` | `result` 为 Codex 最终回答。样例 `"The Windows export passed."`。Codex 未提供可归类的回答时 `result` 可为 `""`；这仍是轮次完成事实。 |
+| `completed` | 字段为 `seq`（整数）、`agent_id`（字符串）、`name`（字符串或 `null`）、`kind: "completed"` 和 `result`（字符串）。`result` 保留 Codex 最终回答，原生服务未提供可归类的回答时为空字符串。 |
 | `message` | 自由协调消息为 `message`，例如 `"The Windows fixture is ready."`。普通 Codex 代理用 `notify_parent` 发出这种通知，收到通知不表示代理正在等待。 |
 | `question` | 原生 `method: "item/tool/requestUserInput"`、`questions`、`request_id` 和插件生成的 `reply_format`。上面的 `platform` 示例为两项选择，选项标签和说明是 Codex 生成的内容。 |
 | `approval` | 记录执行、文件修改、权限申请或 MCP 询问所用的方法和业务参数，原生请求提供理由、命令、路径、`availableDecisions`、表单等字段；插件生成 `reply_format`。 |
 | `interrupted` | 已确认父级轮次中断，可带 `reason: "interrupt"` 或调和后发出的 `reason: "outcome_reconciled"`、`native_status`。常规后续中断事件只有公共标识和 `kind`。 |
-| `user_action_receipt` | 用户执行停止后的状态事实，包含 `origin: "user"`、`action: "interrupt"`、`phase` 和 `summary`。下节给出逐项原文。 |
+| `user_action_receipt` | 用户暂停的操作结果，包含 `origin: "user"`、`action: "interrupt"`、`scope`、`phase` 和 `summary`。下节给出原文。 |
 | `failed`、`unknown` | 已失败或结果待核实，包含相应异常细节，见故障部分。单纯压缩没有事件，压缩真正失败仍可成为 `failed`。 |
 
 待答问题和审批通过 `answer_agent` 消费，使用同一事件的 `agent_id` 与 `request_id`。如原生请求为命令审批，可以见到以下实际形状的事件。
@@ -450,23 +452,21 @@ Claude 工作时，插件在根模型响应结束或工具结果保留后追加�
 
 普通运行过程、压缩阶段、侧栏直接消息及其私有轮次自动终态留在 Codex 一侧。私有轮次有意调用的 `notify_parent`、待答问题和审批仍可交付。如果用户向父级已有工作发送侧栏指导，原轮归属保留，原定父级结果仍可正常交付。［`runtime/event-routing.mjs:1–14`，`runtime/agents.mjs` · `send, serverRequest, publish`］
 
-### 用户停止通知
+### 用户暂停结果
 
-以名为 `export-review` 的代理为例。若代理没有名称，实际结果使用代理 ID。
-
-| `phase` | `summary` 原文 |
-| --- | --- |
-| `requested` | `用户已请求停止 Codex 子代理 export-review 及其子代理。` |
-| `stopping` | `Codex 子代理 export-review 及其子代理正在按用户要求停止。` |
-| `confirmed` | `Codex 子代理 export-review 及其已知子代理已按用户要求停止。` |
-| `unconfirmed` | `用户请求停止 Codex 子代理 export-review 及其子代理，停止状态未确认。` |
-| 未知 `phase` 的兼容分支 | `Codex 子代理 export-review 及其子代理的用户停止请求状态已更新。` |
+以下模拟用真实代理控制器和交付组件接收本地模拟的 Codex 事件。当用户从侧栏暂停正在工作的 Astra，原生线程及其后代的停止都确认后，Claude 收到一条结果。名称取委派名称或原生线程名称，均未记录时使用代理 ID。
 
 ```json
-{"seq":21,"agent_id":"6264227e-386f-4c8c-b3f9-0d830d022b46","name":"export-review","kind":"user_action_receipt","origin":"user","action":"interrupt","phase":"confirmed","summary":"Codex 子代理 export-review 及其已知子代理已按用户要求停止。"}
+{"seq":1,"kind":"user_action_receipt","origin":"user","action":"interrupt","scope":"agent","phase":"confirmed","agent_id":"9de63850-ac71-42b6-a8f3-6bf3937975cc","name":"Astra","summary":"用户暂停了 Codex 代理 Astra 及其所有子代理。"}
 ```
 
-用户批量停止时，已经空闲且无活跃后代的代理仍会被用户暂停，但省略逐代理的 `requested` 与 `confirmed` 通知；在显式列表里可查到暂停标志。运行中、有活跃后代或原生结果待核实的工作树仍发相应通知。`stopping` 也可由已停止后观察到新工作触发，`unconfirmed` 表示仍需核对停止结果。用户的停止事实与 Codex 给出的轮次结果各自用不同的事件表达。［`runtime/agents.mjs` · `prepareUserInterrupt, uiInterruptAll, treeBusy, updateStopStatus, stopTree`，`runtime/delivery.mjs:23–32`］
+用户在列表中确认「暂停全部 Codex」或执行 `/codex-stop`，本次有活跃工作且均已确认暂停时，Claude 收到一条会话级结果。空闲代理同时记为暂停，全部空闲时只更新暂停标记。
+
+```json
+{"seq":4,"kind":"user_action_receipt","origin":"user","action":"interrupt","scope":"session","phase":"confirmed","summary":"用户暂停了本会话中的所有 Codex 代理。"}
+```
+
+暂停进度在侧栏显示，暂停标记也可显式用 `list_agents` 查看。原生调用失败或超过确认窗口且仍有工作未核实时，唯一结果的 `phase` 为 `unconfirmed`。单项原文为「Codex 代理 Astra 及其所有子代理的暂停状态尚未确认。可在代理列表查看状态。」批量结果列出仍未确认的代理，例如「以下 Codex 代理及其子代理的暂停状态尚未确认：Terra、Sol。可在代理列表查看状态。」`unconfirmed_agents` 随批量结果列出这些代理的 `agent_id` 和 `name`。迟到确认更新界面状态。［`runtime/agents.mjs` · `settleUserPause, uiInterrupt, uiInterruptAll`，`runtime/delivery.mjs`］
 
 <a id="models"></a>
 
@@ -475,6 +475,8 @@ Claude 工作时，插件在根模型响应结束或工具结果保留后追加�
 以下在当前候选版本上用模拟原生服务运行真实代理控制器和本地代理桥，复现错误、只读状态和事件交付。JSON 保留完整返回和具体示例 ID，仅调整排版。英文为实际措辞，中文供审核。模拟请求未访问付费上游。
 
 ### 首次派发 `spawn_agent`
+
+`spawn_agent` 或 `followup_task` 的同步失败已由宿主完整保留时，这条工具结果就是该次失败的反馈。若工具结果未保留，原事件仍能通过等待或自动通知交付。［`runtime/broker.mjs`，`runtime/delivery.mjs`，`hooks/delivery.js` · `retainedActionFailures`］
 
 工作区供应商已知且请求型号已知时，先查询该供应商全部可见型号。模型缺失、目录为空或无法验证时，代理与原生线程尚未创建。示例中 `openai` 的四个可见型号都返回，原请求的旧 Astra 缺席。
 
@@ -975,7 +977,7 @@ Codex 已在此线程接收了使用 `gpt-6.2-sol` 的轮次 `019a6d28-51fe-7c59
 
 > 代理 `fc925a42-5c85-4209-820d-9519f31dfcdd`（线程 `4f937aa0-f132-4a60-8a1a-32c37cee2b74`）：`turn/start` 未返回轮次 ID，启动结果未知。请在原生线程上检查或继续该代理，在其状态明确前避免另建任务。
 
-**已注册轮次启动结果仍未知**。普通轮次无确认、无可绑定的启动通知，保留 `kind: unknown`、`reason: turn_start_outcome_unknown` 和原内句。在上例中，后续 `wait_agent` 实测 `message: turn/start returned no turn id; start outcome is unknown.`。`recovery` 使用下列完整文案。若原生 RPC 明确拒绝，结果则为 `kind: failed`、`reason: turn_start_rejected`，原内句例如 `App-server turn/start failed (RPC -32602).`，没有这份未知结果指导。（`runtime/agents.mjs:540`、`:563`–`:585`、`:1354`–`:1355`）
+**已注册轮次启动结果仍未知**。普通轮次无确认、无可绑定的启动通知，保留 `kind: unknown`、`reason: turn_start_outcome_unknown` 和原内句。工具结果未获交付确认时，可在后续 `wait_agent` 得到此事件。上例的事件正文实测为 `message: turn/start returned no turn id; start outcome is unknown.`。`recovery` 使用下列完整文案。若原生 RPC 明确拒绝，结果则为 `kind: failed`、`reason: turn_start_rejected`，原内句例如 `App-server turn/start failed (RPC -32602).`。
 
 > Keep this same agent. An explicit send, followup, interrupt, or close first checks native Codex thread 4f937aa0-f132-4a60-8a1a-32c37cee2b74 metadata and restores its subscription when needed. Do not create replacement work or automatically resend the original task; if metadata remains inconclusive, inspect this thread in Codex.
 

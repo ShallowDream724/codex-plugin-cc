@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import { timingSafeEqual } from 'node:crypto';
 import { prepareContextSnapshot } from './context.mjs';
 import { DeliveryStore } from './delivery.mjs';
@@ -6,6 +7,7 @@ import { ACTION_PREFLIGHT_FAILURE, MemoryReceipts, requestFingerprint } from './
 
 const UI_MUTATIONS = new Set(['ui_interrupt', 'ui_interrupt_all', 'ui_send']);
 const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', ...UI_MUTATIONS]);
+const START_ACTIONS = new Set(['spawn_agent', 'followup_task']);
 const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
@@ -26,6 +28,21 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
   const actions = new Set();
   const requests = new Set(), aborters = new Set();
   let waiting = false, stopping = false;
+
+  const confirm = async (payload) => {
+    const { action_results = [], ...args } = payload;
+    if (!Array.isArray(action_results)) throw new Error('Invalid action result confirmation.');
+    const reportedFailures = [];
+    for (const evidence of action_results) {
+      const { tool_use_id, result } = evidence ?? {};
+      if (typeof tool_use_id !== 'string' || !tool_use_id || tool_use_id.length > 256) continue;
+      const record = await journal.get(tool_use_id);
+      if (record?.reportedFailure && START_ACTIONS.has(record.operation) && record.reportedFailure.resultFingerprint === requestFingerprint('action_result', result)) {
+        reportedFailures.push(record.reportedFailure);
+      }
+    }
+    return delivery.confirm(args, reportedFailures);
+  };
 
   const stopIfIdle = () => {
     if (stopping) return { stopped: true };
@@ -71,18 +88,31 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     }
     // A user's UI action can publish a new event, but never acknowledges events
     // addressed to Claude. Only the model delivery path may confirm those.
-    if (body.restore && !UI_MUTATIONS.has(operation)) await delivery.confirm(body.restore);
-    if (operation === 'confirm') return delivery.confirm(args);
+    if (body.restore && !UI_MUTATIONS.has(operation)) await confirm(body.restore);
+    if (operation === 'confirm') return confirm(args);
     if (operation === 'release') return delivery.release(args.delivery_id);
     if (operation === 'observe') {
       if (args.lease_id) await delivery.renew(args.lease_id);
       const listed = await controller.dispatch('list_agents', { includeModelDiagnostics: false });
-      const batch = args.deliver && !waiting ? await delivery.claim({ channel: 'prompt' }) : { events: [] };
+      // Collect a short burst in one unsolicited prompt. Explicit waits and
+      // UI-only reads never wait for this interval or for a prompt lease.
+      if (args.deliver && !waiting && !delivery.remaining() && (controller.hasQueuedEvents?.() ?? controller.eventsAfter(0).length > 0)) {
+        try { await delay(250, undefined, { signal }); }
+        catch (error) { if (signal.aborted) return { cancelled: true }; throw error; }
+      }
+      const batch = args.deliver && !waiting && !signal.aborted ? await delivery.claim({ channel: 'prompt' }) : { events: [] };
       if (signal.aborted && batch.delivery_id) {
         await delivery.release(batch.delivery_id);
         return { cancelled: true };
       }
-      return { ...listed, ...(activity ? activity.list() : {}), ...(batch.busy ? { events: [], delivery_pending: true } : batch), waiting };
+      // Only an empty idle delivery may need to wake a previously retained request.
+      // Read live request IDs after any batching window, without exposing their contents.
+      const pending = args.include_pending_requests && !batch.events?.length && !batch.busy && !waiting
+        ? await controller.dispatch('list_agents', { includeModelDiagnostics: false }) : undefined;
+      const pending_requests = pending?.agents?.flatMap(agent => agent.user_paused ? []
+        : (agent.pending_requests || []).map(({ request_id }) => ({ agent_id: agent.agent_id, request_id })));
+      return { ...listed, ...(activity ? activity.list() : {}), ...(batch.busy ? { events: [], delivery_pending: true } : batch), waiting,
+        ...(pending_requests ? { pending_requests } : {}) };
     }
     if (operation === 'wait') {
       if (args.timeout_ms !== undefined && (!Number.isSafeInteger(args.timeout_ms) || args.timeout_ms < 0 || args.timeout_ms > 25000)) throw new Error('Wait timeout_ms must be an integer from 0 to 25000.');
@@ -103,6 +133,8 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
             const batch = await delivery.claim({ channel: 'wait', toolUseId: requestId });
             if (signal.aborted) { if (batch.delivery_id) await delivery.release(batch.delivery_id); break; }
             if (batch.events?.length) return batch;
+            // A parallel wait can delay retention of the direct tool result.
+            if (batch.actionResponsePending) return { waiting: true, workersContinue: true };
             const listed = await controller.dispatch('list_agents', { includeModelDiagnostics: false });
             const active = controller.hasParentWork ? controller.hasParentWork() : controller.hasActiveWork ? controller.hasActiveWork()
               : listed.agents?.some(agent => activeStatuses.has(agent.status) || agent.pending_requests?.length);
@@ -144,18 +176,26 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
         throw Object.assign(new Error('This action may already have been submitted. Inspect list_agents before issuing a new action.'), { code: 'ambiguous_action' });
       }
       await journal.put(requestId, { operation, fingerprint, status: 'inflight' });
+      let failure;
+      const action = START_ACTIONS.has(operation) ? { trackFailure: event => {
+        failure = { seq: event.seq, eventFingerprint: requestFingerprint('event', event) };
+        if (!signal.aborted) delivery.holdActionFailure(event.seq);
+      } } : undefined;
+      const notice = (outcome, payload) => failure && action?.outcome === outcome
+        ? { reportedFailure: { ...failure, resultFingerprint: requestFingerprint('action_result', payload) } } : {};
       let result;
-      try { result = await controller.dispatch(operation, args); }
+      try { result = await controller.dispatch(operation, args, action); }
       catch (error) {
         // Keep the exact result of confirmed rejections. For an uncertain action,
         // preserve its inflight receipt so a replay cannot dispatch it again.
         const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable', 'model_recovery_consumed', 'model_resolution_mismatch'].includes(error.code) && error.model_turn_started === false;
-        if (error[ACTION_PREFLIGHT_FAILURE] || ['invalid_answer', 'private_turn_active'].includes(error.code) || modelPreflightFailed) {
-          await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
-        }
+        const definite = error[ACTION_PREFLIGHT_FAILURE] || ['invalid_answer', 'private_turn_active'].includes(error.code) || modelPreflightFailed;
+        const body = errorBody(error), reported = notice(error, { error: body });
+        if (definite || reported.reportedFailure) await journal.put(requestId, { operation, fingerprint,
+          ...(definite ? { status: 'failed', error: body } : { status: 'inflight' }), ...reported });
         throw error;
       }
-      await journal.put(requestId, { operation, fingerprint, status: 'done', result });
+      await journal.put(requestId, { operation, fingerprint, status: 'done', result, ...notice(result, result) });
       return result;
     } finally { actions.delete(requestId); }
   };

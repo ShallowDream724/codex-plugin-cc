@@ -1,4 +1,5 @@
 export const WAIT_TOOL = 'mcp__codex-subagents__wait_agent';
+const START_TOOLS = new Set(['mcp__codex-subagents__spawn_agent', 'mcp__codex-subagents__followup_task']);
 export const EVENT_PREFIX = '[codex-subagents:events:v1]\n';
 const PROMPT_FRAMES = [
   ['The codex-subagents plugin sent a message:\n', "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."],
@@ -50,18 +51,33 @@ export function messageDeliveries(message, { tool = false, prompt = false } = {}
 }
 
 export function eventIdentity(event) {
-  return Number.isSafeInteger(event?.seq) && event.seq > 0 && typeof event.agent_id === 'string' && typeof event.kind === 'string'
+  const sessionStop = event?.scope === 'session' && event.agent_id === undefined && event.kind === 'user_action_receipt'
+    && event.origin === 'user' && event.action === 'interrupt';
+  return Number.isSafeInteger(event?.seq) && event.seq > 0 && (typeof event.agent_id === 'string' || sessionStop) && typeof event.kind === 'string'
     ? { seq: event.seq, agent_id: event.agent_id, kind: event.kind } : undefined;
+}
+
+export function retainedActionFailures(message, toolForId) {
+  const results = [];
+  for (const block of Array.isArray(message?.content) ? message.content : []) {
+    if (block?.type !== 'tool_result' || block.is_error || !START_TOOLS.has(toolForId(block.tool_use_id))) continue;
+    try {
+      const result = JSON.parse(text(block.content));
+      if (result?.error && typeof result.error === 'object') results.push({ tool_use_id: block.tool_use_id, result });
+    } catch { /* Only structured tool results can confirm a failure. */ }
+  }
+  return results;
 }
 
 // API history has no append origin. Associate results with their actual tool uses.
 export function scanRetainedDeliveries(messages) {
   const tools = new Map();
-  const observations = [], legacy_events = [];
+  const observations = [], legacy_events = [], action_results = [];
   for (const message of messages || []) {
     for (const block of Array.isArray(message?.content) ? message.content : []) {
       if (block?.type === 'tool_use') tools.set(block.id, block.name);
     }
+    action_results.push(...retainedActionFailures(message, id => tools.get(id)));
     for (const delivery of messageDeliveries(message, { tool: true, prompt: true })) {
       if (delivery.channel === 'tool' && tools.get(delivery.tool_use_id) !== WAIT_TOOL) continue;
       if (typeof delivery.delivery_id === 'string' && delivery.delivery_id) {
@@ -73,12 +89,13 @@ export function scanRetainedDeliveries(messages) {
       }
     }
   }
-  return { observations, legacy_events };
+  return { observations, legacy_events, ...(action_results.length ? { action_results } : {}) };
 }
 
 export function retainedSequences(delivery, expected) {
   if (!expected || delivery.channel !== expected.channel || (expected.tool_use_id && delivery.tool_use_id !== expected.tool_use_id)) return [];
-  return [...new Set(delivery.events.filter(event => expected.events.some(original => JSON.stringify(event) === JSON.stringify(original))).map(event => event.seq))];
+  const originals = new Map(expected.events.map(event => [event.seq, JSON.stringify(event)]));
+  return [...new Set(delivery.events.filter(event => originals.get(event?.seq) === JSON.stringify(event)).map(event => event.seq))];
 }
 
 export function filterClosed(message, options, closed) {

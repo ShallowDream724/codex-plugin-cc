@@ -1,5 +1,5 @@
 // A Claude Code mod. No model requests or per-task tool definitions.
-import { WAIT_TOOL, EVENT_PREFIX, messageDeliveries, scanRetainedDeliveries, retainedSequences, filterClosed } from './delivery.js';
+import { WAIT_TOOL, EVENT_PREFIX, messageDeliveries, scanRetainedDeliveries, retainedSequences, filterClosed, retainedActionFailures } from './delivery.js';
 import { registerUI, observeUI, closeUI } from './ui.js';
 import { registerRows } from './rows.js';
 import { configureBridge, requestBridge } from './bridge.js';
@@ -24,12 +24,12 @@ let waiters = 0;
 let observing = false;
 let notificationPending;
 let recoveryEvidence;
-let wakePending = false;
+let wakePending;
 let waking = false;
 let pausedAfterStop = false;
-const wakeTurns = new Set();
+const wakeTurns = new Map();
 const endedTurns = new Map();
-const busyTurns = new Set();
+const busyTurns = new Map();
 const deliveries = new Map();
 const closedAgents = new Set();
 
@@ -79,6 +79,12 @@ function remember($, result, channel, tool_use_id, signal) {
     if (onAbort) signal.addEventListener('abort', onAbort, { once: true });
   }
   return result.events ? { ...result, events: result.events.filter(event => !closedAgents.has(event.agent_id)) } : result;
+}
+
+function acceptedEvents(retained, delivery_id, expected) {
+  if (!expected || expected.signal?.aborted) return [];
+  const sequences = new Set(retained.filter(item => item.delivery_id === delivery_id).flatMap(item => retainedSequences(item, expected)));
+  return expected.events.filter(event => sequences.has(event.seq));
 }
 
 async function cancellableWait($, args, signal) {
@@ -164,21 +170,23 @@ async function observe($, atBoundary = false, signal) {
   if (!active || observing) return;
   const epoch = activityEpoch;
   observing = true;
+  let reobserve = false;
   try {
-    void wake($);
     for (const [delivery_id, expected] of deliveries) {
       if (expected.confirmedEvents) await confirm($, delivery_id, expected.confirmedEvents);
     }
     const pendingDelivery = notificationPending || deliveries.keys().next().value;
-    const deliver = !signal?.aborted && !pausedAfterStop && !wakePending && !waking && !waiters && !pendingDelivery && (!busyTurns.size || Boolean(atBoundary));
-    const result = await bridge($, 'observe', { deliver, ...(pendingDelivery ? { lease_id: pendingDelivery } : {}) });
+    const deliver = !signal?.aborted && !pausedAfterStop && !waking && !waiters && !pendingDelivery && (!busyTurns.size || matchesBoundary(atBoundary));
+    const requests = deliver && !busyTurns.size ? wakePending : undefined;
+    const result = await bridge($, 'observe', { deliver, ...(pendingDelivery ? { lease_id: pendingDelivery } : {}), ...(requests ? { include_pending_requests: true } : {}) });
     if (result.offline) { if (epoch === activityEpoch) active = false; return; }
     if (result.error) return;
     if (epoch === activityEpoch) await observeUI($, result);
     if (result.events?.length && result.delivery_id) {
       // Recheck after the async bridge: a tool wait may have started meanwhile.
-      if (signal?.aborted || pausedAfterStop || wakePending || waking || waiters || notificationPending || deliveries.size || (busyTurns.size && (!atBoundary || [...busyTurns].some(turn => !atBoundary.has(turn))))) { await release($, result.delivery_id); return; }
+      if (signal?.aborted || pausedAfterStop || waking || waiters || notificationPending || deliveries.size || (busyTurns.size && !matchesBoundary(atBoundary))) { await release($, result.delivery_id); return; }
       const delivery = remember($, result, 'prompt');
+      if (!delivery.events.length) { await release($, delivery.delivery_id); return; }
       notificationPending = result.delivery_id;
       const text = EVENT_PREFIX + JSON.stringify({ delivery_id: delivery.delivery_id, events: delivery.events });
       if (busyTurns.size) {
@@ -186,20 +194,25 @@ async function observe($, atBoundary = false, signal) {
         try {
           const receipt = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } });
           const retained = receipt?.deny ? [] : messageDeliveries(receipt?.message, { prompt: true });
-          const expected = deliveries.get(delivery.delivery_id);
-          const sequences = retained.filter(item => item.delivery_id === delivery.delivery_id).flatMap(item => retainedSequences(item, expected));
-          if (sequences.length) {
-            // A response or tool can end the turn without another model request.
-            // The next step consumes arrived notes; otherwise completion wakes it.
-            for (const turn of turns) {
-              if (busyTurns.has(turn)) wakeTurns.add(turn);
-              else if (endedTurns.get(turn)) wakePending = true;
+          const accepted = acceptedEvents(retained, delivery.delivery_id, deliveries.get(delivery.delivery_id));
+          if (accepted.length) {
+            // A tool can still end the turn. Only an unread request that blocks
+            // a worker justifies starting another turn after the note is retained.
+            const requests = accepted.filter(event => ['question', 'approval'].includes(event.kind) && typeof event.request_id === 'string')
+              .map(({ agent_id, request_id }) => ({ agent_id, request_id }));
+            if (requests.length) {
+              for (const [turn, step] of turns) {
+                if (busyTurns.get(turn) === step) wakeTurns.set(turn, [...(wakeTurns.get(turn) || []), ...requests]);
+                else if (endedTurns.get(turn)) {
+                  wakePending = [...(wakePending || []), ...requests];
+                  reobserve = true;
+                }
+              }
             }
-            try { await confirm($, delivery.delivery_id, expected.events.filter(event => sequences.includes(event.seq))); }
+            try { await confirm($, delivery.delivery_id, accepted); }
             catch { /* Retained history and recoveryEvidence preserve the receipt. */ }
           } else await release($, delivery.delivery_id);
         } catch { await release($, delivery.delivery_id); }
-        void wake($);
         return;
       }
       // Do not await a queued prompt inside a running turn. Host interruption holds it.
@@ -207,21 +220,36 @@ async function observe($, atBoundary = false, signal) {
         .then(async receipt => {
           if (receipt?.drop) await release($, delivery.delivery_id);
         }).catch(() => release($, delivery.delivery_id));
+    } else if (requests && !result.delivery_pending && !result.waiting) {
+      // A newly queued batch already starts a model step that can see the prior note.
+      void wake($, requests, result.pending_requests);
     }
-  } finally { observing = false; }
+  } finally {
+    observing = false;
+    if (reobserve) void observe($).catch(() => {});
+  }
 }
 
-async function observeBoundary($, turns, signal) {
-  if (signal?.aborted || !turns.size || !busyTurns.size || [...busyTurns].some(turn => !turns.has(turn))) return;
-  await observe($, turns, signal).catch(() => {});
+function matchesBoundary(steps) {
+  return Boolean(steps) && [...busyTurns].every(([turn, step]) => step && steps.get(turn) === step);
 }
 
-async function wake($) {
-  if (!active || !wakePending || pausedAfterStop || wakeTurns.size || busyTurns.size || waking) return;
+async function observeBoundary($, steps, signal) {
+  if (signal?.aborted || !busyTurns.size || !matchesBoundary(steps)) return;
+  await observe($, steps, signal).catch(() => {});
+}
+
+async function wake($, requests, pendingRequests) {
+  if (wakePending !== requests || !active || pausedAfterStop || wakeTurns.size || busyTurns.size || waiters || waking) return;
+  const pending = new Set(pendingRequests?.map(request => JSON.stringify([request.agent_id, request.request_id])));
+  if (!requests.some(request => !closedAgents.has(request.agent_id) && pending.has(JSON.stringify([request.agent_id, request.request_id])))) {
+    wakePending = undefined;
+    return;
+  }
   waking = true;
   try {
-    const receipt = await $.prompt.submit({ text: 'A Codex subagent notification was added to the conversation during the previous turn. Review it and act on any result you have not already addressed.' });
-    if (!receipt?.drop) wakePending = false;
+    const receipt = await $.prompt.submit({ text: 'A Codex subagent is waiting for a reply. Review the preceding Codex subagent notification for the question or approval request.' });
+    if (!receipt?.drop && wakePending === requests) wakePending = undefined;
   } catch { /* Retry at the next observation. */ }
   finally { waking = false; }
 }
@@ -231,14 +259,21 @@ async function handleAppend($, e, next) {
   const candidates = messageDeliveries(e.message, options).filter(delivery => deliveries.has(delivery.delivery_id));
   const message = filterClosed(e.message, options, closedAgents);
   const result = await next(message === e.message ? e : { ...e, message });
+  if (!result?.deny && !next.signal?.aborted && e.door === 'tool-result' && e.origin?.kind === 'tool') {
+    const action_results = retainedActionFailures(result?.message, id => !e.origin.tool_use_id || e.origin.tool_use_id === id ? e.origin.tool : undefined);
+    if (action_results.length) {
+      const previous = recoveryEvidence ?? { observations: [], legacy_events: [] };
+      recoveryEvidence = { ...previous, action_results: [...(previous.action_results ?? []), ...action_results] };
+      await bridge($, 'confirm').catch(() => {});
+    }
+  }
   if (!candidates.length) return result;
   const retained = result?.deny ? [] : messageDeliveries(result?.message, options);
   for (const candidate of candidates) {
-    const expected = deliveries.get(candidate.delivery_id);
-    const sequences = expected?.signal?.aborted ? [] : retained.filter(delivery => delivery.delivery_id === candidate.delivery_id).flatMap(delivery => retainedSequences(delivery, expected));
-    if (sequences.length) {
+    const accepted = acceptedEvents(retained, candidate.delivery_id, deliveries.get(candidate.delivery_id));
+    if (accepted.length) {
       try {
-        await confirm($, candidate.delivery_id, expected.events.filter(event => sequences.includes(event.seq)));
+        await confirm($, candidate.delivery_id, accepted);
       } catch { /* The retained transcript recovers this delivery on restart. */ }
     } else await release($, candidate.delivery_id);
   }
@@ -254,7 +289,7 @@ export function register(on, options = {}) {
     for (const tool of TOOLS) await $.tool.register(tool); // ToolSearch controls deferral.
     // Recover only retained deliveries in the current API window, once per startup.
     const retained = scanRetainedDeliveries(await $.session.messages({ as: 'api' }));
-    if (retained.observations.length || retained.legacy_events.length) {
+    if (retained.observations.length || retained.legacy_events.length || retained.action_results?.length) {
       recoveryEvidence = retained;
       await bridge($, 'confirm', retained).catch(() => {});
     }
@@ -266,27 +301,40 @@ export function register(on, options = {}) {
     return next(e);
   });
   on('session.append', { door: 'tool-result' }, async ($, e, next) => {
-    const turns = !e.agentId ? new Set(busyTurns) : new Set();
+    const steps = e.agentId ? new Map() : new Map(busyTurns);
     // Confirm our own wait result before asking for another delivery. For all
     // other tools handleAppend keeps their row and receipt unchanged.
     const result = await handleAppend($, e, next);
     // A long-running tool may finish after the response that requested it.
     // Observe its retained result without intercepting tool execution itself.
-    await observeBoundary($, turns, next.signal);
+    const wait = e.origin?.kind === 'tool' && e.origin.tool === WAIT_TOOL;
+    for (const [turn, step] of steps) {
+      if (wait && step) step.waitRetained = true;
+      if (!step?.hasTools || (step.waitPlanned && !step.waitRetained)) steps.delete(turn);
+    }
+    await observeBoundary($, steps, next.signal);
     return result;
   });
   on('session.append', { door: 'prompt' }, handleAppend);
   on('turn.start', ($, e, next) => {
-    if (!e.agentId) { pausedAfterStop = false; wakePending = false; busyTurns.add(e.turnId); }
+    if (!e.agentId) { pausedAfterStop = false; wakePending = undefined; busyTurns.set(e.turnId, undefined); }
     return next(e);
   });
   on('turn.step', async function* ($, e, next) {
-    if (!e.agentId) wakeTurns.delete(e.turnId);
-    const turns = !e.agentId && busyTurns.has(e.turnId) ? new Set([e.turnId]) : new Set();
+    if (e.agentId || !busyTurns.has(e.turnId)) return yield* next(e);
+    wakeTurns.delete(e.turnId);
+    const step = {};
+    busyTurns.set(e.turnId, step);
     const result = yield* next(e);
     // At entry the host already selected this request's messages. Append only
-    // after its response, before a subsequent request drains the arrived queue.
-    await observeBoundary($, turns, next.signal);
+    // when the response has tool calls. Final answers leave the batch for the
+    // idle prompt, which carries the events into a new turn in one message.
+    if (result?.toolUses?.length) {
+      step.hasTools = true;
+      step.waitPlanned = result.toolUses.some(tool => tool.name === WAIT_TOOL);
+      // A planned wait owns the next event even if its handler has not started.
+      if (!step.waitPlanned || step.waitRetained) await observeBoundary($, new Map([[e.turnId, step]]), next.signal);
+    }
     return result;
   });
   on('turn.complete', ($, e, next) => {
@@ -296,11 +344,12 @@ export function register(on, options = {}) {
       if (endedTurns.size > 64) endedTurns.delete(endedTurns.keys().next().value);
       if (e.isAborted || e.reason === 'aborted') {
         pausedAfterStop = true;
-        wakePending = false;
+        wakePending = undefined;
         wakeTurns.delete(e.turnId);
       } else if (e.reason === 'answer') {
-        if (wakeTurns.delete(e.turnId)) wakePending = true;
-        void wake($);
+        const requests = wakeTurns.get(e.turnId);
+        wakeTurns.delete(e.turnId);
+        if (requests) wakePending = [...(wakePending || []), ...requests];
         void observe($).catch(() => {});
       } else wakeTurns.delete(e.turnId);
     }

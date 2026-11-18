@@ -453,7 +453,7 @@ test('stop during attachment validation prevents a later resume', async t => {
 
 test('user stop isolates the tree, waits for descendants, and resumes with user attribution', async t => {
   const { client, controller, spawn } = await setup(t);
-  const first = await spawn(), other = await spawn();
+  const first = await spawn({ name: 'Astra' }), other = await spawn();
   client.note('thread/started', { thread: { id: 'child', parentThreadId: first.thread_id } });
   client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
   const actions = []; controller.on('agentAction', action => actions.push(action));
@@ -463,9 +463,11 @@ test('user stop isolates the tree, waits for descendants, and resumes with user 
   await assert.rejects(controller.dispatch('followup_task', { target: first.id, message: 'continue' }), /paused by the user/);
   client.complete(first.thread_id, first.turn_id, 'interrupted');
   assert.equal(controller.view(controller.find(first.id)).user_control_status, 'stopping');
+  assert.deepEqual(controller.eventsAfter(), []);
   await assert.rejects(controller.dispatch('ui_send', { target: first.id, message: 'resume' }), /not yet confirmed/);
   client.complete('child', 'child-turn', 'interrupted');
   assert.equal(controller.view(controller.find(first.id)).user_control_status, 'stopped');
+  assert.deepEqual(controller.eventsAfter(), [{ seq: 1, agent_id: first.id, name: 'Astra', kind: 'user_action_receipt', origin: 'user', action: 'interrupt', phase: 'confirmed', scope: 'agent', summary: '用户暂停了 Codex 代理 Astra 及其所有子代理。' }]);
   assert.equal(controller.find(other.id).status, 'running');
   await controller.dispatch('ui_send', { target: first.id, message: 'resume' });
   assert.equal(client.calls.filter(c => c.method === 'turn/start').at(-1).params.input[0].text, '[Direct message from the user]\n\nresume');
@@ -497,6 +499,7 @@ test('stop all pauses every root before interrupting either tree and isolates fa
   for (const a of [first, second]) await assert.rejects(controller.dispatch('send_message', { target: a.id, message: 'continue' }), /paused by the user/);
   for (const [thread, turn] of [[first.thread_id, first.turn_id], [second.thread_id, second.turn_id], ['child-a', 'child-a-turn'], ['child-b', 'child-b-turn']]) client.complete(thread, turn, 'interrupted');
   assert.ok(result.results.every(a => a.user_paused));
+  assert.deepEqual(controller.eventsAfter().map(event => event.summary), ['用户暂停了本会话中的所有 Codex 代理。']);
   assert.equal((await spawn()).status, 'running');
 });
 
@@ -512,7 +515,115 @@ test('bulk pause quietly locks completed agents and notifies Claude for a runnin
   assert.equal(controller.find(idle.id).userPaused, true);
   client.complete('nested', 'nested-turn', 'interrupted');
   const notices = controller.eventsAfter().filter(event => event.action === 'interrupt');
-  assert.deepEqual(notices.map(event => [event.agent_id, event.phase]), [[parent.id, 'requested'], [parent.id, 'confirmed']]);
+  assert.deepEqual(notices, [{ seq: 3, kind: 'user_action_receipt', origin: 'user', action: 'interrupt', phase: 'confirmed', scope: 'session', summary: '用户暂停了本会话中的所有 Codex 代理。' }]);
+  await controller.dispatch('ui_interrupt_all');
+  assert.deepEqual(controller.eventsAfter().filter(event => event.action === 'interrupt'), notices);
+});
+
+test('bulk pause deadline identifies only unconfirmed trees and late completion stays local', async t => {
+  const { client, controller, spawn } = await setup(t, { pauseConfirmationMs: 30 });
+  const first = await spawn({ name: 'Astra' }), second = await spawn({ name: 'Sol' });
+  const { results } = await controller.dispatch('ui_interrupt_all');
+  assert.deepEqual(results.map(result => result.status), ['stopping', 'stopping']);
+  assert.deepEqual(controller.eventsAfter(), []);
+  client.complete(first.thread_id, first.turn_id, 'interrupted');
+  await new Promise(resolve => setTimeout(resolve, 60));
+  const events = controller.eventsAfter();
+  assert.deepEqual(events, [{ seq: 1, kind: 'user_action_receipt', origin: 'user', action: 'interrupt', phase: 'unconfirmed', scope: 'session',
+    summary: '以下 Codex 代理及其子代理的暂停状态尚未确认：Sol。可在代理列表查看状态。', unconfirmed_agents: [{ agent_id: second.id, name: 'Sol' }] }]);
+  assert.equal(controller.find(first.id).userControlStatus, 'stopped');
+  assert.equal(controller.find(second.id).userControlStatus, 'unconfirmed');
+  client.complete(second.thread_id, second.turn_id, 'interrupted');
+  assert.equal(controller.find(second.id).userControlStatus, 'stopped');
+  await controller.dispatch('ui_interrupt_all');
+  assert.deepEqual(controller.eventsAfter(), events);
+});
+
+test('an in-flight bulk pause reconciles after restart and its sole result survives closing every root', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-stop-all-receipt-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'live.json'), restartedPath = path.join(dir, 'restored.json');
+  const { client, controller, spawn } = await setup(t, { statePath });
+  const first = await spawn(), second = await spawn();
+  await controller.dispatch('ui_interrupt_all');
+  client.complete(first.thread_id, first.turn_id, 'interrupted');
+  await controller.persist();
+  await writeFile(restartedPath, await readFile(statePath));
+
+  const restartedClient = new MockClient();
+  restartedClient.handler = (method, params) => {
+    if (method !== 'thread/read') return;
+    assert.equal(params.threadId, second.thread_id);
+    restartedClient.complete(second.thread_id, second.turn_id, 'interrupted');
+    return { thread: { status: { type: 'idle' } } };
+  };
+  const reopened = new AgentController({ client: restartedClient, statePath: restartedPath });
+  await reopened.init(); t.after(() => reopened.close());
+  const events = reopened.eventsAfter();
+  assert.deepEqual(events, [{ seq: 1, kind: 'user_action_receipt', origin: 'user', action: 'interrupt', phase: 'confirmed', scope: 'session', summary: '用户暂停了本会话中的所有 Codex 代理。' }]);
+  assert.deepEqual(reopened.eventsAfter(0, [second.id]), events);
+  const closed = await reopened.dispatch('close_agent', { targets: 'all' });
+  assert.equal(closed.closed_count, 2);
+  assert.deepEqual(reopened.eventsAfter(), events);
+  await reopened.close();
+
+  const again = new AgentController({ client: new MockClient(), statePath: restartedPath });
+  await again.init(); t.after(() => again.close());
+  assert.deepEqual(again.eventsAfter(), events);
+  await again.ackSequences([events[0].seq]);
+  assert.deepEqual(again.eventsAfter(), []);
+});
+
+test('bulk pause with only idle registrations stays out of the parent journal', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const a = await spawn();
+  client.complete(a.thread_id, a.turn_id);
+  const cursor = controller.nextSeq - 1;
+  await controller.dispatch('ui_interrupt_all');
+  assert.equal(controller.find(a.id).userControlStatus, 'stopped');
+  assert.deepEqual(controller.eventsAfter(cursor), []);
+});
+
+test('bulk pause absorbs an outstanding single pause and waits for every busy tree', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const first = await spawn(), second = await spawn();
+  await controller.dispatch('ui_interrupt', { target: first.id });
+  await controller.dispatch('ui_interrupt_all');
+  client.complete(second.thread_id, second.turn_id, 'interrupted');
+  assert.deepEqual(controller.eventsAfter(), []);
+  client.complete(first.thread_id, first.turn_id, 'interrupted');
+  assert.deepEqual(controller.eventsAfter().map(event => [event.scope, event.phase]), [['session', 'confirmed']]);
+});
+
+test('a pause waits for its private turn result while unrelated questions and failures reach the parent', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const first = await spawn();
+  client.complete(first.thread_id, first.turn_id);
+  await controller.ackEvents(controller.nextSeq - 1);
+  const privateTurn = await controller.dispatch('ui_send', { target: first.id, message: 'A private followup' });
+  assert.equal(controller.hasParentWork(), false);
+  await controller.dispatch('ui_interrupt', { target: first.id });
+  assert.equal(controller.hasParentWork(), true);
+
+  const other = await spawn();
+  client.ask('question', 'item/tool/requestUserInput', pendingQuestion(other.thread_id, other.turn_id));
+  await tick();
+  assert.deepEqual(controller.eventsAfter().map(event => [event.agent_id, event.kind]), [[other.id, 'question']]);
+  client.complete(other.thread_id, other.turn_id, 'failed', { message: 'Unrelated turn failed.' });
+  client.complete(first.thread_id, privateTurn.turn_id, 'interrupted');
+  assert.deepEqual(controller.eventsAfter().map(event => [event.agent_id, event.kind]), [[other.id, 'failed'], [first.id, 'user_action_receipt']]);
+  assert.equal(controller.hasParentWork(), false);
+});
+
+test('pause withdraws undelivered questions and declines a late approval from the stopped turn', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const a = await spawn();
+  client.ask('question', 'item/tool/requestUserInput', pendingQuestion(a.thread_id, a.turn_id));
+  assert.equal(controller.eventsAfter().some(e => e.kind === 'question'), true);
+  await controller.dispatch('ui_interrupt', { target: a.id });
+  client.ask('late', 'item/commandExecution/requestApproval', { threadId: a.thread_id, turnId: a.turn_id });
+  assert.equal(client.rejected.some(r => r.id === 'late'), true);
+  client.complete(a.thread_id, a.turn_id, 'interrupted');
+  assert.deepEqual(controller.eventsAfter().map(e => e.kind), ['user_action_receipt']);
 });
 
 test('stop all persists registrations and pause across controller restart', async t => {
@@ -555,6 +666,8 @@ test('failed user stop remains unconfirmed, retries, and catches late descendant
   const agent = await spawn(); let fail = true;
   client.handler = method => { if (method === 'turn/interrupt' && fail) throw new Error('offline'); };
   assert.equal((await controller.dispatch('ui_interrupt', { target: agent.id })).status, 'unconfirmed');
+  const [uncertain] = controller.eventsAfter();
+  assert.equal(uncertain.phase, 'unconfirmed');
   fail = false;
   assert.equal((await controller.dispatch('ui_interrupt', { target: agent.id })).status, 'stopping');
   client.note('thread/started', { thread: { id: 'late-child', parentThreadId: agent.thread_id } });
@@ -564,8 +677,7 @@ test('failed user stop remains unconfirmed, retries, and catches late descendant
   client.complete(agent.thread_id, agent.turn_id, 'interrupted');
   client.complete('late-child', 'late-turn', 'interrupted');
   assert.equal(controller.view(controller.find(agent.id)).user_control_status, 'stopped');
-  assert.equal(controller.eventsAfter().filter(e => e.action === 'interrupt' && e.phase === 'requested').length, 1);
-  assert.equal(controller.eventsAfter().filter(e => e.action === 'interrupt' && e.phase === 'confirmed').length, 1);
+  assert.deepEqual(controller.eventsAfter(), [uncertain]);
 });
 
 test('user pause persists across restart and prevents Claude from resuming', async t => {

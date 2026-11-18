@@ -36,6 +36,32 @@ test('local transport requires a session secret', async t => {
   assert.equal(response.status, 403); assert.equal(controller.calls.length, 0);
 });
 
+test('automatic observation delivers nearby independent results in one notification', async t => {
+  const { post, controller } = await setup(t);
+  const collecting = Promise.withResolvers();
+  controller.hasQueuedEvents = () => { collecting.resolve(); return true; };
+  controller.publish('completed');
+  const observing = post({ operation: 'observe', args: { deliver: true } });
+  await collecting.promise;
+  controller.publish('failed');
+  const { body } = await observing;
+  assert.deepEqual(body.events.map(e => e.kind), ['completed', 'failed']);
+  await post({ operation: 'confirm', args: { observations: [{ delivery_id: body.delivery_id, events: body.events }] } });
+  assert.deepEqual((await post({ operation: 'wait', args: { timeout_ms: 0 } })).body.events ?? [], []);
+});
+
+test('explicit wait can take a batch while the automatic observer is collecting', async t => {
+  const { post, controller } = await setup(t);
+  const collecting = Promise.withResolvers();
+  controller.hasQueuedEvents = () => { collecting.resolve(); return true; };
+  controller.publish();
+  const observing = post({ operation: 'observe', args: { deliver: true } });
+  await collecting.promise;
+  const wait = await post({ operation: 'wait', args: { timeout_ms: 0 } });
+  assert.equal(wait.body.events.length, 1);
+  assert.deepEqual((await observing).body.events, []);
+});
+
 test('wait returns queryable private-agent status without awaiting its private work', async t => {
   const { post, controller } = await setup(t);
   controller.hasParentWork = () => false;
@@ -281,6 +307,104 @@ test('an unconfirmed native turn keeps its inflight receipt even when the cause 
   assert.equal(receipts[body.requestId].status, 'inflight');
   assert.equal((await post(body)).body.error.code, 'ambiguous_action');
   assert.deepEqual(nativeCalls, ['thread/start', 'turn/start']);
+});
+
+test('a parallel waiter yields to the exact synchronous model failure and a later failure still delivers', async t => {
+  const client = new EventEmitter(), receipts = {};
+  const nativeError = { codexErrorInfo: 'modelNotFound', message: 'Provider rejected the model.' };
+  let acknowledgeSave, releaseSave, turnStarts = 0;
+  const saving = new Promise(resolve => { acknowledgeSave = resolve; });
+  const waitToSave = new Promise(resolve => { releaseSave = resolve; });
+  client.request = async method => {
+    if (method === 'thread/start') return { thread: { id: 'native', model: 'model-1' } };
+    if (method === 'model/list') return { data: [{ model: 'model-1' }, { model: 'model-2' }] };
+    if (method === 'turn/start') return ++turnStarts === 1
+      ? { turn: { id: 'failed-turn', status: 'failed', error: nativeError } }
+      : { turn: { id: 'later-turn', status: 'inProgress' } };
+    return {};
+  };
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  t.after(async () => { releaseSave(); await controller.close(); });
+  const { post } = await setup(t, { controller, receipts, saveReceipts: async snapshot => {
+    if (snapshot.first?.reportedFailure) { acknowledgeSave(); await waitToSave; }
+  } });
+  const failing = post({ operation: 'spawn_agent', requestId: 'first', args: { message: 'Task', cwd: '/workspace', model: 'model-1', context_mode: 'none' } });
+  await Promise.race([saving, failing]);
+  assert.equal(controller.eventsAfter(0).length, 1);
+  assert.deepEqual((await post({ operation: 'wait', args: { timeout_ms: 0 } })).body, { waiting: true, workersContinue: true });
+  releaseSave();
+  const first = await failing;
+  assert.equal(first.status, 400);
+  assert.equal(first.body.error.turn_id, 'failed-turn');
+  assert.equal(first.body.error.recovery_choices[0].model, 'model-2');
+  const action_results = [{ tool_use_id: 'first', result: first.body }];
+  await post({ operation: 'confirm', args: { action_results: [{ ...action_results[0], tool_use_id: 'different' }] } });
+  await post({ operation: 'confirm', args: { action_results: [{ ...action_results[0], result: { error: { ...first.body.error, recovery_choices: [] } } }] } });
+  assert.equal(controller.eventsAfter(0).length, 1);
+  await post({ operation: 'confirm', args: { action_results } });
+  assert.equal(controller.eventsAfter(0).length, 0);
+
+  const continuing = await post({ operation: 'followup_task', requestId: 'continue', args: {
+    target: first.body.error.recovery_choices[0].target, message: 'Continue',
+  } });
+  assert.equal(continuing.body.turn_id, 'later-turn');
+  client.emit('notification', { method: 'turn/completed', params: { threadId: 'native', turn: { id: 'later-turn', status: 'failed', error: nativeError } } });
+  await post({ operation: 'confirm', args: { action_results } });
+  assert.equal((await post({ operation: 'wait', args: { timeout_ms: 0 } })).body.events[0].code, 'agent_model_unavailable');
+});
+
+test('startup failures without retained results fall back while restored evidence confirms its own failure', async t => {
+  const client = new EventEmitter(), receipts = {};
+  let now = 0, starts = 0;
+  client.request = async method => {
+    if (method === 'thread/start') return { thread: { id: `thread-${++starts}` } };
+    if (method === 'turn/start' && starts === 3) return { turn: { id: 'running', status: 'inProgress' } };
+    if (method === 'turn/start') throw Object.assign(new Error('Start rejected'), { code: -32602 });
+    return {};
+  };
+  client.reject = async () => {};
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  t.after(() => controller.close());
+  const deliveryStore = new DeliveryStore({ controller, actionFailureHoldMs: 10, now: () => now });
+  const { post } = await setup(t, { controller, deliveryStore, receipts });
+  const fail = requestId => post({ operation: 'spawn_agent', requestId, args: { message: requestId, cwd: '/workspace', context_mode: 'none' } });
+  const lost = await fail('lost'), retained = await fail('retained');
+  assert.equal((await post({ operation: 'observe', args: { deliver: true } })).body.delivery_pending, true);
+  assert.equal((await fail('asking')).status, 200);
+  client.emit('request', { method: 'item/tool/requestUserInput', id: 'question', params: {
+    threadId: 'thread-3', turnId: 'running', questions: [{ id: 'q', header: 'Choice', question: 'Which one?' }],
+  } });
+  const question = (await post({ operation: 'wait', args: { timeout_ms: 0 } })).body;
+  assert.deepEqual(question.events.map(event => event.request_id), ['question']);
+  await post({ operation: 'confirm', args: { observations: [{ delivery_id: question.delivery_id, events: question.events }] } });
+  const restored = await setup(t, { controller, receipts });
+  await restored.post({ operation: 'confirm', args: { action_results: [{ tool_use_id: 'retained', result: retained.body }] } });
+  now += 11;
+  const fallback = (await post({ operation: 'wait', args: { timeout_ms: 0 } })).body;
+  assert.deepEqual(fallback.events.map(event => [event.agent_id, event.message]), [[lost.body.error.agent_id, 'Start rejected']]);
+});
+
+test('an ordinary native failure already included in a start result is confirmed through that result', async t => {
+  const client = new EventEmitter();
+  client.request = async method => {
+    if (method === 'thread/start') return { thread: { id: 'native' } };
+    if (method === 'turn/start') {
+      const turn = { id: 'native-turn', status: 'failed', error: { message: 'Native failure' } };
+      client.emit('notification', { method: 'turn/completed', params: { threadId: 'native', turn } });
+      return { turn: { id: turn.id, status: 'inProgress' } };
+    }
+    return {};
+  };
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  t.after(() => controller.close());
+  const { post } = await setup(t, { controller });
+  const tool_use_id = 'native-start';
+  const action = await post({ operation: 'spawn_agent', requestId: tool_use_id, args: { message: 'Run', cwd: '/workspace', context_mode: 'none' } });
+  assert.equal(action.status, 200);
+  assert.equal(action.body.status, 'failed');
+  assert.equal(action.body.error.message, 'Native failure');
+  await post({ operation: 'confirm', args: { action_results: [{ tool_use_id, result: action.body }] } });
+  assert.deepEqual(controller.eventsAfter(0), []);
 });
 
 test('private-turn followup rejection is a retryable-on-new-call preflight failure rather than ambiguous submission', async t => {

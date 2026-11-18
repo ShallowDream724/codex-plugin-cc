@@ -54,15 +54,20 @@ test('an old lease containing only compaction does not block the next useful not
   assert.deepEqual((await store.claim()).events, c.events);
 });
 
-test('stop receipts distinguish requested, stopped, and unconfirmed without a new task message', () => {
+test('legacy pause phases and matching interrupted turn yield just the outcome, retaining independent work', async () => {
   const base = { seq: 1, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'interrupt', message: 'Stop status detail' };
-  for (const [phase, expected] of [['requested', '用户已请求停止 Codex 子代理 worker 及其子代理。'], ['stopping', 'Codex 子代理 worker 及其子代理正在按用户要求停止。'], ['confirmed', 'Codex 子代理 worker 及其已知子代理已按用户要求停止。'], ['unconfirmed', '用户请求停止 Codex 子代理 worker 及其子代理，停止状态未确认。']]) {
-    const receipt = formatDeliveryEvent({ ...base, phase });
-    assert.equal(receipt.summary, expected); assert.equal(receipt.kind, 'user_action_receipt');
-    assert.equal(receipt.message, undefined); assert.equal(receipt.status_detail, undefined);
-    assert.equal(receipt.quoted_user_message, undefined);
-    assert.doesNotMatch(receipt.summary, /followup|resume|重启|恢复/);
-  }
+  const c = controller(0);
+  c.events = [
+    { ...base, turn_id: 'stopped', phase: 'requested' },
+    { agent_id: 'a', seq: 2, turn_id: 'stopped', kind: 'interrupted' },
+    { ...base, seq: 3, turn_id: 'stopped', phase: 'confirmed' },
+    { agent_id: 'a', seq: 4, turn_id: 'other', kind: 'interrupted' },
+  ];
+  const { events } = await new DeliveryStore({ controller: c }).claim();
+  assert.deepEqual(events.map(e => [e.seq, e.kind]), [[3, 'user_action_receipt'], [4, 'interrupted']]);
+  assert.equal(events[0].summary, '用户暂停了 Codex 代理 worker 及其所有子代理。');
+  assert.equal(events[0].phase, 'confirmed');
+  assert.equal(events[0].message, undefined);
 });
 
 test('parent wire omits native routing IDs while preserving names, business fields and original journal', async () => {
@@ -202,6 +207,20 @@ test('event delivery waits for durable publication and excludes arrivals beyond 
   assert.deepEqual((await claimed).events.map(event => event.seq), [1]);
 });
 
+test('an undelivered note identical to its own final answer is represented once by that answer', async () => {
+  const c = controller(0);
+  const note = { seq: 1, kind: 'message', agent_id: 'a', turn_id: 't', message: 'Report saved.' };
+  c.events = [note, { ...note, seq: 2, turn_id: 'different-turn' }, { ...note, seq: 3, agent_id: 'other' },
+    { ...note, seq: 4, code: 'separate_fact' }, { ...note, seq: 5, message: 'Please choose a filename.' },
+    { seq: 6, kind: 'completed', agent_id: 'a', turn_id: 't', result: note.message }];
+  const store = new DeliveryStore({ controller: c });
+  const batch = await store.claim({ channel: 'prompt' });
+  assert.deepEqual(batch.events.map(e => e.seq), [2, 3, 4, 5, 6]);
+  assert.equal(batch.more, false);
+  await store.release(batch.delivery_id);
+  assert.deepEqual((await store.claim()).events, batch.events);
+});
+
 test('partial or rewritten host results cannot erase unrelated events', async () => {
   const c = controller(), store = new DeliveryStore({ controller: c });
   const batch = await store.claim();
@@ -214,8 +233,9 @@ test('partial or rewritten host results cannot erase unrelated events', async ()
 
 test('cancel/release and expired lease replay unconfirmed events, with whole-event paging', async () => {
   const c = controller(70); let now = 0;
+  for (const event of c.events) event.result = 'x'.repeat(60000);
   const store = new DeliveryStore({ controller: c, now: () => now, leaseMs: 10 });
-  const first = await store.claim(); assert.equal(first.events.length, 32); assert.equal(first.more, true);
+  const first = await store.claim(); assert.equal(first.events.length, 2); assert.equal(first.more, true);
   await store.release(first.delivery_id);
   const second = await store.claim(); assert.deepEqual(second.events, first.events);
   now = 9; await store.renew(second.delivery_id); now = 11;
@@ -223,7 +243,22 @@ test('cancel/release and expired lease replay unconfirmed events, with whole-eve
   now = 20;
   const third = await store.claim(); assert.deepEqual(third.events, first.events);
   await store.confirm({ delivery_ids: [first.delivery_id] }); // Late acknowledgement still has exact scope.
-  assert.deepEqual((await store.claim()).events.map(e => e.seq), Array.from({ length: 32 }, (_, i) => i + 33));
+  assert.deepEqual((await store.claim()).events.map(e => e.seq), [3, 4]);
+});
+
+test('small results share one delivery even above 32 agents and a single oversized result remains whole', async () => {
+  for (const channel of ['prompt', 'wait']) {
+    const c = controller(75);
+    const large = { seq: 76, kind: 'completed', agent_id: 'large', result: '数'.repeat(48000) };
+    c.events.push(large);
+    const store = new DeliveryStore({ controller: c });
+    const batch = await store.claim({ channel });
+    assert.equal(batch.events.length, 75);
+    await store.confirm({ observations: [{ delivery_id: batch.delivery_id, events: batch.events }] });
+    const remainder = await store.claim({ channel });
+    assert.deepEqual(remainder.events, [large]);
+    assert.equal(remainder.more, false);
+  }
 });
 
 test('legacy recovery requires exact event identity, not just a sequence number', async () => {

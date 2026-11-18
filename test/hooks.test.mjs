@@ -32,10 +32,14 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
     calls, envs, prompts, registered, retained, appendHandlers, handlers, get scans() { return scans; }, setSubmit: fn => { submit = fn; }, setAppendNote: fn => { appendNote = fn; },
     start: () => handlers.get('session.start')($, {}, async e => e), observe: () => timer(),
     emit: (name, args = {}) => handlers.get(name)($, args, async e => e),
-    step: async (args, downstream = async function* () {}) => {
+    step: async (args, downstream = async function* () {}, signal) => {
+      downstream.signal = signal;
       const iterator = handlers.get('turn.step')($, args, downstream), chunks = [];
       while (true) { const item = await iterator.next(); if (item.done) return { chunks, result: item.value }; chunks.push(item.value); }
     },
+    toolStep: (args = { turnId: 'turn' }, names = ['external'], signal) => h.step(args, async function* () {
+      return { toolUses: names.map(name => ({ name })) };
+    }, signal),
     tool: async (name = 'external', args = {}, signal, finish = async e => e) => {
       const tool = name === 'external' ? name : `mcp__codex-subagents__${name}`;
       const applicable = toolHandlers.filter(item => !item.filter || item.filter.tool === tool);
@@ -142,6 +146,25 @@ test('retained seq 11 is recovered once on reopen with exact acknowledgement', a
   await h.observe(); await h.observe(); assert.equal(h.scans, 1);
 });
 
+test('only retained spawn or followup failures are submitted for exact action-result confirmation', async () => {
+  const tool = 'mcp__codex-subagents__followup_task', tool_use_id = 'startup-failure';
+  const result = { error: { code: 'agent_model_unavailable', message: 'Model unavailable' } };
+  const message = resultMessage(result, tool_use_id);
+  const h = await setup();
+  await h.start();
+  await h.append(message, { tool, finish: async () => ({ deny: true }) });
+  await h.append(message, { tool: 'mcp__other__followup_task' });
+  await h.append(message, { origin: { kind: 'tool', tool, tool_use_id: 'unrelated' } });
+  assert.deepEqual(h.calls, []);
+  await h.append(message, { tool });
+  assert.deepEqual(h.calls[0].restore.action_results, [{ tool_use_id, result }]);
+
+  const history = [{ role: 'assistant', content: [{ type: 'tool_use', id: tool_use_id, name: tool }] }, message];
+  const restored = await setup(() => ({}), history);
+  await restored.start();
+  assert.deepEqual(restored.calls[0].args.action_results, [{ tool_use_id, result }]);
+});
+
 test('offline startup retains recovery evidence for first wait without rescanning history', async () => {
   const history = [{ role: 'assistant', content: [{ type: 'tool_use', id: 'wait-1', name: WAIT_TOOL }] }, resultMessage({ delivery_id: 'old', events: [event()] })];
   const h = await setup(body => body.operation === 'confirm' ? { offline: true } : body.operation === 'wait' ? { events: [event(12)], delivery_id: 'new' } : {}, history);
@@ -242,7 +265,7 @@ test('supported step boundary preserves stream and result, observing only after 
   h.setAppendNote(async args => { notes++; return { message: args.message }; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
   assert.equal(h.handlers.has('classic.PostToolBatch'), false);
-  const first = { type: 'text', text: 'one' }, second = { type: 'text', text: 'two' }, result = { done: true };
+  const first = { type: 'text', text: 'one' }, second = { type: 'text', text: 'two' }, result = { toolUses: [{ name: 'Read' }] };
   const step = await h.step({ turnId: 'turn' }, async function* () {
     yield first; assert.equal(notes, 0);
     yield second; assert.equal(notes, 0);
@@ -253,27 +276,33 @@ test('supported step boundary preserves stream and result, observing only after 
 });
 
 test('nested tool-result and step boundaries do not deliver root notifications', async () => {
-  const h = await setup(body => body.operation === 'observe' && body.args.deliver ? { events: [event()], delivery_id: 'nested' } : {});
+  let queued = false;
+  const h = await setup(body => body.operation === 'observe' && body.args.deliver && queued ? { events: [event()], delivery_id: 'nested' } : {});
   let notes = 0;
   h.setAppendNote(async args => { notes++; return { message: args.message }; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
+  await h.toolStep(); queued = true;
+  const calls = h.calls.length;
   const value = { message: { role: 'user', content: 'unchanged' } };
   assert.equal(await h.boundary({ agentId: 'child', finish: async () => value }), value);
-  await h.step({ turnId: 'child-turn', agentId: 'child' });
-  assert.equal(notes, 0); assert.equal(h.calls.some(call => call.operation === 'observe'), false);
+  await h.toolStep({ turnId: 'child-turn', agentId: 'child' });
+  assert.equal(notes, 0); assert.equal(h.calls.length, calls);
   assert.equal(await h.boundary({ finish: async () => value }), value);
   assert.equal(notes, 1);
 });
 
 test('failed or aborted tool-result appends do not deliver or wake', async () => {
   for (const mode of ['throw', 'abort']) {
-    const h = await setup(body => body.operation === 'observe' && body.args.deliver ? { events: [event()], delivery_id: 'aborted' } : {});
+    let queued = false;
+    const h = await setup(body => body.operation === 'observe' && body.args.deliver && queued ? { events: [event()], delivery_id: 'aborted' } : {});
     await h.start(); await h.emit('turn.start', { turnId: 'turn' });
+    await h.toolStep(); queued = true;
+    const calls = h.calls.length;
     const controller = new AbortController();
     if (mode === 'throw') await assert.rejects(h.boundary({ signal: controller.signal, finish: async () => { throw Error('failed'); } }), /failed/);
     else await h.boundary({ signal: controller.signal, finish: async () => { controller.abort(); return { deny: 'cancelled' }; } });
     await h.emit('turn.complete', { turnId: 'turn', reason: 'aborted', isAborted: true });
-    assert.equal(h.calls.some(call => call.operation === 'observe' && call.args.deliver), false);
+    assert.equal(h.calls.length, calls);
     assert.deepEqual(h.prompts, []);
   }
 });
@@ -283,7 +312,7 @@ test('aborting during boundary observation releases the late delivery', async ()
   const h = await setup(body => body.operation === 'observe' ? pending.promise : {});
   let notes = 0; h.setAppendNote(async args => { notes++; return { message: args.message }; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
-  const boundary = h.boundary({ signal: controller.signal }); await tick();
+  const boundary = h.toolStep(undefined, undefined, controller.signal); await tick();
   controller.abort(); pending.resolve({ events: [event()], delivery_id: 'late-abort' }); await boundary;
   assert.equal(notes, 0); assert.equal(h.calls.at(-1).operation, 'release');
   assert.equal(h.calls.at(-1).args.delivery_id, 'late-abort');
@@ -295,8 +324,9 @@ test('wait delivery remains reserved until append and is not duplicated by bound
   const h = await setup(body => body.operation === 'wait' ? { events: [event()], delivery_id: 'wait' } : {});
   let notes = 0; h.setAppendNote(async args => { notes++; return { message: args.message }; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
+  await h.toolStep(undefined, [WAIT_TOOL]);
   const result = await h.call('wait_agent', { tool_use_id: 'wait-1' });
-  await h.step({ turnId: 'turn' });
+  await h.observe();
   assert.equal(notes, 0); assert.equal(h.calls.some(call => call.operation === 'confirm'), false);
   await h.append(resultMessage(result));
   assert.deepEqual(h.calls.filter(call => call.operation === 'confirm').map(call => call.args.observations[0].sequences), [[11]]);
@@ -314,6 +344,8 @@ test('a wait result is confirmed before the same boundary observes again', async
   });
   h.setAppendNote(async args => { notes++; return { message: args.message }; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
+  await h.toolStep(undefined, [WAIT_TOOL]);
+  await h.boundary(); // An unrelated result does not claim the planned wait's events.
   const result = await h.call('wait_agent', { tool_use_id: 'wait-1' });
   await h.append(resultMessage(result));
   assert.deepEqual(h.calls.map(call => call.operation), ['wait', 'confirm', 'observe']);
@@ -323,25 +355,93 @@ test('a wait result is confirmed before the same boundary observes again', async
   assert.deepEqual(h.prompts, []);
 });
 
-test('a late batch note wakes only when no subsequent model step ran', async () => {
-  const pending = deferred(), notes = [];
-  const h = await setup(body => body.operation === 'observe' && body.args.deliver ? { events: [event()], delivery_id: 'busy' } : {});
-  h.setAppendNote(args => { notes.push(args); return pending.promise; });
+const pauseReceipt = (target = { agent_id: 'agent' }) => ({ seq: 12, ...target, kind: 'user_action_receipt', origin: 'user', action: 'interrupt', phase: 'confirmed' });
+const blockingQuestion = { seq: 13, agent_id: 'agent', kind: 'question', request_id: 'question-1' };
+
+test('a final answer leaves the queued batch for one idle prompt carrying the events', async () => {
+  const events = [event(), pauseReceipt({ scope: 'session' })];
+  let issued = false;
+  const h = await setup(body => {
+    if (body.operation === 'observe' && body.args.deliver && !issued) {
+      issued = true;
+      return { events, delivery_id: 'idle' };
+    }
+    return {};
+  });
+  h.setAppendNote(async () => assert.fail('final step must leave the batch for the idle prompt'));
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
-  const observation = h.boundary(); await tick();
-  assert.equal(notes.length, 1); assert.equal(h.prompts.length, 0);
-  assert.equal((await h.call('wait_agent')).notificationPending, true);
-  await h.emit('turn.complete', { turnId: 'turn', reason: 'answer' });
-  pending.resolve({ message: notes[0].message, uuid: 'kept' }); await observation; await tick();
-  assert.deepEqual(h.calls.find(call => call.operation === 'confirm').args.observations, [{ delivery_id: 'busy', sequences: [11], events: [event()] }]);
-  assert.equal(h.prompts.length, 1); assert.doesNotMatch(h.prompts[0].text, /"events"|"seq"/);
-  assert.deepEqual(scanRetainedDeliveries([notes[0].message]).observations[0].sequences, [11]);
+  await h.step({ turnId: 'turn' }, async function* () { return { toolUses: [], answer: 'Final answer' }; });
+  assert.equal(issued, false);
+  await h.emit('turn.complete', { turnId: 'turn', reason: 'answer' }); await tick();
+  assert.equal(h.prompts.length, 1);
+  const message = { role: 'user', content: h.prompts[0].text };
+  assert.deepEqual(messageDeliveries(message, { prompt: true })[0].events, events);
+  await h.append(message, { door: 'prompt' }); await h.observe();
+  assert.equal(h.prompts.length, 1);
+  assert.deepEqual(h.calls.find(call => call.operation === 'confirm').args.observations, [{ delivery_id: 'idle', sequences: [11, 12], events }]);
+});
+
+test('late single-agent and session pause notes are retained once without waking', async () => {
+  for (const target of [{ agent_id: 'agent', scope: 'agent' }, { scope: 'session' }]) {
+    const events = [pauseReceipt(target)];
+    const pending = deferred(), notes = [];
+    const h = await setup(body => body.operation === 'observe' && body.args.deliver ? { events, delivery_id: 'busy' } : {});
+    h.setAppendNote(args => { notes.push(args); return pending.promise; });
+    await h.start(); await h.emit('turn.start', { turnId: 'turn' });
+    const observation = h.toolStep(); await tick();
+    assert.equal(notes.length, 1);
+    assert.equal((await h.call('wait_agent')).notificationPending, true);
+    await h.emit('turn.complete', { turnId: 'turn', reason: 'answer' });
+    pending.resolve({ message: notes[0].message, uuid: 'kept' }); await observation; await tick();
+    assert.deepEqual(h.prompts, []);
+    const expected = [{ delivery_id: 'busy', sequences: [12], events }];
+    assert.deepEqual(h.calls.find(call => call.operation === 'confirm').args.observations, expected);
+    assert.deepEqual(scanRetainedDeliveries([notes[0].message]).observations, expected);
+  }
+});
+
+test('a retained question wakes an ended tool turn only if it still blocks the agent', async () => {
+  for (const mode of ['pending', 'resolved', 'consumed', 'removed']) {
+    const receipt = pauseReceipt({ scope: 'session' });
+    const pending_requests = mode === 'resolved' ? [] : [{ agent_id: blockingQuestion.agent_id, request_id: blockingQuestion.request_id }];
+    let issued = false;
+    const h = await setup(body => {
+      if (body.operation === 'observe' && body.args.include_pending_requests) return { pending_requests };
+      if (body.operation === 'observe' && body.args.deliver && !issued) {
+        issued = true;
+        return { events: [receipt, blockingQuestion], delivery_id: 'mixed' };
+      }
+      return {};
+    });
+    if (mode === 'removed') h.setAppendNote(async ({ message }) => ({ message: { ...message, content: EVENT_PREFIX + JSON.stringify({ delivery_id: 'mixed', events: [receipt] }) } }));
+    await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
+    if (mode === 'consumed') await h.step({ turnId: 'turn' });
+    await h.emit('turn.complete', { turnId: 'turn', reason: 'answer' }); await tick(); await tick();
+    assert.deepEqual(h.calls.find(call => call.operation === 'confirm').args.observations[0].sequences, mode === 'removed' ? [12] : [12, 13]);
+    assert.equal(h.prompts.length, mode === 'pending' ? 1 : 0);
+    if (mode === 'pending') assert.match(h.prompts[0].text, /waiting for a reply/);
+  }
+});
+
+test('a new result wakes Claude for a prior question with only the new event batch', async () => {
+  let issued = false;
+  const h = await setup(body => {
+    if (body.operation !== 'observe' || !body.args.deliver) return {};
+    if (body.args.include_pending_requests) return { events: [event()], delivery_id: 'result' };
+    if (issued) return {};
+    issued = true;
+    return { events: [blockingQuestion], delivery_id: 'question' };
+  });
+  await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
+  await h.emit('turn.complete', { turnId: 'turn', reason: 'answer' }); await tick();
+  assert.equal(h.prompts.length, 1);
+  assert.deepEqual(messageDeliveries({ content: h.prompts[0].text }, { prompt: true })[0].events, [event()]);
 });
 
 test('busy note refusal, rewrite or exception releases the lease without acknowledging it', async () => {
   for (const outcome of [{ deny: 'blocked' }, { message: { type: 'user', content: [{ type: 'text', text: 'rewritten' }] } }, new Error('append failed')]) {
     const h = await setup(body => body.operation === 'observe' ? { events: [event()], delivery_id: 'busy' } : {});
-    h.setAppendNote(async () => { if (outcome instanceof Error) throw outcome; return outcome; }); await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.boundary();
+    h.setAppendNote(async () => { if (outcome instanceof Error) throw outcome; return outcome; }); await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
     assert.equal(h.calls.at(-1).operation, 'release'); assert.equal(h.calls.some(call => call.operation === 'confirm'), false);
     assert.equal(h.prompts.length, 0);
   }
@@ -355,7 +455,7 @@ test('busy note confirms only exact retained events and recovers that note on re
     note = { type: 'user', content: [{ type: 'text', text: EVENT_PREFIX + JSON.stringify({ ...original, events: [event(12)] }) }] };
     return { message: note, uuid: 'kept' };
   });
-  await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.boundary();
+  await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
   const observation = { delivery_id: 'busy', sequences: [12], events: [event(12)] };
   assert.deepEqual(h.calls.at(-1).args.observations, [observation]);
   const reopened = await setup(() => ({}), [note]); await reopened.start();
@@ -367,7 +467,7 @@ test('a wait starting during observation wins over a late busy note', async () =
   const h = await setup(body => body.operation === 'observe' ? observed.promise : body.operation === 'wait' ? waiting.promise : {});
   let notes = 0; h.setAppendNote(async () => { notes++; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
-  const observation = h.boundary(); await tick(); const wait = h.call('wait_agent'); await tick();
+  const observation = h.toolStep(); await tick(); const wait = h.call('wait_agent'); await tick();
   observed.resolve({ events: [event()], delivery_id: 'late' }); await observation;
   assert.equal(notes, 0); assert.equal(h.calls.at(-1).operation, 'release');
   waiting.resolve({ events: [], delivery_id: undefined }); await wait;
@@ -378,7 +478,7 @@ test('batch delivery consumed by the next step does not start another turn', asy
   const h = await setup(body => body.operation === 'observe' && body.args.deliver && !issued ? (issued = true, { events: [event()], delivery_id: 'busy' }) : {});
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
   await h.observe(); assert.equal(issued, false);
-  await h.boundary();
+  await h.toolStep();
   assert.equal(h.calls.some(call => call.operation === 'confirm'), true);
   await h.step({ turnId: 'turn' }); await h.emit('turn.complete', { turnId: 'turn', reason: 'answer' }); await tick();
   assert.deepEqual(h.prompts, []);
@@ -386,7 +486,7 @@ test('batch delivery consumed by the next step does not start another turn', asy
 
 test('user interruption never wakes a retained batch note or polls new prompts', async () => {
   const h = await setup(body => body.operation === 'observe' && body.args.deliver ? { events: [event()], delivery_id: 'busy' } : {});
-  await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.boundary();
+  await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
   await h.emit('turn.complete', { turnId: 'turn', reason: 'aborted', isAborted: true }); await h.observe(); await tick();
   assert.deepEqual(h.prompts, []); assert.equal(h.calls.at(-1).args.deliver, false);
 });
@@ -396,7 +496,7 @@ test('a note retained after user interruption does not wake the session', async 
   const h = await setup(body => body.operation === 'observe' && body.args.deliver ? { events: [event()], delivery_id: 'busy' } : {});
   h.setAppendNote(args => { note = args.message; return pending.promise; });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' });
-  const batch = h.boundary(); await tick();
+  const batch = h.toolStep(); await tick();
   await h.emit('turn.complete', { turnId: 'turn', reason: 'aborted', isAborted: true });
   pending.resolve({ message: note, uuid: 'kept' }); await batch; await h.observe();
   assert.equal(h.calls.some(call => call.operation === 'confirm'), true); assert.deepEqual(h.prompts, []);
@@ -414,7 +514,8 @@ test('direct user sends never submit a parent prompt', async () => {
 });
 
 test('user stop facts still prompt and confirm exact framed receipts on append and recovery', async () => {
-  const receipt = formatDeliveryEvent({ seq: 3, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'interrupt', phase: 'confirmed', message: 'User stop detail' });
+  const receipt = formatDeliveryEvent({ ...pauseReceipt({ agent_id: 'a', name: 'worker', scope: 'agent' }), seq: 3,
+    summary: 'Codex 子代理 worker 及其已知子代理已按用户要求停止。' });
   for (const [head, tail] of [
     ['The codex-subagents plugin sent a message:\n', "\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."],
     ['The codex-subagents plugin sent a message while you were working:\n', '\n\nThis is how Claude Code surfaces prompts a plugin submits mid-turn — within the running turn, often alongside the next tool result. Address the message above as you continue this turn.'],
