@@ -69,17 +69,23 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
   return h;
 }
 
-test('followup declares and transports an optional replacement model and structured errors', async () => {
-  const error = { code: 'agent_model_unavailable', message: 'Choose a model', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', model_turn_started: false };
-  const h = await setup(() => ({ error }));
+test('followup keeps its normal schema and carries the selected recovery target verbatim', async () => {
+  const target = 'codex-recovery:example/gpt-6.2-astra';
+  const error = { code: 'agent_model_unavailable', message: 'Model unavailable', recovery_choices: [{ model: 'gpt-6.2-astra', target }] };
+  const h = await setup(body => body.args?.target === target ? { agent_id: 'a' } : { error });
   await h.start();
   const schema = h.registered.find(tool => tool.name === 'followup_task').inputSchema;
-  assert.equal(schema.properties.replacement_model.type, 'string');
+  assert.deepEqual(Object.keys(schema.properties), ['target', 'message']);
+  assert.equal(schema.additionalProperties, false);
   assert.deepEqual(schema.required, ['target', 'message']);
-  assert.deepEqual(await h.call('followup_task', { target: 'a', message: 'Continue', replacement_model: 'new', tool_use_id: 'f1' }), { error });
-  assert.deepEqual(h.calls.at(-1).args, { target: 'a', message: 'Continue', replacement_model: 'new' });
-  await h.call('followup_task', { target: 'a', message: 'Continue', tool_use_id: 'f2' });
-  assert.deepEqual(h.calls.at(-1).args, { target: 'a', message: 'Continue' });
+  const failed = await h.call('followup_task', { target: 'a', message: 'Continue', tool_use_id: 'f1' });
+  assert.deepEqual(failed, { error });
+  assert.deepEqual(await h.call('followup_task', { target: failed.error.recovery_choices[0].target, message: 'Continue', tool_use_id: 'f2' }), { agent_id: 'a' });
+  assert.deepEqual(h.calls.at(-1).args, { target, message: 'Continue' });
+  const requests = h.calls.length;
+  const invalid = await h.call('followup_task', { target: 'a', message: 'Continue', replacement_model: 'new', tool_use_id: 'f3' });
+  assert.match(invalid.error.message, /only accepts target and message/);
+  assert.equal(h.calls.length, requests);
 });
 
 test('default wait renews locally until an event without sampling or interrupting workers', async () => {

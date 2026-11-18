@@ -143,6 +143,7 @@ test('only decisive model errors on model-bearing RPCs expose a recovery reason'
     for (const [method, message, data, confirmed] of [
       ['turn/start', 'request rejected', { codexErrorInfo: 'modelNotFound', details: 'SENSITIVE' }, true],
       ['thread/resume', 'provider refused', { error: { code: 'model_not_found' } }, true],
+      ['thread/compact/start', 'provider refused compaction', { codexErrorInfo: 'modelNotFound' }, true],
       ['turn/start', 'The model `private-model` does not exist or you do not have access to it.', null, true],
       ['turn/start', 'model temporarily unavailable', { status: 503 }, false],
       ['thread/resume', 'bad effort for this model', { codexErrorInfo: 'badRequest' }, false],

@@ -7,7 +7,7 @@ import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 import { prepareAttachments, directUserInput } from './attachments.mjs';
 import { AUTOMATIC_TURN_EVENTS, isCompactionStatus, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
-import { modelRecoveryDetails, modelRecoveryError, pendingModelRecovery, providerModelUnavailable, readVisibleModels, replacementEffort } from './model-recovery.mjs';
+import { MODEL_RECOVERY_TARGET_PREFIX, modelRecoveryDetails, modelRecoveryError, pendingModelRecovery, providerModelUnavailable, readVisibleModels, replacementEffort, selectModelRecovery } from './model-recovery.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const STARTED_TURN_ID = Symbol('startedTurnId');
@@ -26,6 +26,8 @@ function storedContextSource(a) {
 const copy = (x) => structuredClone(x);
 const input = (text) => [{ type: 'text', text }];
 const now = () => Date.now();
+const staleModelRecoveryTarget = () => new Error('This model recovery target is invalid or no longer active. Use list_agents to find the original agent. If it shows model_recovery and its status is failed, interrupted, or completed, call followup_task with its agent ID and your intended message to get current choices. If a turn may already have started, inspect it in Codex before resending.');
+const pendingModelRecoveryRequest = () => new Error('This agent has a pending approval or question, so model recovery cannot start. Use answer_agent with the pending request_id, then retry followup_task once the agent and its descendants are idle.');
 const isOverflow = (error) => error?.codexErrorInfo === 'contextWindowExceeded' || error?.code === 'contextWindowExceeded';
 const roleConfig = (role) => role === 'default' ? { 'features.default_mode_request_user_input': false, 'features.multi_agent': false, 'features.multi_agent_v2': false, 'features.image_generation': false } : undefined;
 
@@ -84,6 +86,7 @@ export class AgentController extends EventEmitter {
     for (const saved of data.agents) {
       const privateTurnIds = data.pendingEvents.filter(event => event.agent_id === saved.id && isUserSend(event) && event.phase === 'delivered').map(event => event.turn_id).filter(Boolean);
       const a = { ...saved, contextSource: storedContextSource(saved), lastTurnId: saved.turnId ?? saved.lastTurnId, turnOrigin: saved.turnOrigin ?? (privateTurnIds.includes(saved.turnId ?? saved.lastTurnId) ? 'user' : 'parent'), pending: [], completedTurns: new Set(), compactItems: new Set(), loaded: false, terminalEmitted: true };
+      if (a.modelRecovery && !nonempty(a.modelRecovery.ticket)) a.modelRecovery = pendingModelRecovery(a.modelRecovery.model, a.modelRecovery.reason);
       // A crashed steer has no confirmed acceptance. Restore the original parent
       // task's deferred facts; never infer successful takeover from an inflight RPC.
       this.pendingEvents.push(...(saved.pendingUserSteer?.events ?? []));
@@ -95,7 +98,7 @@ export class AgentController extends EventEmitter {
       if (a.threadId) this.threads.set(a.threadId, a);
       if (ACTIVE.has(a.status) || a.turnId || a.replacementAttempt) {
         a.status = 'unknown'; a.turnId = null; a.activity = 'stale_pending';
-        this.publish(a, 'unknown', { reason: 'controller_restarted', stale_pending: true });
+        this.publish(a, 'unknown', { ...(a.replacementAttempt ? this.unknownReplacementDetails(a) : {}), reason: 'controller_restarted', stale_pending: true });
       }
     }
     for (const [id, rootId] of data.descendants ?? []) {
@@ -121,7 +124,7 @@ export class AgentController extends EventEmitter {
       model: a.model, reasoning_effort: a.effort, status: a.status, activity: a.activity,
       turn_id: a.turnId, error: a.turnOrigin === 'user' && !metrics ? null : a.error ?? null,
       turn_origin: a.turnOrigin ?? 'parent',
-      ...(a.modelRecovery ? { model_recovery: copy(a.modelRecovery) } : {}),
+      ...(a.modelRecovery ? { model_recovery: { model: a.modelRecovery.model, reason: a.modelRecovery.reason } } : {}),
       context_source: a.contextSource ?? 'unknown',
       user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null,
       pending_requests: a.pending.map(({ id, method, params }) => ({ method, ...copy(params), request_id: id,
@@ -196,7 +199,8 @@ export class AgentController extends EventEmitter {
   }
 
   requireIdleReplacement(a, options) {
-    if (this.occupies(a, options) || a.sending || a.stopPromise) throw new Error('The agent and its descendants must be idle before replacing its unavailable model.');
+    if (a.pending.length || a.status === 'waiting') throw pendingModelRecoveryRequest();
+    if (this.occupies(a, options) || a.sending || a.stopPromise) throw new Error('This agent or one of its descendants is still active, so model recovery cannot start. Wait until they are idle, then retry followup_task with the same recovery target.');
   }
 
   reserve(key, a) {
@@ -240,24 +244,24 @@ export class AgentController extends EventEmitter {
     return this.modelCatalogRequests.get(key);
   }
 
-  async prepareTurnModel(a, replacementModel) {
+  async prepareTurnModel(a, replacementModel, { duringCompaction = false } = {}) {
     if (!nonempty(a.model)) return { effort: a.effort };
     let catalog;
     try { catalog = await this.visibleModels(a.modelProvider); }
     catch (cause) {
-      throw Object.assign(new Error(`Could not verify the current Codex model catalog for thread ${a.threadId}: ${cause.message} Retry after the catalog is available.`, { cause }),
-        { code: 'model_catalog_unavailable', agent_id: a.id, thread_id: a.threadId, model: a.model, model_turn_started: false });
+      const explanation = duringCompaction ? 'Context recovery stopped before starting a new turn.' : 'No turn was started.';
+      const recovery = `Retry followup_task with ${replacementModel !== undefined ? 'the same recovery target and message' : `target set to agent ID ${a.id} and your intended message`} once the model catalog is available.`;
+      throw Object.assign(new Error(`Could not verify the Codex model catalog for agent ${a.name ?? a.id}. ${explanation} ${recovery}`, { cause }),
+        { code: 'model_catalog_unavailable', agent_id: a.id, thread_id: a.threadId, model: a.model, model_turn_started: duringCompaction });
     }
     if (replacementModel !== undefined) {
       if (a.modelRecovery.reason === 'model_not_listed' && catalog.has(a.model)) {
         a.modelRecovery = null;
         await this.persist();
-        throw new Error(`Model ${a.model} is visible again. Continue this same agent without replacement_model to preserve continuity and avoid additional cache costs.`);
+        throw new Error(`Model ${a.model} is visible again for this Codex thread. No turn was started. Retry followup_task with target set to agent ID ${a.id} and the same message to continue with ${a.model}.`);
       }
       if (replacementModel === a.modelRecovery.model || !catalog.has(replacementModel)) {
-        const error = modelRecoveryError(a, catalog, false);
-        error.message = `Select a different replacement_model from the currently visible Codex models. ${error.recovery}`;
-        throw error;
+        throw modelRecoveryError(a, catalog, false, { invalidReplacement: replacementModel });
       }
       return { model: replacementModel, effort: replacementEffort(catalog.get(replacementModel), a.effort), catalog, replacement: true };
     }
@@ -266,7 +270,7 @@ export class AgentController extends EventEmitter {
       await this.persist();
     }
     if (a.modelRecovery && (a.modelRecovery.reason === 'provider_model_unavailable' || !catalog.has(a.model))) {
-      throw modelRecoveryError(a, catalog, false);
+      throw modelRecoveryError(a, catalog, duringCompaction, { duringCompaction });
     }
     return { model: a.model, effort: a.effort, catalog };
   }
@@ -277,9 +281,10 @@ export class AgentController extends EventEmitter {
     if (plan.model) a.modelRecovery = null;
   }
 
-  requireModelRecovery(a) {
+  requireModelRecovery(a, recoveryTicket) {
+    if (recoveryTicket !== undefined && a.modelRecovery?.ticket !== recoveryTicket) throw staleModelRecoveryTarget();
     if (a.modelRecovery?.model !== a.model || !a.modelRecovery || !a.threadId) {
-      throw new Error('This registered agent has no pending model recovery or confirmed model availability failure. Continue with its current model to preserve continuity and avoid additional cache costs.');
+      throw new Error(`Agent ${a.id} has no pending model recovery. Call followup_task with this agent ID as the target and your intended message to continue with its current model.`);
     }
   }
 
@@ -291,7 +296,7 @@ export class AgentController extends EventEmitter {
 
   noteUnavailableModel(a, plan, modelTurnStarted) {
     if (!plan.replacement) a.modelRecovery = pendingModelRecovery(plan.model, 'provider_model_unavailable');
-    return modelRecoveryError(a, plan.catalog, modelTurnStarted, plan.replacement ? plan.model : undefined);
+    return modelRecoveryError(a, plan.catalog, modelTurnStarted, { rejectedReplacement: plan.replacement ? plan.model : undefined });
   }
 
   async spawn({ message, cwd, model, reasoning_effort, name, context_mode, snapshot, role }) {
@@ -381,7 +386,7 @@ export class AgentController extends EventEmitter {
     a.startingTurn = true;
     a.startEvents = [];
     if (plan.replacement) a.replacementAttempt = { model: plan.model, effort: plan.effort, priorTurnId: plan.priorTurnId };
-    let response, boundTurnId = null;
+    let response, boundTurnId = null, startRequested = false;
     try {
       // Record the recipient before native work can emit a result or survive a
       // controller restart. The same native thread/history remains in use.
@@ -389,13 +394,15 @@ export class AgentController extends EventEmitter {
       if (a.userPaused || a.interrupted) {
         a.replacementAttempt = null;
         this.finish(a, 'interrupted', { reason: 'interrupt' });
-        throw new Error('The agent was stopped before the message could be sent.');
+        throw new Error('The agent was stopped before the message could be sent. The user can resume it with a direct message in the Codex interface.');
       }
-      if (plan.replacement && this.hasActiveDescendant(a)) {
+      if (plan.replacement && (a.pending.length || this.hasActiveDescendant(a))) {
         a.replacementAttempt = null;
-        this.finish(a, 'failed', { message: 'An agent descendant became active before model recovery could start.' });
-        throw new Error('An agent descendant became active before model recovery could start.');
+        const failure = a.pending.length ? pendingModelRecoveryRequest() : new Error('An agent descendant became active before model recovery could start. Wait until it is idle, then retry followup_task with the same recovery target.');
+        this.finish(a, 'failed', { message: failure.message });
+        throw failure;
       }
+      startRequested = true;
       response = await this.rpc('turn/start', { threadId: a.threadId, input: Array.isArray(text) ? text : input(text),
         ...(plan.model ? { model: plan.model } : {}), ...(plan.effort ? { effort: plan.effort } : {}), serviceTierForTurn: 'default' });
       if (!nonempty(response?.turn?.id)) throw new Error('turn/start returned no turn id; start outcome is unknown.');
@@ -417,19 +424,33 @@ export class AgentController extends EventEmitter {
       if (!boundTurnId && plan.model && providerModelUnavailable(error)) {
         a.replacementAttempt = null;
         const unavailable = this.noteUnavailableModel(a, plan, false);
-        this.finish(a, 'failed', modelRecoveryDetails(a, plan.catalog, false, plan.replacement ? plan.model : undefined));
+        this.finish(a, 'failed', { ...unavailable, message: unavailable.message });
         await this.persist();
         throw unavailable;
       }
-      if (Object.isExtensible(error)) error[STARTED_TURN_ID] = boundTurnId;
-      if (!boundTurnId && Number.isInteger(error.code)) a.replacementAttempt = null;
+      const rejected = Number.isInteger(error.code);
+      if (!boundTurnId && (rejected || !startRequested)) a.replacementAttempt = null;
+      let failure = error;
+      let details = { message: error.message, reason: rejected ? 'turn_start_rejected' : 'turn_start_outcome_unknown',
+        ...(rejected ? {} : { recovery: `Keep this same agent. An explicit send, followup, interrupt, or close first checks native Codex thread ${a.threadId} metadata and restores its subscription when needed. Do not create replacement work or automatically resend the original task; if metadata remains inconclusive, inspect this thread in Codex.` }) };
+      if (plan.replacement && startRequested) {
+        if (boundTurnId) {
+          const recovery = `Inspect thread ${a.threadId} in Codex before resending the followup.`;
+          details = { message: `Codex started turn ${boundTurnId} with replacement model ${plan.model}, but the followup acknowledgement failed. ${recovery}` };
+        } else if (rejected) {
+          const recovery = 'Check the followup message and retry followup_task with the same recovery target once the request can be accepted.';
+          details = { message: `Codex rejected the request to start a turn with replacement model ${plan.model}. No turn was started. ${recovery}`, reason: 'turn_start_rejected' };
+        } else {
+          details = this.unknownReplacementDetails(a);
+        }
+        failure = Object.assign(new Error(details.message, { cause: error }), { code: error.code, ...details });
+      }
+      if (Object.isExtensible(failure)) failure[STARTED_TURN_ID] = boundTurnId;
       // A transport failure says nothing about whether the server started work.
       // An observed turn remains authoritative even if its RPC reply was lost.
-      if (!a.turnId && !a.terminalEmitted) this.finish(a, Number.isInteger(error.code) ? 'failed' : 'unknown',
-        { message: error.message, reason: Number.isInteger(error.code) ? 'turn_start_rejected' : 'turn_start_outcome_unknown',
-          ...(Number.isInteger(error.code) ? {} : { recovery: `Keep this same agent. An explicit send, followup, interrupt, or close first checks native Codex thread ${a.threadId} metadata and restores its subscription when needed. Do not create replacement work or automatically resend the original task; if metadata remains inconclusive, inspect this thread in Codex.` }) });
+      if (!a.turnId && !a.terminalEmitted) this.finish(a, rejected ? 'failed' : 'unknown', details);
       await this.persist();
-      throw error;
+      throw failure;
     }
     finally {
       a.startingTurn = false;
@@ -529,7 +550,7 @@ export class AgentController extends EventEmitter {
           } else a.error = { ...a.error, reconciliation_status: 'active thread has no confirmed inProgress turn' };
         } else a.error = { ...a.error, reconciliation_status: status ?? 'missing thread status' };
       } catch (error) {
-        if (a.status === 'unknown') a.error = { ...a.error, reconciliation_error: error.message };
+        if (a.status === 'unknown') a.error = { ...a.error, reconciliation_error: a.replacementAttempt ? 'native Codex metadata could not be read' : error.message };
         else throw error;
       }
       await this.persist();
@@ -540,12 +561,29 @@ export class AgentController extends EventEmitter {
     finally { a.reconciling = null; }
   }
 
+  unknownReplacementDetails(a) {
+    const recovery = `Inspect thread ${a.threadId} in Codex before resending the followup.`;
+    const metadata = a.error?.reconciliation_error ?? a.error?.reconciliation_status;
+    const explanation = `Codex did not confirm whether it started a turn with replacement model ${a.replacementAttempt.model} on thread ${a.threadId}.`;
+    const message = `${explanation}${metadata ? ' Native metadata could not confirm the attempted model replacement.' : ''} ${recovery}`;
+    return { message, reason: 'turn_start_outcome_unknown' };
+  }
+
   unknownError(a) {
+    if (a.replacementAttempt) {
+      const details = this.unknownReplacementDetails(a);
+      return Object.assign(new Error(details.message), details);
+    }
     return new Error(`Previous turn/start outcome is unknown; native metadata could not confirm a safe operation (${a.error?.reconciliation_error ?? a.error?.reconciliation_status ?? 'unconfirmed thread'}). Inspect thread ${a.threadId} in Codex before retrying.`);
   }
 
   async followup(target, message, replacementModel) {
     if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (typeof target === 'string' && target.startsWith(MODEL_RECOVERY_TARGET_PREFIX)) {
+      const selection = selectModelRecovery(this.agents.values(), target);
+      if (!selection) throw staleModelRecoveryTarget();
+      return this.send(selection.agent, message, { followup: true, replacementModel: selection.model, recoveryTicket: selection.ticket });
+    }
     if (replacementModel !== undefined && !nonempty(replacementModel)) throw new TypeError('replacement_model must be nonempty.');
     const threadLink = typeof target === 'string' && target.startsWith('codex://threads/');
     let id = threadLink ? target.slice('codex://threads/'.length) : target;
@@ -555,7 +593,7 @@ export class AgentController extends EventEmitter {
     const existing = matches[0];
     if (this.adoptions.has(existing?.threadId ?? id)) throw new Error(`Thread ${existing?.threadId ?? id} is already being adopted; retry using the registered agent after it completes.`);
     if (existing) return this.send(existing, message, { followup: true, replacementModel });
-    if (replacementModel !== undefined) throw new Error('replacement_model requires a registered agent with a pending model recovery.');
+    if (replacementModel !== undefined) throw new Error('The requested agent has no registered model recovery. Call followup_task with its agent ID or native Codex thread link and your intended message to check its current model.');
     if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
     if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Unknown agent target; native thread IDs must be UUIDs.');
     const reservation = Symbol('adopt'); this.reserve(reservation);
@@ -597,23 +635,23 @@ export class AgentController extends EventEmitter {
     } finally { const a = this.threads.get(id); if (a) a.adopting = false; this.reservations.delete(reservation); this.adoptions.delete(id); }
   }
 
-  async send(a, message, { followup = false, existingReservation, origin, resumeToken, attachments = [], replacementModel } = {}) {
+  async send(a, message, { followup = false, existingReservation, origin, resumeToken, attachments = [], replacementModel, recoveryTicket } = {}) {
     if (!nonempty(message) && !(origin === 'user' && attachments.length)) throw new TypeError('message must be nonempty.');
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
-    if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
+    if (a.userPaused) throw new Error('This agent is paused by the user. The user can resume it with a direct message in the Codex interface.');
     const epoch = a.controlEpoch ?? 0;
     const wireInput = origin === 'user' ? directUserInput(message, attachments) : input(message);
     if (a.adopting && !existingReservation) throw new Error(`Thread ${a.threadId} is being adopted.`);
     if (a.externalConflict) throw new Error(`Thread ${a.threadId} became active in another client. Close this agent and retry adoption once the native thread is idle.`);
-    if (replacementModel !== undefined) this.requireModelRecovery(a);
+    if (replacementModel !== undefined) this.requireModelRecovery(a, recoveryTicket);
     await this.reconcileUnknown(a);
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
-    if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
+    if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('The agent was paused by the user before the message could be sent. The user can resume it with a direct message in the Codex interface.');
     if (a.status === 'unknown') throw this.unknownError(a);
-    if (replacementModel !== undefined) this.requireModelRecovery(a);
-    if (a.removing) throw new Error('Agent is closing.');
-    if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
+    if (replacementModel !== undefined) this.requireModelRecovery(a, recoveryTicket);
+    if (a.removing || this.agents.get(a.id) !== a) throw new Error('This agent is closing or has been closed. Use list_agents to confirm its status before continuing.');
     if (replacementModel !== undefined) this.requireIdleReplacement(a);
+    if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
     if (ACTIVE.has(a.status)) {
       if (!a.turnId || a.status === 'compacting') throw new Error('Agent turn is not steerable yet.');
       const turnId = a.turnId, turnOrigin = a.turnOrigin;
@@ -643,7 +681,7 @@ export class AgentController extends EventEmitter {
     try {
       let plan = followup ? await this.prepareTurnModel(a, replacementModel) : { model: a.model };
       const wasLoaded = a.loaded;
-      if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
+      if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('The agent was paused by the user before the message could be sent. The user can resume it with a direct message in the Codex interface.');
       if (plan.replacement) this.requireIdleReplacement(a, { allowResume: true });
       // A completed turn keeps this connection's native thread loaded. Resume
       // only after a restart/unload; repeated followups use the same writer.
@@ -653,25 +691,29 @@ export class AgentController extends EventEmitter {
           response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings),
             ...(plan.model ? { model: plan.model } : {}), ...(a.modelProvider ? { modelProvider: a.modelProvider } : {}), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
         } catch (error) {
-          if (!followup || !plan.model || !providerModelUnavailable(error)) throw error;
-          const unavailable = this.noteUnavailableModel(a, plan, false);
-          await this.persist();
-          throw unavailable;
+          if (followup && plan.model && providerModelUnavailable(error)) {
+            const unavailable = this.noteUnavailableModel(a, plan, false);
+            await this.persist();
+            throw unavailable;
+          }
+          if (!plan.replacement) throw error;
+          throw new Error(`Codex could not resume thread ${a.threadId} with replacement model ${plan.model}. No turn was requested. Inspect the same thread in Codex and retry the recovery target once the thread is available.`, { cause: error });
         }
-        if (nonempty(response?.thread?.id) && response.thread.id !== a.threadId) throw new Error(`Native Codex returned a different thread during resume of ${a.threadId}; no task was sent.`);
+        if (nonempty(response?.thread?.id) && response.thread.id !== a.threadId) throw new Error(`Codex returned a different thread while resuming thread ${a.threadId}. No task was sent. Verify the original thread in Codex before retrying.`);
         if ((a.externalAdopted || replacementModel !== undefined) && !['idle', 'notLoaded'].includes(response?.thread?.status?.type)) {
           if (a.externalAdopted) a.externalConflict = true;
-          throw new Error(`Native thread ${a.threadId} became active or unconfirmed during resume; no task was sent.`);
+          const recovery = a.externalConflict ? 'Once the thread is idle in Codex, close this agent and call followup_task with the original thread ID and your intended message.' : 'Confirm the thread is idle in Codex, then retry followup_task with the same recovery target.';
+          throw new Error(`Codex could not confirm that thread ${a.threadId} was idle during resume. No task was sent. ${recovery}`);
         }
         a.loaded = true;
         const resumedModel = response?.model ?? response?.thread?.model;
         const resumedProvider = response?.modelProvider ?? response?.thread?.modelProvider;
         if (followup && plan.model && nonempty(resumedModel) && resumedModel !== plan.model) {
-          throw new Error(`Native Codex resumed thread ${a.threadId} with model ${resumedModel} instead of ${plan.model}; no task was sent.`);
+          throw new Error(`Codex resumed thread ${a.threadId} with model ${resumedModel} instead of ${plan.model}. No task was sent. Check the thread's model configuration in Codex before retrying.`);
         }
         if (followup && a.modelProvider && nonempty(resumedProvider) && resumedProvider !== a.modelProvider) {
           a.loaded = false;
-          throw new Error(`Native Codex resumed thread ${a.threadId} with a different model provider; no task was sent.`);
+          throw new Error(`Codex resumed thread ${a.threadId} with a different model provider. No task was sent. Check the thread's provider configuration in Codex before retrying.`);
         }
         if (!plan.replacement) {
           this.updateResolved(a, response, { keepModel: true });
@@ -682,11 +724,13 @@ export class AgentController extends EventEmitter {
       a.loaded = true;
       a.externalAdopted = false;
       if (plan.replacement) {
-        const priorTurn = wasLoaded && !a.externalThread ? null : await this.latestNativeTurn(a);
-        if (priorTurn?.status === 'inProgress') throw new Error(`Native thread ${a.threadId} is active; no model replacement task was sent.`);
+        const priorTurn = wasLoaded && !a.externalThread ? null : await this.latestNativeTurn(a).catch(cause => {
+          throw new Error(`Codex could not confirm the latest turn on thread ${a.threadId}. No replacement task was sent. Confirm the thread is idle in Codex, then retry followup_task with the same recovery target.`, { cause });
+        });
+        if (priorTurn?.status === 'inProgress') throw new Error(`Codex thread ${a.threadId} is still active. No replacement task was sent. Wait until it is idle, then retry followup_task with the same recovery target.`);
         plan.priorTurnId = priorTurn?.id ?? (wasLoaded && !a.externalThread ? a.lastTurnId : null) ?? null;
       }
-      if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
+      if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('The agent was paused by the user before the message could be sent. The user can resume it with a direct message in the Codex interface.');
       if (plan.replacement) this.requireIdleReplacement(a, { allowResume: true });
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
@@ -1138,20 +1182,20 @@ export class AgentController extends EventEmitter {
 
   async startCompaction(a) {
     try {
-      if (nonempty(a.model)) await this.prepareTurnModel(a);
+      if (nonempty(a.model)) await this.prepareTurnModel(a, undefined, { duringCompaction: true });
       if (a.recovery && !a.interrupted && !this.closing) await this.rpc('thread/compact/start', { threadId: a.threadId });
     } catch (error) {
       if (!a.recovery || a.interrupted || this.closing) return;
       if (nonempty(a.model) && providerModelUnavailable(error)) {
         a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
-        this.finish(a, 'failed', modelRecoveryDetails(a, null, true));
+        this.finish(a, 'failed', modelRecoveryDetails(a, null, true, { duringCompaction: true }));
       } else this.finishCompactionError(a, error);
     }
   }
 
   async continueAfterCompaction(a) {
     try {
-      const plan = nonempty(a.model) ? await this.prepareTurnModel(a) : { effort: a.effort };
+      const plan = nonempty(a.model) ? await this.prepareTurnModel(a, undefined, { duringCompaction: true }) : { effort: a.effort };
       if (!a.interrupted && !this.closing && a.status === 'compacting') await this.startTurn(a, CONTINUE, { plan });
     } catch (error) {
       if (a.status === 'compacting' && !a.interrupted && !this.closing) this.finishCompactionError(a, error);
@@ -1159,7 +1203,7 @@ export class AgentController extends EventEmitter {
   }
 
   finishCompactionError(a, error) {
-    const details = error.code === 'agent_model_unavailable' ? { ...error, message: error.message, model_turn_started: true } : { message: `Context compaction failed: ${error.message}` };
+    const details = ['agent_model_unavailable', 'model_catalog_unavailable'].includes(error.code) ? { ...error, message: error.message } : { message: `Context compaction failed: ${error.message}` };
     this.finish(a, 'failed', details);
   }
 
@@ -1314,7 +1358,10 @@ export class AgentController extends EventEmitter {
         if (ACTIVE.has(a.status)) { a.status = 'unknown'; a.activity = 'connection closed; interruption unconfirmed'; }
         a.stopError = 'App-server connection closed before interruption was confirmed.';
         this.updateStopStatus(a);
-      } else if (ACTIVE.has(a.status)) this.finish(a, 'failed', { message: 'App-server connection closed.' });
+      } else if (ACTIVE.has(a.status)) {
+        if (a.replacementAttempt) this.finish(a, 'unknown', this.unknownReplacementDetails(a));
+        else this.finish(a, 'failed', { message: 'App-server connection closed.' });
+      }
     }
   }
 

@@ -10,7 +10,7 @@ const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
 const errorBody = error => ({ code: error.code || 'bridge_error', message: error.message,
-  ...Object.fromEntries(['agent_id', 'thread_id', 'status', 'recovery', 'reason', 'model', 'available_models', 'recommended_model', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
+  ...Object.fromEntries(['agent_id', 'thread_id', 'status', 'recovery', 'reason', 'model', 'available_models', 'recommended_model', 'recovery_choices', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
   ...(error.code === 'invalid_answer' ? { request_id: error.request_id, reply_format: error.reply_format } : {}) });
 
 function authorized(value, token) {
@@ -145,7 +145,8 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       catch (error) {
         // These validations fail before any wire response. Other errors may have
         // ambiguous side effects, so retain their inflight receipt and never retry.
-        if (['invalid_answer', 'private_turn_active'].includes(error.code) || (error.code === 'agent_model_unavailable' && error.model_turn_started === false)) await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
+        const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable'].includes(error.code) && error.model_turn_started === false;
+        if (['invalid_answer', 'private_turn_active'].includes(error.code) || modelPreflightFailed) await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
         throw error;
       }
       await journal.put(requestId, { operation, fingerprint, status: 'done', result });

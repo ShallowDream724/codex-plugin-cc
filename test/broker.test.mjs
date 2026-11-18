@@ -87,19 +87,25 @@ test('partial adoption failures still refresh the catalog, and a UI failure cann
 test('model recovery errors retain options and distinguish confirmed rejection from an uncertain action', async t => {
   const { post, controller } = await setup(t, { activity: { list: () => ({ agents: [{ agent_id: 'a', status: 'failed' }] }) } });
   let calls = 0;
+  const choices = [{ model: 'new', target: 'codex-recovery:example/new' }];
   controller.dispatch = async (_, args) => {
     calls++;
-    throw Object.assign(new Error('Model unavailable'), { code: 'agent_model_unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', model_turn_started: args.target === 'certain' ? false : true, recovery: 'Choose a replacement.' });
+    if (args.target === 'catalog-offline') throw Object.assign(new Error('Could not verify the Codex model catalog. No turn was started.'), { code: 'model_catalog_unavailable', model_turn_started: false });
+    throw Object.assign(new Error('Model unavailable'), { code: 'agent_model_unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', recovery_choices: choices, model_turn_started: args.target === 'certain' ? false : true, recovery: 'Choose a replacement.' });
   };
-  const request = target => ({ operation: 'followup_task', requestId: target, args: { target, message: 'Continue', replacement_model: 'new' }, ui_summary: true });
+  const request = target => ({ operation: 'followup_task', requestId: target, args: { target, message: 'Continue' }, ui_summary: true });
   const first = (await post(request('certain'))).body;
-  assert.deepEqual(first.error, { code: 'agent_model_unavailable', message: 'Model unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', recovery: 'Choose a replacement.', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', model_turn_started: false });
+  assert.deepEqual(first.error, { code: 'agent_model_unavailable', message: 'Model unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', recovery: 'Choose a replacement.', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', recovery_choices: choices, model_turn_started: false });
   assert.equal(first.ui_summary.agents[0].status, 'failed');
   assert.deepEqual((await post(request('certain'))).body.error, first.error);
   assert.equal(calls, 1);
   assert.equal((await post(request('uncertain'))).body.error.model_turn_started, true);
   assert.equal((await post(request('uncertain'))).body.error.code, 'ambiguous_action');
   assert.equal(calls, 2);
+  const offline = (await post(request('catalog-offline'))).body.error;
+  assert.equal(offline.code, 'model_catalog_unavailable');
+  assert.deepEqual((await post(request('catalog-offline'))).body.error, offline);
+  assert.equal(calls, 3);
 });
 
 test('direct user controls use durable receipts without acknowledging Claude events', async t => {

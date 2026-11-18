@@ -8,7 +8,7 @@
   },
   "models": {
     "gpt-6-luna": {
-      "selection_note": "Low-cost read-only scout for lookup, extraction and factual checks. The default preset uses medium."
+      "selection_note": "Read-only scout for lookup, extraction and factual checks. The default preset uses medium."
     },
     "gpt-6.1-terra": {
       "selection_note": "For tasks with clear steps and directly checkable results, including image reading and authorized interface operations. Usually high; xhigh for deeper verification."

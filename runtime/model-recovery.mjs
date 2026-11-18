@@ -1,12 +1,32 @@
+import { createHmac, randomUUID } from 'node:crypto';
+
 const PROVIDER_UNAVAILABLE = 'provider_model_unavailable';
 const MODEL_NOT_LISTED = 'model_not_listed';
+export const MODEL_RECOVERY_TARGET_PREFIX = 'codex-recovery:';
 
 export function providerModelUnavailable(error) {
   return error?.reason === PROVIDER_UNAVAILABLE || error?.codexErrorInfo === 'modelNotFound';
 }
 
 export function pendingModelRecovery(model, reason) {
-  return { model, reason: reason === PROVIDER_UNAVAILABLE ? PROVIDER_UNAVAILABLE : MODEL_NOT_LISTED };
+  return { model, reason: reason === PROVIDER_UNAVAILABLE ? PROVIDER_UNAVAILABLE : MODEL_NOT_LISTED, ticket: randomUUID() };
+}
+
+function recoveryTarget(ticket, model) {
+  const signature = createHmac('sha256', ticket).update(model).digest('base64url');
+  return `${MODEL_RECOVERY_TARGET_PREFIX}${signature}/${encodeURIComponent(model)}`;
+}
+
+export function selectModelRecovery(agents, target) {
+  const encoded = target.slice(MODEL_RECOVERY_TARGET_PREFIX.length);
+  const match = /^[0-9A-Za-z_-]{43}\/([^/]+)$/.exec(encoded);
+  if (!match) return;
+  let model;
+  try { model = decodeURIComponent(match[1]); } catch { return; }
+  for (const agent of agents) {
+    const ticket = agent.modelRecovery?.ticket;
+    if (ticket && recoveryTarget(ticket, model) === target) return { agent, model, ticket };
+  }
 }
 
 export async function readVisibleModels(rpc, modelProvider) {
@@ -20,7 +40,7 @@ export async function readVisibleModels(rpc, modelProvider) {
     for (const model of page.data) {
       if (model?.hidden === true) continue;
       const id = model?.model || model?.id;
-      if (typeof id !== 'string' || !id.trim()) throw new Error('model/list returned a model without an ID.');
+      if (typeof id !== 'string' || !id.trim() || !id.isWellFormed()) throw new Error('model/list returned an invalid model ID.');
       models.set(id, model);
     }
     cursor = page.nextCursor;
@@ -58,26 +78,38 @@ function recommendedModel(oldId, ids) {
   return best?.id;
 }
 
-export function modelRecoveryDetails(agent, catalog, modelTurnStarted, rejectedReplacement) {
-  const { model, reason } = agent.modelRecovery;
+export function modelRecoveryDetails(agent, catalog, modelTurnStarted, { invalidReplacement, rejectedReplacement, duringCompaction } = {}) {
+  const { model, reason, ticket } = agent.modelRecovery;
   const available_models = [...(catalog?.keys() ?? [])].filter(id => id !== model && id !== rejectedReplacement);
   const recommended_model = recommendedModel(model, available_models);
-  const target = `agent ${agent.id} (native thread ${agent.threadId})`;
+  const recovery_choices = available_models.map(id => ({ model: id, target: recoveryTarget(ticket, id) }));
   let recovery;
   if (!catalog) {
-    recovery = `When ready to continue, call followup_task on ${target} to check its current model choices.`;
+    recovery = `If list_agents shows model_recovery for agent ${agent.id} and its status is failed, interrupted, or completed, call followup_task with that agent ID and your intended message to check the current replacement choices.`;
   } else if (available_models.length) {
-    recovery = `Retry followup_task on ${target} with replacement_model set to an ID from available_models.`;
+    recovery = 'To continue on the same thread, call followup_task with target set to the recovery target for your chosen model in recovery_choices and message set to your original followup message.';
   } else {
-    recovery = `No eligible replacement is currently visible. Retry followup_task on ${target} after its model catalog changes.`;
+    recovery = `No eligible replacement is visible. Once the model catalog changes, check list_agents. If agent ${agent.id} still shows model_recovery and its status is failed, interrupted, or completed, retry followup_task with that agent ID and the same message.`;
   }
-  const message = rejectedReplacement ? `Codex rejected replacement model ${rejectedReplacement}. ${recovery}` : `Model ${model} is unavailable for this Codex thread. ${recovery}`;
+  let explanation;
+  if (invalidReplacement === model) explanation = `The requested replacement ${model} is the same as the unavailable model. No turn was started.`;
+  else if (invalidReplacement !== undefined) explanation = `The requested replacement ${invalidReplacement} is absent from the visible Codex model catalog. No turn was started.`;
+  else if (rejectedReplacement) explanation = `Codex rejected replacement model ${rejectedReplacement} as unavailable for this thread. No turn was started.`;
+  else if (duringCompaction) {
+    explanation = reason === PROVIDER_UNAVAILABLE
+      ? `Context recovery stopped because Codex rejected model ${model} as unavailable.`
+      : `Context recovery stopped because model ${model} is absent from the visible Codex model catalog.`;
+  }
+  else if (modelTurnStarted) explanation = `The turn failed because Codex rejected model ${model} as unavailable.`;
+  else if (reason === PROVIDER_UNAVAILABLE) explanation = `Codex rejected model ${model} as unavailable for this thread. No turn was started.`;
+  else explanation = `Model ${model} is absent from the visible Codex model catalog. No turn was started.`;
+  const message = `${explanation} ${recovery}`;
   return { code: 'agent_model_unavailable', message, reason, agent_id: agent.id, thread_id: agent.threadId, model, available_models,
-    ...(recommended_model ? { recommended_model } : {}), model_turn_started: modelTurnStarted, recovery };
+    ...(recommended_model ? { recommended_model } : {}), ...(recovery_choices.length ? { recovery_choices } : {}), model_turn_started: modelTurnStarted };
 }
 
-export function modelRecoveryError(agent, catalog, modelTurnStarted, rejectedReplacement) {
-  const details = modelRecoveryDetails(agent, catalog, modelTurnStarted, rejectedReplacement);
+export function modelRecoveryError(agent, catalog, modelTurnStarted, context) {
+  const details = modelRecoveryDetails(agent, catalog, modelTurnStarted, context);
   return Object.assign(new Error(details.message), details);
 }
 

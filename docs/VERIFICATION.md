@@ -1,5 +1,13 @@
 # 验证记录
 
+## rc.27 文案审阅后：故障提示与恢复选项（2026-11-18，本地候选）
+
+本机 `codex-cli 0.169.0` 的 `model/list` 返回 4 个可见模型，包含隐藏项时返回 14 个。旧 `gpt-6-astra` 仅出现在含隐藏项的结果中。把可见目录传给真实插件控制器，续接模拟的旧 Astra 线程时得到 `agent_model_unavailable / model_not_listed`，推荐 `gpt-6.2-astra`；此次失败未调用 `turn/start`。
+
+隔离的 Claude Code 2.1.303 宿主与本地模拟供应商完成了实际的工具注册、调用、接收错误、选择候选、续接和重开会话。普通 `followup_task` 的 schema 只包含 `target` 和 `message`。成功恢复使用原线程，重开 Claude 会话后模型轮次数保持为 2。完整宿主套件 4 项通过，见 `artifacts/rc27-review-host.log`。
+
+常规完整回归 542 项通过、2 项跳过（Windows FIFO、单独运行的隔离宿主）。元数据、语法和生成指引检查通过。常规结果见 `artifacts/rc27-recovery-review-full.log`；最后的桥接回执、错误映射与工具参数复测见 `artifacts/rc27-review-wire.log`。未对真实会话派发任务，Claude 安装仍为 rc.26。
+
 ## rc.27 原线程模型恢复（2026-11-18，本地候选）
 
 完整回归共 540 项，538 项通过，2 项跳过（Windows 上的 FIFO 测试、需要显式启用的隔离 Claude 宿主测试）。最终结果在 `artifacts/rc27-full.log`。插件和 marketplace 版本、JavaScript 语法、生成的调度指引检查通过。

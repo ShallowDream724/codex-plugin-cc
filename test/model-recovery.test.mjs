@@ -1,17 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentController } from '../runtime/agents.mjs';
 
 const THREAD = '12345678-1234-4234-8234-123456789abc';
 const LINK = `codex://threads/${THREAD}`;
-const OLD = 'gpt-6.5-bel';
-const REPLACEMENT = 'gpt-7-bel';
-const HIDDEN = 'gpt-8-bel';
-const OTHER = 'gpt-9-bel-mini';
+const OLD = 'gpt-6-astra';
+const REPLACEMENT = 'gpt-6.2-astra';
+const HIDDEN = 'gpt-6.9-astra';
+const OTHER = 'gpt-6.4-astra-mini';
 
 class NativeClient extends EventEmitter {
   calls = [];
@@ -61,6 +61,12 @@ async function setup(t, { client = new NativeClient(), statePath } = {}) {
   return { client, controller, spawn, followup, agents };
 }
 
+async function rejection(promise) {
+  let received;
+  await assert.rejects(promise, error => { received = error; return true; });
+  return received;
+}
+
 function assertGate(error, agent, reason) {
   assert.equal(error.code, 'agent_model_unavailable');
   assert.equal(error.reason, reason);
@@ -76,11 +82,14 @@ test('a relisted model expires its catalog-only gate and continues without switc
   const agent = await spawn();
   client.complete(agent.turn_id);
   client.catalog = [{ model: REPLACEMENT }];
-  await assert.rejects(followup(agent.id), error => assertGate(error, agent, 'model_not_listed'));
+  const missing = await rejection(followup(agent.id));
+  assertGate(missing, agent, 'model_not_listed');
+  const [{ target }] = missing.recovery_choices;
 
   client.catalog = [{ model: OLD }, { model: REPLACEMENT }];
   client.calls.length = 0;
-  await assert.rejects(followup(agent.id, { replacement_model: REPLACEMENT }), /visible again.*without replacement_model/);
+  await assert.rejects(followup(target), /visible again.*target set to agent ID.*continue with gpt-6-astra/);
+  await assert.rejects(followup(target), /invalid or no longer active.*list_agents/);
   assert.deepEqual(client.writes(), []);
   assert.ok(!(await agents())[0].model_recovery);
   assert.equal((await followup(agent.id)).model, OLD);
@@ -90,17 +99,21 @@ test('a relisted model expires its catalog-only gate and continues without switc
 test('a lost recovery reply only consumes the gate when native metadata confirms the attempted turn', async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-model-replacement-reconciliation-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  for (const outcome of ['accepted', 'rejected', 'ambiguous']) {
+  for (const outcome of ['accepted', 'rejected', 'ambiguous', 'failed-model']) {
     const statePath = path.join(dir, `${outcome}.json`);
     const first = await setup(t, { statePath });
     const agent = await first.spawn();
     first.client.complete(agent.turn_id);
     first.client.catalog = [{ model: REPLACEMENT }];
-    await assert.rejects(first.followup(agent.id), error => assertGate(error, agent, 'model_not_listed'));
+    const missing = await rejection(first.followup(agent.id));
+    assertGate(missing, agent, 'model_not_listed');
+    const [{ target }] = missing.recovery_choices;
     first.client.handler = method => {
       if (method === 'turn/start') throw Object.assign(new Error('Lost replacement reply.'), { code: 'ETIMEDOUT' });
     };
-    await assert.rejects(first.followup(agent.id, { message: 'Private text in the model request', replacement_model: REPLACEMENT }), /Lost replacement reply/);
+    const lost = await rejection(first.followup(target, { message: 'Private text in the model request' }));
+    assert.match(lost.message, /did not confirm whether it started.*gpt-6.2-astra.*Inspect thread/);
+    assert.equal(lost.cause.message, 'Lost replacement reply.');
     assert.equal((await first.agents())[0].status, 'unknown');
     await first.controller.close();
     assert.doesNotMatch(await readFile(statePath, 'utf8'), /Private text in the model request/);
@@ -108,19 +121,25 @@ test('a lost recovery reply only consumes the gate when native metadata confirms
     const client = new NativeClient();
     client.model = outcome === 'ambiguous' ? OLD : REPLACEMENT;
     client.latestTurn = { id: outcome === 'rejected' ? agent.turn_id : 'new-native-turn', status: 'completed' };
+    if (outcome === 'failed-model') Object.assign(client.latestTurn, { status: 'failed', error: { message: 'Provider detail with private text.', codexErrorInfo: 'modelNotFound' } });
     client.catalog = [{ model: REPLACEMENT }];
     const reopened = await setup(t, { client, statePath });
     const [listed] = await reopened.agents();
-    assert.equal(listed.model, outcome === 'accepted' ? REPLACEMENT : OLD);
-    assert.deepEqual(listed.model_recovery, outcome === 'accepted' ? undefined : { model: OLD, reason: 'model_not_listed' });
+    assert.equal(listed.model, ['accepted', 'failed-model'].includes(outcome) ? REPLACEMENT : OLD);
+    assert.deepEqual(listed.model_recovery, outcome === 'accepted' ? undefined : outcome === 'failed-model'
+      ? { model: REPLACEMENT, reason: 'provider_model_unavailable' } : { model: OLD, reason: 'model_not_listed' });
     assert.deepEqual(client.writes(), [], 'reconciliation never repeats the lost request');
     if (outcome === 'accepted') {
-      await assert.rejects(reopened.followup(agent.id, { replacement_model: REPLACEMENT }), /no pending model recovery/);
+      await assert.rejects(reopened.followup(target), /invalid or no longer active.*list_agents/);
     } else if (outcome === 'rejected') {
       assert.equal(listed.status, 'interrupted');
+    } else if (outcome === 'failed-model') {
+      assert.match(listed.error.message, /turn failed because Codex rejected model gpt-6.2-astra.*followup_task.*check the current replacement choices/);
+      assert.ok(reopened.controller.eventsAfter().some(event => event.kind === 'failed' && event.message === listed.error.message));
+      await assert.rejects(reopened.followup(target), /invalid or no longer active.*list_agents/);
     } else {
       assert.equal(listed.status, 'unknown');
-      await assert.rejects(reopened.followup(agent.id, { replacement_model: REPLACEMENT }), /native metadata could not confirm/);
+      await assert.rejects(reopened.followup(target), /Native metadata could not confirm.*Inspect thread/);
     }
     assert.deepEqual(client.writes(), [], 'checking the recovery gate never sends the old request');
     await reopened.controller.close();
@@ -129,13 +148,13 @@ test('a lost recovery reply only consumes the gate when native metadata confirms
 
 test('replacement cannot change a healthy running, idle, or unregistered thread', async t => {
   const { client, spawn, followup, agents } = await setup(t);
-  await assert.rejects(followup(LINK, { replacement_model: REPLACEMENT }));
+  await assert.rejects(followup(LINK, { replacement_model: REPLACEMENT }), /no registered model recovery.*native Codex thread link/);
   assert.deepEqual(client.writes(), []);
   assert.deepEqual(await agents(), []);
 
   const agent = await spawn();
   client.calls.length = 0;
-  await assert.rejects(followup(agent.id, { replacement_model: REPLACEMENT }));
+  await assert.rejects(followup(agent.id, { replacement_model: REPLACEMENT }), /no pending model recovery.*continue with its current model/);
   assert.deepEqual(client.writes(), [], 'a rejected replacement must not steer a running turn');
   assert.equal((await followup(agent.id)).turn_id, agent.turn_id);
 
@@ -169,10 +188,12 @@ test('catalog preflight blocks a hidden model before native inference and only o
       assertGate(error, agent, 'model_not_listed');
       assert.deepEqual(new Set(error.available_models), new Set([OTHER, REPLACEMENT]));
       assert.equal(error.recommended_model, REPLACEMENT);
+      assert.match(error.message, /gpt-6-astra is absent.*No turn was started.*target.*recovery_choices.*message/);
+      assert.deepEqual(error.recovery_choices.map(choice => choice.model), error.available_models);
       return true;
     });
   }
-  await assert.rejects(followup(agent.id, { replacement_model: HIDDEN }));
+  await assert.rejects(followup(agent.id, { replacement_model: HIDDEN }), /requested replacement gpt-6.9-astra is absent.*recovery_choices/);
   assert.deepEqual(client.writes(), []);
   assert.deepEqual((await agents())[0].model_recovery, { model: OLD, reason: 'model_not_listed' });
   assert.ok(controller.eventsAfter(cursor).length <= 1, 'retrying a blocked operation must not accumulate duplicate events');
@@ -193,7 +214,8 @@ test('catalog failures block inference without authorizing replacement', async t
     assert.deepEqual(client.writes(), []);
     await assert.rejects(followup(agent.id), error => {
       assert.notEqual(error.code, 'agent_model_unavailable');
-      assert.match(error.message, /catalog|model\/list/i);
+      assert.match(error.message, /Could not verify the Codex model catalog.*No turn was started.*target set to agent ID.*once the model catalog is available/);
+      assert.doesNotMatch(error.message, /timed out|invalid page|repeated cursor/);
       return true;
     });
     assert.deepEqual(client.writes(), []);
@@ -232,12 +254,53 @@ test('a native deep link registers a recovery target when its known model is una
   assert.equal(agent.context_source, 'codex');
   assert.deepEqual(client.writes(), []);
 
-  const recovered = await followup(LINK, { replacement_model: REPLACEMENT });
+  const recovered = await followup(gated.recovery_choices[0].target);
   assert.equal(recovered.agent_id, agent.id);
   assert.equal(recovered.thread_id, THREAD);
   assert.deepEqual(client.writes().map(call => [call.method, call.params.model]), [
     ['thread/resume', REPLACEMENT], ['turn/start', REPLACEMENT],
   ]);
+});
+
+test('signed recovery choices require the same pending agent and a currently visible model', async t => {
+  const { client, spawn, followup, agents } = await setup(t);
+  const agent = await spawn();
+  client.complete(agent.turn_id);
+  client.catalog = [{ model: REPLACEMENT }, { model: OTHER }];
+  const blocked = await rejection(followup(agent.id));
+  const [{ target }] = blocked.recovery_choices;
+  const forged = target.replace(REPLACEMENT, OTHER);
+  client.calls.length = 0;
+  await assert.rejects(followup(forged), /invalid or no longer active.*find the original agent/);
+  assert.deepEqual(client.calls, []);
+
+  client.catalog = [{ model: REPLACEMENT, hidden: true }];
+  const unavailable = await rejection(followup(target));
+  assertGate(unavailable, agent, 'model_not_listed');
+  assert.match(unavailable.message, /requested replacement gpt-6.2-astra is absent.*No eligible replacement is visible.*Once the model catalog changes.*same message/);
+  assert.deepEqual(unavailable.available_models, []);
+  assert.equal(unavailable.recovery_choices, undefined);
+  assert.deepEqual((await agents())[0].model_recovery, { model: OLD, reason: 'model_not_listed' });
+  assert.deepEqual(client.writes(), []);
+});
+
+test('a live recovery target respects descendant activity, approval, and the user pause', async t => {
+  const { client, controller, followup, spawn } = await setup(t);
+  const agent = await spawn();
+  client.complete(agent.turn_id);
+  client.catalog = [{ model: REPLACEMENT }];
+  const { recovery_choices: [{ target }] } = await rejection(followup(agent.id));
+  const child = '22345678-1234-4234-8234-123456789abc';
+  client.calls.length = 0;
+  client.emit('notification', { method: 'thread/started', params: { thread: { id: child, parentThreadId: THREAD } } });
+  client.emit('notification', { method: 'turn/started', params: { threadId: child, turn: { id: 'child-turn' } } });
+  await assert.rejects(followup(target), /descendants is still active.*Wait until they are idle/);
+  await controller.serverRequest({ id: 'approval-1', method: 'item/commandExecution/requestApproval', params: { threadId: child, turnId: 'child-turn' } });
+  await assert.rejects(followup(target), /pending approval or question.*answer_agent.*pending request_id/);
+  client.emit('notification', { method: 'turn/completed', params: { threadId: child, turn: { id: 'child-turn', status: 'completed' } } });
+  await controller.dispatch('ui_interrupt', { target: agent.id });
+  await assert.rejects(followup(target), /paused by the user.*direct message in the Codex interface/);
+  assert.deepEqual(client.writes(), []);
 });
 
 test('a native resume response cannot silently replace the pinned model', async t => {
@@ -269,6 +332,7 @@ test('provider rejection can open recovery even while the target model remains l
   await assert.rejects(followup(agent.id), error => {
     assertGate(error, agent, 'provider_model_unavailable');
     assert.deepEqual(error.available_models, [REPLACEMENT]);
+    assert.match(error.message, /Codex rejected model gpt-6-astra as unavailable.*No turn was started.*recovery_choices/);
     return true;
   });
   assert.deepEqual(client.writes().map(call => [call.method, call.params.model]), [['turn/start', OLD]]);
@@ -276,6 +340,38 @@ test('provider rejection can open recovery even while the target model remains l
   client.handler = undefined;
   await assert.rejects(followup(agent.id), error => assertGate(error, agent, 'provider_model_unavailable'));
   assert.equal(client.writes().length, 1);
+});
+
+test('a rejected replacement explains the failure in results and events and offers other models', async t => {
+  const { client, controller, spawn, followup } = await setup(t);
+  const agent = await spawn();
+  client.complete(agent.turn_id);
+  client.catalog = [{ model: REPLACEMENT }, { model: OTHER }];
+  const { recovery_choices: [{ target }] } = await rejection(followup(agent.id));
+  const cursor = controller.snapshot().nextSeq - 1;
+  client.handler = method => {
+    if (method === 'turn/start') throw Object.assign(new Error('Private provider detail.'), { code: -32602, codexErrorInfo: 'modelNotFound' });
+  };
+  const refused = await rejection(followup(target));
+  assertGate(refused, agent, 'model_not_listed');
+  assert.match(refused.message, /Codex rejected replacement model gpt-6.2-astra.*No turn was started.*recovery_choices/);
+  assert.deepEqual(refused.recovery_choices.map(choice => choice.model), [OTHER]);
+  assert.equal(refused.recovery, undefined);
+  const [failed] = controller.eventsAfter(cursor);
+  assert.equal(failed.message, refused.message);
+  assert.deepEqual(failed.recovery_choices, refused.recovery_choices);
+  assert.doesNotMatch(JSON.stringify(failed), /Private provider detail/);
+
+  client.handler = undefined;
+  const recovered = await followup(refused.recovery_choices[0].target);
+  client.complete(recovered.turn_id, { codexErrorInfo: 'modelNotFound', message: 'Private provider detail.' });
+  const asyncFailure = controller.eventsAfter(cursor).at(-1);
+  assert.equal(asyncFailure.model, OTHER);
+  assert.equal(asyncFailure.model_turn_started, true);
+  assert.equal(asyncFailure.recovery_choices, undefined);
+  assert.match(asyncFailure.message, /turn failed because Codex rejected model gpt-6.4-astra-mini.*model_recovery for agent.*status is failed, interrupted, or completed.*current replacement choices/);
+  assert.doesNotMatch(JSON.stringify(asyncFailure), /Private provider detail/);
+  await assert.rejects(followup(target), /invalid or no longer active/);
 });
 
 test('an unrelated rejection leaves the pinned model in place and does not open recovery', async t => {
@@ -303,7 +399,10 @@ test('rejected replacement start preserves the gate and requires a new explicit 
   const cause = Object.assign(new Error('Request contains an unsupported input format.'), { code: -32602 });
   client.handler = method => { if (method === 'turn/start') throw cause; };
   client.calls.length = 0;
-  await assert.rejects(followup(agent.id, { replacement_model: REPLACEMENT }), /unsupported input format/);
+  const rejected = await rejection(followup(agent.id, { replacement_model: REPLACEMENT }));
+  assert.match(rejected.message, /rejected the request.*gpt-6.2-astra.*No turn was started.*Check the followup message/);
+  assert.equal(rejected.cause, cause);
+  assert.equal(rejected.code, cause.code);
   const [listed] = await agents();
   assert.equal(listed.model, OLD);
   assert.deepEqual(listed.model_recovery, { model: OLD, reason: 'model_not_listed' });
@@ -326,7 +425,9 @@ test('recovery survives reopening and an explicit replacement starts one turn on
   const agent = await first.spawn();
   first.client.complete(agent.turn_id);
   first.client.catalog = [{ model: REPLACEMENT }];
-  await assert.rejects(first.followup(agent.id), error => assertGate(error, agent, 'model_not_listed'));
+  const unavailable = await rejection(first.followup(agent.id));
+  assertGate(unavailable, agent, 'model_not_listed');
+  const [{ target }] = unavailable.recovery_choices;
   await first.controller.close();
 
   const reopened = await setup(t, { statePath });
@@ -339,10 +440,10 @@ test('recovery survives reopening and an explicit replacement starts one turn on
     enterStart();
     return new Promise(resolve => { finishStart = resolve; });
   };
-  const recovery = reopened.followup(LINK, { replacement_model: REPLACEMENT });
+  const recovery = reopened.followup(target);
   await Promise.race([startEntered, recovery]);
   try {
-    await assert.rejects(reopened.followup(agent.id, { replacement_model: REPLACEMENT }));
+    await assert.rejects(reopened.followup(target), /still active.*Wait until they are idle/);
   } finally {
     finishStart({ turn: { id: 'replacement-turn', status: 'inProgress' } });
   }
@@ -351,7 +452,7 @@ test('recovery survives reopening and an explicit replacement starts one turn on
   assert.equal(recovered.thread_id, THREAD);
   assert.equal(recovered.model, REPLACEMENT);
   assert.ok(!recovered.model_recovery);
-  await assert.rejects(reopened.followup(agent.id, { replacement_model: REPLACEMENT }));
+  await assert.rejects(reopened.followup(target), /invalid or no longer active.*list_agents/);
   assert.deepEqual(reopened.client.writes().map(call => [call.method, call.params.threadId, call.params.model]), [
     ['thread/resume', THREAD, REPLACEMENT], ['turn/start', THREAD, REPLACEMENT],
   ]);
@@ -368,6 +469,28 @@ test('recovery survives reopening and an explicit replacement starts one turn on
   ]);
   next.client.complete(continued.turn_id);
   await next.controller.close();
+});
+
+test('a pending state created before signed recovery targets can still issue a usable choice', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-model-legacy-recovery-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const statePath = path.join(dir, 'state.json');
+  const first = await setup(t, { statePath });
+  const agent = await first.spawn();
+  first.client.complete(agent.turn_id);
+  first.client.catalog = [{ model: REPLACEMENT }];
+  await rejection(first.followup(agent.id));
+  await first.controller.close();
+  const state = JSON.parse(await readFile(statePath, 'utf8'));
+  delete state.agents[0].modelRecovery.ticket;
+  await writeFile(statePath, JSON.stringify(state));
+
+  const reopened = await setup(t, { statePath });
+  reopened.client.catalog = [{ model: REPLACEMENT }];
+  const { recovery_choices: [{ target }] } = await rejection(reopened.followup(agent.id));
+  const recovered = await reopened.followup(target);
+  assert.equal(recovered.model, REPLACEMENT);
+  assert.equal(recovered.thread_id, THREAD);
 });
 
 test('direct user send preserves private model failure and uses the same actionable recovery gate', async t => {

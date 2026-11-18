@@ -15,7 +15,7 @@ const threadIdPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 // Only preserve recognized protocol diagnostics. Arbitrary remote message/data
 // may contain tool input, prompts, paths, or credentials and must stay private.
 function rpcDiagnostic(method, { message, data }) {
-  if (method === 'turn/start' || method === 'thread/resume' || method === 'thread/start') {
+  if (['turn/start', 'thread/resume', 'thread/start', 'thread/compact/start'].includes(method)) {
     const missing = data?.codexErrorInfo === 'modelNotFound'
       || data?.code === 'model_not_found' || data?.error?.code === 'model_not_found'
       || /^The model [`'"][\w.:/-]+[`'"] does not exist or you do not have access to it\.?$/i.test(message)
