@@ -84,6 +84,24 @@ test('partial adoption failures still refresh the catalog, and a UI failure cann
   assert.equal(accepted.status, 200); assert.equal(accepted.body.accepted, true);
 });
 
+test('model recovery errors retain options and distinguish confirmed rejection from an uncertain action', async t => {
+  const { post, controller } = await setup(t, { activity: { list: () => ({ agents: [{ agent_id: 'a', status: 'failed' }] }) } });
+  let calls = 0;
+  controller.dispatch = async (_, args) => {
+    calls++;
+    throw Object.assign(new Error('Model unavailable'), { code: 'agent_model_unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', model_turn_started: args.target === 'certain' ? false : true, recovery: 'Choose a replacement.' });
+  };
+  const request = target => ({ operation: 'followup_task', requestId: target, args: { target, message: 'Continue', replacement_model: 'new' }, ui_summary: true });
+  const first = (await post(request('certain'))).body;
+  assert.deepEqual(first.error, { code: 'agent_model_unavailable', message: 'Model unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', recovery: 'Choose a replacement.', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', model_turn_started: false });
+  assert.equal(first.ui_summary.agents[0].status, 'failed');
+  assert.deepEqual((await post(request('certain'))).body.error, first.error);
+  assert.equal(calls, 1);
+  assert.equal((await post(request('uncertain'))).body.error.model_turn_started, true);
+  assert.equal((await post(request('uncertain'))).body.error.code, 'ambiguous_action');
+  assert.equal(calls, 2);
+});
+
 test('direct user controls use durable receipts without acknowledging Claude events', async t => {
   const { post, controller } = await setup(t);
   controller.publish();
@@ -361,15 +379,19 @@ test('shutdown releases local waiters but drains accepted disconnected mutations
   const { post, controller, server } = await setup(t, { waitTimeoutMs: 10000 });
   let release, entered;
   const started = new Promise(resolve => { entered = resolve; });
+  const waitRegistered = Promise.withResolvers();
   controller.dispatch = async op => {
-    if (op === 'list_agents') return { agents: [{ agent_id: 'a', status: 'running' }] };
+    if (op === 'list_agents') {
+      waitRegistered.resolve();
+      return { agents: [{ agent_id: 'a', status: 'running' }] };
+    }
     entered(); await new Promise(resolve => { release = resolve; }); return { accepted: true };
   };
   const abort = new AbortController();
   const action = post({ operation: 'send_message', requestId: 'slow', args: {} }, { signal: abort.signal }).catch(() => {});
   await started;
   const waiting = post({ operation: 'wait' });
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitRegistered.promise;
   abort.abort(); server.close();
   assert.equal((await waiting).body.cancelled, true);
   let drained = false;

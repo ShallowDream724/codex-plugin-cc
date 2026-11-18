@@ -29,7 +29,8 @@ class Client extends EventEmitter {
     if (this.handler) { const response = this.handler(method, params); if (response !== undefined) return response; }
     if (method === 'thread/start') return { thread: { id: `thread-${++this.n}` } };
     if (method === 'turn/start') return { turn: { id: `turn-${this.n}`, status: 'inProgress' } };
-    if (method === 'thread/read' || method === 'thread/resume') return { thread: { id: params.threadId, cwd: '/native', status: { type: 'idle' } } };
+    if (method === 'model/list') return { data: [{ model: 'gpt-6-luna' }], nextCursor: null };
+    if (method === 'thread/read' || method === 'thread/resume') return { thread: { id: params.threadId, cwd: '/native', status: { type: 'idle' } }, model: params.model };
     return {};
   }
   async reject() {} async respond(id, result) { this.lastReply = { id, result }; }
@@ -184,14 +185,15 @@ test('root actions emit lifecycle events without descendant traces', async t => 
 
 test('start and resume expose valid native model metadata', async t => {
   const { client, c, spawn } = await setup(t);
-  client.handler = method => {
+  client.handler = (method, params) => {
     if (method === 'thread/start') return { thread: { id: 'metadata-thread' }, model: 'resolved-model', reasoningEffort: 'high' };
-    if (method === 'thread/resume') return { thread: { status: { type: 'idle' } }, model: 'resumed-model', reasoningEffort: null };
+    if (method === 'model/list') return { data: [{ model: 'resolved-model' }], nextCursor: null };
+    if (method === 'thread/resume') return { thread: { status: { type: 'idle' } }, model: params.model, reasoningEffort: null };
   };
   const a = await spawn(); assert.equal(a.model, 'resolved-model'); assert.equal(a.reasoning_effort, 'high');
   client.finish(a); c.find(a.id).loaded = false;
   const resumed = await c.dispatch('followup_task', { target: a.id, message: 'continue' });
-  assert.equal(resumed.model, 'resumed-model'); assert.equal(resumed.reasoning_effort, 'high');
+  assert.equal(resumed.model, 'resolved-model'); assert.equal(resumed.reasoning_effort, 'high');
 });
 
 test('permission modes and default role use explicit protocol settings', async t => {

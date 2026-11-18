@@ -7,6 +7,7 @@ import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 import { prepareAttachments, directUserInput } from './attachments.mjs';
 import { AUTOMATIC_TURN_EVENTS, isCompactionStatus, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
+import { modelRecoveryDetails, modelRecoveryError, pendingModelRecovery, providerModelUnavailable, readVisibleModels, replacementEffort } from './model-recovery.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
 const STARTED_TURN_ID = Symbol('startedTurnId');
@@ -41,6 +42,7 @@ export class AgentController extends EventEmitter {
     this.adoptions = new Map();
     this.reservations = new Set();
     this.agents = new Map();
+    this.modelCatalogRequests = new Map();
     this.threads = new Map();
     this.descendants = new Map();
     this.unlinkedThreads = new Map();
@@ -91,7 +93,7 @@ export class AgentController extends EventEmitter {
       if (a.userPaused && a.threadId) this.pausedThreads.add(a.threadId);
       this.agents.set(a.id, a);
       if (a.threadId) this.threads.set(a.threadId, a);
-      if (ACTIVE.has(a.status) || a.turnId) {
+      if (ACTIVE.has(a.status) || a.turnId || a.replacementAttempt) {
         a.status = 'unknown'; a.turnId = null; a.activity = 'stale_pending';
         this.publish(a, 'unknown', { reason: 'controller_restarted', stale_pending: true });
       }
@@ -119,6 +121,7 @@ export class AgentController extends EventEmitter {
       model: a.model, reasoning_effort: a.effort, status: a.status, activity: a.activity,
       turn_id: a.turnId, error: a.turnOrigin === 'user' && !metrics ? null : a.error ?? null,
       turn_origin: a.turnOrigin ?? 'parent',
+      ...(a.modelRecovery ? { model_recovery: copy(a.modelRecovery) } : {}),
       context_source: a.contextSource ?? 'unknown',
       user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null,
       pending_requests: a.pending.map(({ id, method, params }) => ({ method, ...copy(params), request_id: id,
@@ -165,8 +168,8 @@ export class AgentController extends EventEmitter {
       case 'spawn_agent': return this.spawn(args);
       case 'list_agents': return { agents: [...this.agents.values()].map((a) => this.view(a)) };
       case 'list_models': return this.models();
-      case 'send_message': return this.send(this.find(args.target), args.message, false);
-      case 'followup_task': return this.followup(args.target, args.message);
+      case 'send_message': return this.send(this.find(args.target), args.message);
+      case 'followup_task': return this.followup(args.target, args.message, args.replacement_model);
       case 'interrupt_agent': return this.interrupt(this.find(args.target));
       case 'ui_interrupt': return this.uiInterrupt(this.find(args.target));
       case 'ui_interrupt_all': return this.uiInterruptAll();
@@ -184,8 +187,16 @@ export class AgentController extends EventEmitter {
     return matches[0];
   }
 
-  occupies(a) {
-    return ACTIVE.has(a.status) || a.status === 'unknown' || !!a.turnId || !!a.pending.length || a.spawning || a.resuming || a.startingTurn || a.recovery || [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id));
+  occupies(a, { allowResume = false } = {}) {
+    return ACTIVE.has(a.status) || a.status === 'unknown' || !!a.turnId || !!a.pending.length || a.spawning || a.resuming && !allowResume || a.startingTurn || a.recovery || this.hasActiveDescendant(a);
+  }
+
+  hasActiveDescendant(a) {
+    return [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id));
+  }
+
+  requireIdleReplacement(a, options) {
+    if (this.occupies(a, options) || a.sending || a.stopPromise) throw new Error('The agent and its descendants must be idle before replacing its unavailable model.');
   }
 
   reserve(key, a) {
@@ -201,18 +212,86 @@ export class AgentController extends EventEmitter {
     this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: turnId, name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }), ...(attachments?.length ? { attachments: copy(attachments) } : {}) });
   }
 
-  updateResolved(a, response) {
+  updateResolved(a, response, { keepModel = false } = {}) {
     const model = response?.model ?? response?.thread?.model;
+    const provider = response?.modelProvider ?? response?.thread?.modelProvider;
     const effort = response?.reasoningEffort ?? response?.thread?.reasoningEffort;
     const threadName = response?.thread?.name;
-    if (nonempty(model)) a.model = model;
-    if (nonempty(effort)) a.effort = effort;
+    const matchesModel = !keepModel || !nonempty(a.model) || !nonempty(model) || model === a.model;
+    if (nonempty(model) && (!keepModel || !nonempty(a.model))) a.model = model;
+    if (nonempty(provider) && (!keepModel || !nonempty(a.modelProvider))) a.modelProvider = provider;
+    if (nonempty(effort) && matchesModel) a.effort = effort;
     if (nonempty(threadName)) a.threadName = threadName;
   }
 
   async rpc(method, params) {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
     return Promise.race([this.client.request(method, params, { timeoutMs: 120000 }), this.closedPromise.then(() => { throw new Error('App-server connection closed.'); })]);
+  }
+
+  visibleModels(provider) {
+    const key = provider ?? '';
+    if (!this.modelCatalogRequests.has(key)) {
+      const request = readVisibleModels((method, params) => this.rpc(method, params), provider);
+      this.modelCatalogRequests.set(key, request);
+      const clear = () => this.modelCatalogRequests.delete(key);
+      request.then(clear, clear);
+    }
+    return this.modelCatalogRequests.get(key);
+  }
+
+  async prepareTurnModel(a, replacementModel) {
+    if (!nonempty(a.model)) return { effort: a.effort };
+    let catalog;
+    try { catalog = await this.visibleModels(a.modelProvider); }
+    catch (cause) {
+      throw Object.assign(new Error(`Could not verify the current Codex model catalog for thread ${a.threadId}: ${cause.message} Retry after the catalog is available.`, { cause }),
+        { code: 'model_catalog_unavailable', agent_id: a.id, thread_id: a.threadId, model: a.model, model_turn_started: false });
+    }
+    if (replacementModel !== undefined) {
+      if (a.modelRecovery.reason === 'model_not_listed' && catalog.has(a.model)) {
+        a.modelRecovery = null;
+        await this.persist();
+        throw new Error(`Model ${a.model} is visible again. Continue this same agent without replacement_model to preserve continuity and avoid additional cache costs.`);
+      }
+      if (replacementModel === a.modelRecovery.model || !catalog.has(replacementModel)) {
+        const error = modelRecoveryError(a, catalog, false);
+        error.message = `Select a different replacement_model from the currently visible Codex models. ${error.recovery}`;
+        throw error;
+      }
+      return { model: replacementModel, effort: replacementEffort(catalog.get(replacementModel), a.effort), catalog, replacement: true };
+    }
+    if (!catalog.has(a.model) && !a.modelRecovery) {
+      a.modelRecovery = pendingModelRecovery(a.model, 'model_not_listed');
+      await this.persist();
+    }
+    if (a.modelRecovery && (a.modelRecovery.reason === 'provider_model_unavailable' || !catalog.has(a.model))) {
+      throw modelRecoveryError(a, catalog, false);
+    }
+    return { model: a.model, effort: a.effort, catalog };
+  }
+
+  acceptTurnModel(a, plan) {
+    if (plan.replacement) { a.model = plan.model; a.effort = plan.effort; }
+    a.replacementAttempt = null;
+    if (plan.model) a.modelRecovery = null;
+  }
+
+  requireModelRecovery(a) {
+    if (a.modelRecovery?.model !== a.model || !a.modelRecovery || !a.threadId) {
+      throw new Error('This registered agent has no pending model recovery or confirmed model availability failure. Continue with its current model to preserve continuity and avoid additional cache costs.');
+    }
+  }
+
+  async latestNativeTurn(a) {
+    const page = await this.rpc('thread/turns/list', { threadId: a.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+    if (!Array.isArray(page?.data) || page.data.length && !nonempty(page.data[0]?.id)) throw new Error('Native Codex returned an invalid latest turn.');
+    return page.data[0];
+  }
+
+  noteUnavailableModel(a, plan, modelTurnStarted) {
+    if (!plan.replacement) a.modelRecovery = pendingModelRecovery(plan.model, 'provider_model_unavailable');
+    return modelRecoveryError(a, plan.catalog, modelTurnStarted, plan.replacement ? plan.model : undefined);
   }
 
   async spawn({ message, cwd, model, reasoning_effort, name, context_mode, snapshot, role }) {
@@ -258,11 +337,12 @@ export class AgentController extends EventEmitter {
         a.injected = true;
       }
       const collaboration = role === 'default' ? 'Claude is your parent agent.\n\n' : `${this.guidance.collaboration.trim()}\n\n`;
-      if (!a.interrupted) spawnTurnId = await this.startTurn(a, collaboration + roleInstructions + message, true);
+      if (!a.interrupted) spawnTurnId = await this.startTurn(a, collaboration + roleInstructions + message, { newTask: true });
       return { ...this.view(a), context_snapshot: a.snapshot ? { ...copy(a.snapshot), ...(Object.hasOwn(snapshot, 'preview') ? { preview: copy(snapshot.preview) } : {}) } : null };
     } catch (error) {
       spawnTurnId = error[STARTED_TURN_ID] ?? null;
       if (ACTIVE.has(a.status) && !a.turnId) this.finish(a, this.closing ? 'interrupted' : 'failed', { message: error.message });
+      if (error.code === 'agent_model_unavailable') throw error;
       const recovery = a.threadId ? `Inspect or continue agent ${a.id} on native thread ${a.threadId}; do not create replacement work until its state is known.` : `Agent ${a.id} has no confirmed native thread; inspect its status or close it before retrying.`;
       throw Object.assign(new Error(`Agent ${a.id}${a.threadId ? ` (thread ${a.threadId})` : ''}: ${error.message} ${recovery}`, { cause: error }), { agent_id: a.id, thread_id: a.threadId ?? null, status: a.status, recovery });
     } finally {
@@ -287,7 +367,7 @@ export class AgentController extends EventEmitter {
     for (const entry of matching) entry.request ? this.onRequest(entry.message) : this.observe(entry.message);
   }
 
-  async startTurn(a, text, newTask = false, origin = 'parent') {
+  async startTurn(a, text, { newTask = false, origin = 'parent', plan = { model: a.model, effort: a.effort } } = {}) {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
     if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
     const previousTaskTurns = newTask ? new Set(a.completedTurns) : null;
@@ -295,30 +375,54 @@ export class AgentController extends EventEmitter {
     a.compactItems.clear();
     a.result = null;
     a.unclassifiedResult = null;
+    a.lastError = null;
+    a.modelUnavailableTurnId = null;
     a.status = a.pending.length ? 'waiting' : 'running'; a.activity = a.pending.length ? 'waiting for parent' : 'working'; a.turnId = null; a.overflow = false;
     a.startingTurn = true;
     a.startEvents = [];
+    if (plan.replacement) a.replacementAttempt = { model: plan.model, effort: plan.effort, priorTurnId: plan.priorTurnId };
     let response, boundTurnId = null;
     try {
       // Record the recipient before native work can emit a result or survive a
       // controller restart. The same native thread/history remains in use.
       await this.persist();
+      if (a.userPaused || a.interrupted) {
+        a.replacementAttempt = null;
+        this.finish(a, 'interrupted', { reason: 'interrupt' });
+        throw new Error('The agent was stopped before the message could be sent.');
+      }
+      if (plan.replacement && this.hasActiveDescendant(a)) {
+        a.replacementAttempt = null;
+        this.finish(a, 'failed', { message: 'An agent descendant became active before model recovery could start.' });
+        throw new Error('An agent descendant became active before model recovery could start.');
+      }
       response = await this.rpc('turn/start', { threadId: a.threadId, input: Array.isArray(text) ? text : input(text),
-        ...(a.effort ? { effort: a.effort } : {}), serviceTierForTurn: 'default' });
+        ...(plan.model ? { model: plan.model } : {}), ...(plan.effort ? { effort: plan.effort } : {}), serviceTierForTurn: 'default' });
       if (!nonempty(response?.turn?.id)) throw new Error('turn/start returned no turn id; start outcome is unknown.');
       boundTurnId = response.turn.id;
+      this.acceptTurnModel(a, plan);
       a.startingTurn = false;
       await this.replayTurnStart(a, response.turn.id);
+      if (response.turn.status === 'failed' && providerModelUnavailable(response.turn.error)) this.turnCompleted(a, response.turn);
     } catch (error) {
       a.startingTurn = false;
       // On a lost reply, a single observed start is the best available identity.
       // On success, the response above is authoritative and discards late traffic
       // from older tasks, without retaining every historical turn ID forever.
       const observed = [...new Set((a.startEvents ?? []).filter((entry) => !entry.request && entry.message.method === 'turn/started')
-        .map((entry) => entry.message.params.turn.id).filter((id) => !a.completedTurns.has(id)))];
+        .map((entry) => entry.message.params.turn.id).filter((id) => id !== plan.priorTurnId && !a.completedTurns.has(id)))];
       boundTurnId ??= observed.length === 1 ? observed[0] : null;
-      if (Object.isExtensible(error)) error[STARTED_TURN_ID] = boundTurnId;
+      if (boundTurnId && a.startEvents) this.acceptTurnModel(a, plan);
       await this.replayTurnStart(a, boundTurnId);
+      if (!boundTurnId && plan.model && providerModelUnavailable(error)) {
+        a.replacementAttempt = null;
+        const unavailable = this.noteUnavailableModel(a, plan, false);
+        this.finish(a, 'failed', modelRecoveryDetails(a, plan.catalog, false, plan.replacement ? plan.model : undefined));
+        await this.persist();
+        throw unavailable;
+      }
+      if (Object.isExtensible(error)) error[STARTED_TURN_ID] = boundTurnId;
+      if (!boundTurnId && Number.isInteger(error.code)) a.replacementAttempt = null;
       // A transport failure says nothing about whether the server started work.
       // An observed turn remains authoritative even if its RPC reply was lost.
       if (!a.turnId && !a.terminalEmitted) this.finish(a, Number.isInteger(error.code) ? 'failed' : 'unknown',
@@ -343,6 +447,11 @@ export class AgentController extends EventEmitter {
     if (previousTaskTurns) for (const id of previousTaskTurns) a.completedTurns.delete(id);
     if (a.interrupted && a.turnId) await this.requestTreeInterrupt(a, a.threadId, a.turnId);
     await this.persist();
+    if (a.lastTurnId === turn.id && a.error?.code === 'agent_model_unavailable' && a.modelRecovery) {
+      const error = modelRecoveryError(a, plan.catalog, true);
+      error[STARTED_TURN_ID] = turn.id;
+      throw error;
+    }
     return response.turn.id;
   }
 
@@ -372,16 +481,41 @@ export class AgentController extends EventEmitter {
         const response = await this.rpc('thread/read', { threadId: a.threadId, includeTurns: false });
         if (a.status !== 'unknown') return;
         let status = response?.thread?.status?.type;
+        let model = response?.thread?.model;
         if (status === 'active' && !a.loaded) {
           const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
-          this.updateResolved(a, response);
+          this.updateResolved(a, response, { keepModel: true });
+          model = response?.model ?? response?.thread?.model ?? model;
           resumed = true; a.loaded = true;
           if (a.status !== 'unknown') return { resumed };
           // The thread may finish while its subscription is being restored.
           // Use the resume response before deciding whether to bind a live turn.
           status = response?.thread?.status?.type;
         }
-        if (['idle', 'notLoaded'].includes(status)) {
+        const idle = ['idle', 'notLoaded'].includes(status);
+        const turn = status === 'active' || idle && a.replacementAttempt ? await this.latestNativeTurn(a) : undefined;
+        if (a.status !== 'unknown') return { resumed };
+        if (a.replacementAttempt && (status === 'active' || idle)) {
+          const attempt = a.replacementAttempt;
+          if (idle && (turn?.id ?? null) === attempt.priorTurnId) {
+            a.replacementAttempt = null;
+          } else if (nonempty(turn?.id) && turn.id !== attempt.priorTurnId && model === attempt.model && (idle ? ['completed', 'failed', 'interrupted'].includes(turn.status) : turn.status === 'inProgress')) {
+            this.acceptTurnModel(a, { ...attempt, replacement: true });
+            a.lastTurnId = turn.id;
+            if (idle && turn.status === 'failed' && providerModelUnavailable(turn.error)) {
+              a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
+              a.terminalEmitted = false;
+              this.finish(a, 'failed', modelRecoveryDetails(a, null, true));
+              await this.persist();
+              return { resumed };
+            }
+          } else {
+            a.error = { ...a.error, reconciliation_status: 'native metadata could not confirm the attempted model replacement' };
+            await this.persist();
+            return { resumed };
+          }
+        }
+        if (idle) {
           if (status === 'notLoaded') a.loaded = false;
           a.status = 'interrupted'; a.activity = 'outcome_reconciled'; a.turnId = null;
           a.error = null; a.terminalEmitted = true; a.interrupted = true;
@@ -389,9 +523,6 @@ export class AgentController extends EventEmitter {
         } else if (status === 'active') {
           // Read a single turn with no item history. An active thread alone is
           // insufficient to infer which turn may safely be steered/interrupted.
-          const page = await this.rpc('thread/turns/list', { threadId: a.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
-          if (a.status !== 'unknown') return { resumed };
-          const turn = page?.data?.[0];
           if (nonempty(turn?.id) && turn.status === 'inProgress') {
             a.turnId = turn.id; a.lastTurnId = turn.id; a.status = a.pending.length ? 'waiting' : 'running';
             a.activity = a.pending.length ? 'waiting for parent' : 'working'; a.error = null; a.terminalEmitted = false;
@@ -413,8 +544,9 @@ export class AgentController extends EventEmitter {
     return new Error(`Previous turn/start outcome is unknown; native metadata could not confirm a safe operation (${a.error?.reconciliation_error ?? a.error?.reconciliation_status ?? 'unconfirmed thread'}). Inspect thread ${a.threadId} in Codex before retrying.`);
   }
 
-  async followup(target, message) {
+  async followup(target, message, replacementModel) {
     if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (replacementModel !== undefined && !nonempty(replacementModel)) throw new TypeError('replacement_model must be nonempty.');
     const threadLink = typeof target === 'string' && target.startsWith('codex://threads/');
     let id = threadLink ? target.slice('codex://threads/'.length) : target;
     if (typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) id = id.toLowerCase();
@@ -422,7 +554,8 @@ export class AgentController extends EventEmitter {
     if (matches.length > 1) throw new Error('Ambiguous agent target. Use an agent ID.');
     const existing = matches[0];
     if (this.adoptions.has(existing?.threadId ?? id)) throw new Error(`Thread ${existing?.threadId ?? id} is already being adopted; retry using the registered agent after it completes.`);
-    if (existing) return this.send(existing, message, true);
+    if (existing) return this.send(existing, message, { followup: true, replacementModel });
+    if (replacementModel !== undefined) throw new Error('replacement_model requires a registered agent with a pending model recovery.');
     if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
     if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Unknown agent target; native thread IDs must be UUIDs.');
     const reservation = Symbol('adopt'); this.reserve(reservation);
@@ -452,18 +585,19 @@ export class AgentController extends EventEmitter {
       try {
         await this.persist();
         if (a.userPaused) throw new Error(`Agent ${a.id} remains paused by the user. Resume it with a direct user message in the interface.`);
-        const result = await this.send(a, message, true, reservation);
+        const result = await this.send(a, message, { followup: true, existingReservation: reservation });
         return { ...result, client_tools_unavailable: clientTools, limitations: ['Original client dynamic tools are unavailable here. Continue in the original Codex client if those tools are needed.'] };
       } catch (error) {
+        if (['agent_model_unavailable', 'model_catalog_unavailable'].includes(error.code)) throw error;
         throw new Error(`Thread ${id} is registered as agent ${a.id}. ${error.message} Inspect the thread in Codex or retry using this agent ID; do not create replacement work.`, { cause: error });
       }
     } catch (error) {
-      if (error.cause) throw error;
+      if (error.cause || error.code === 'agent_model_unavailable') throw error;
       throw new Error(`Could not adopt native thread ${id}: ${error.message} Inspect the thread in Codex and retry when its state is confirmed.`, { cause: error });
     } finally { const a = this.threads.get(id); if (a) a.adopting = false; this.reservations.delete(reservation); this.adoptions.delete(id); }
   }
 
-  async send(a, message, followup, existingReservation, origin, resumeToken, attachments = []) {
+  async send(a, message, { followup = false, existingReservation, origin, resumeToken, attachments = [], replacementModel } = {}) {
     if (!nonempty(message) && !(origin === 'user' && attachments.length)) throw new TypeError('message must be nonempty.');
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
     if (a.userPaused) throw new Error('Agent is paused by the user. Only a user message can resume it.');
@@ -471,12 +605,15 @@ export class AgentController extends EventEmitter {
     const wireInput = origin === 'user' ? directUserInput(message, attachments) : input(message);
     if (a.adopting && !existingReservation) throw new Error(`Thread ${a.threadId} is being adopted.`);
     if (a.externalConflict) throw new Error(`Thread ${a.threadId} became active in another client. Close this agent and retry adoption once the native thread is idle.`);
+    if (replacementModel !== undefined) this.requireModelRecovery(a);
     await this.reconcileUnknown(a);
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
     if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
     if (a.status === 'unknown') throw this.unknownError(a);
+    if (replacementModel !== undefined) this.requireModelRecovery(a);
     if (a.removing) throw new Error('Agent is closing.');
     if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; use answer_agent with its pending request_id.');
+    if (replacementModel !== undefined) this.requireIdleReplacement(a);
     if (ACTIVE.has(a.status)) {
       if (!a.turnId || a.status === 'compacting') throw new Error('Agent turn is not steerable yet.');
       const turnId = a.turnId, turnOrigin = a.turnOrigin;
@@ -504,19 +641,53 @@ export class AgentController extends EventEmitter {
     a.resuming = true;
     this.reservations.delete(reservation);
     try {
+      let plan = followup ? await this.prepareTurnModel(a, replacementModel) : { model: a.model };
+      const wasLoaded = a.loaded;
+      if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
+      if (plan.replacement) this.requireIdleReplacement(a, { allowResume: true });
       // A completed turn keeps this connection's native thread loaded. Resume
       // only after a restart/unload; repeated followups use the same writer.
       if (!a.loaded) {
-        const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
-        this.updateResolved(a, response);
-        if (a.externalAdopted && !a.loaded && !['idle', 'notLoaded'].includes(response?.thread?.status?.type)) {
-          a.externalConflict = true;
+        let response;
+        try {
+          response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings),
+            ...(plan.model ? { model: plan.model } : {}), ...(a.modelProvider ? { modelProvider: a.modelProvider } : {}), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+        } catch (error) {
+          if (!followup || !plan.model || !providerModelUnavailable(error)) throw error;
+          const unavailable = this.noteUnavailableModel(a, plan, false);
+          await this.persist();
+          throw unavailable;
+        }
+        if (nonempty(response?.thread?.id) && response.thread.id !== a.threadId) throw new Error(`Native Codex returned a different thread during resume of ${a.threadId}; no task was sent.`);
+        if ((a.externalAdopted || replacementModel !== undefined) && !['idle', 'notLoaded'].includes(response?.thread?.status?.type)) {
+          if (a.externalAdopted) a.externalConflict = true;
           throw new Error(`Native thread ${a.threadId} became active or unconfirmed during resume; no task was sent.`);
+        }
+        a.loaded = true;
+        const resumedModel = response?.model ?? response?.thread?.model;
+        const resumedProvider = response?.modelProvider ?? response?.thread?.modelProvider;
+        if (followup && plan.model && nonempty(resumedModel) && resumedModel !== plan.model) {
+          throw new Error(`Native Codex resumed thread ${a.threadId} with model ${resumedModel} instead of ${plan.model}; no task was sent.`);
+        }
+        if (followup && a.modelProvider && nonempty(resumedProvider) && resumedProvider !== a.modelProvider) {
+          a.loaded = false;
+          throw new Error(`Native Codex resumed thread ${a.threadId} with a different model provider; no task was sent.`);
+        }
+        if (!plan.replacement) {
+          this.updateResolved(a, response, { keepModel: true });
+          if (followup && !plan.model && a.model) plan = await this.prepareTurnModel(a);
+          else if (followup) plan.effort = a.effort;
         }
       }
       a.loaded = true;
       a.externalAdopted = false;
+      if (plan.replacement) {
+        const priorTurn = wasLoaded && !a.externalThread ? null : await this.latestNativeTurn(a);
+        if (priorTurn?.status === 'inProgress') throw new Error(`Native thread ${a.threadId} is active; no model replacement task was sent.`);
+        plan.priorTurnId = priorTurn?.id ?? (wasLoaded && !a.externalThread ? a.lastTurnId : null) ?? null;
+      }
       if (a.userPaused || (a.controlEpoch ?? 0) !== epoch) throw new Error('Agent was paused by the user before the message could be sent.');
+      if (plan.replacement) this.requireIdleReplacement(a, { allowResume: true });
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
           items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
@@ -524,7 +695,7 @@ export class AgentController extends EventEmitter {
         await this.persist();
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
-      await this.startTurn(a, wireInput, true, origin === 'user' ? 'user' : 'parent');
+      await this.startTurn(a, wireInput, { newTask: true, origin: origin === 'user' ? 'user' : 'parent', plan });
       this.action('send', a, message, origin, attachments);
       await this.persist();
       return this.view(a);
@@ -600,7 +771,7 @@ export class AgentController extends EventEmitter {
   async restoreSubscription(a) {
     try {
       const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
-      this.updateResolved(a, response);
+      this.updateResolved(a, response, { keepModel: true });
       a.loaded = true;
       if (response?.thread?.status?.type !== 'idle') {
         a.status = 'unknown'; a.activity = 'subscription restored; native status unconfirmed';
@@ -689,12 +860,12 @@ export class AgentController extends EventEmitter {
       if (!nonempty(message) && !files.length) throw new TypeError('A message or attachment is required.');
       if (a.pending.length || a.status === 'waiting') throw new Error('Agent is waiting for a response; answer the pending request first.');
       if (a.userPaused && (this.treeBusy(a) || a.stopPromise)) throw new Error('Interruption is not yet confirmed; retry after all agent work stops.');
-      if (!ACTIVE.has(a.status) && [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id))) throw new Error('Agent has an active descendant; wait for it to finish before resuming.');
+      if (!ACTIVE.has(a.status) && this.hasActiveDescendant(a)) throw new Error('Agent has an active descendant; wait for it to finish before resuming.');
       const wasPaused = !!a.userPaused;
       try {
         a.userPaused = false; a.userControlStatus = null;
         if (wasPaused) await this.persist();
-        const result = await this.send(a, message, true, undefined, 'user', resumeToken, files);
+        const result = await this.send(a, message, { followup: true, origin: 'user', resumeToken, attachments: files });
         if (wasPaused && !a.userPaused && a.threadId) this.pausedThreads.delete(a.threadId);
         await this.persist();
         return { ...result, delivery: result.status === 'steered' ? 'steered' : 'started', user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
@@ -713,7 +884,7 @@ export class AgentController extends EventEmitter {
   }
 
   treeBusy(a) {
-    return a.status === 'unknown' || ACTIVE.has(a.status) || !!a.turnId || !!a.startingTurn || !!a.spawning || !!a.resuming || !!a.sending || !!a.recovery || [...this.descendants].some(([id, root]) => root === a && this.descendantTurns.has(id));
+    return a.status === 'unknown' || ACTIVE.has(a.status) || !!a.turnId || !!a.startingTurn || !!a.spawning || !!a.resuming || !!a.sending || !!a.recovery || this.hasActiveDescendant(a);
   }
 
   async reconcileDescendants(a) {
@@ -856,6 +1027,10 @@ export class AgentController extends EventEmitter {
       a.startEvents.push({ message: buffered });
       return;
     }
+    if (a.status === 'unknown' && a.replacementAttempt && ['turn/started', 'turn/completed'].includes(message.method)) {
+      this.reconcileUnknown(a).catch(() => {});
+      return;
+    }
     switch (message.method) {
       case 'turn/started':
         if (a.completedTurns.has(p.turn.id)) return;
@@ -879,6 +1054,7 @@ export class AgentController extends EventEmitter {
       case 'error':
         if (a.terminalEmitted || (p.turnId && (a.completedTurns.has(p.turnId) || a.turnId && a.turnId !== p.turnId))) return;
         if (isOverflow(p.error)) a.overflow = true;
+        if (p.willRetry === false && p.turnId && providerModelUnavailable(p.error)) a.modelUnavailableTurnId = p.turnId;
         a.lastError = p.error ? { message: p.error.message, codexErrorInfo: p.error.codexErrorInfo } : null;
         break;
       case 'item/started': case 'item/completed': {
@@ -935,28 +1111,56 @@ export class AgentController extends EventEmitter {
     a.pending = a.pending.filter((request) => request.params.threadId !== a.threadId || request.params.turnId !== turn.id);
     this.pruneRequestEvents(a);
     if (this.closing || a.interrupted || turn.status === 'interrupted') { a.recovery = null; this.finish(a, 'interrupted', {}); return; }
+    if (turn.status === 'failed' && nonempty(a.model) && (providerModelUnavailable(turn.error) || !turn.error?.codexErrorInfo && a.modelUnavailableTurnId === turn.id)) {
+      a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
+      this.finish(a, 'failed', modelRecoveryDetails(a, null, true));
+      return;
+    }
     if (a.recovery) {
       if (turn.status !== 'completed' || !a.recovery.compacted) {
         a.recovery = null;
         this.finish(a, 'failed', { message: turn.error?.message ?? 'Context compaction did not complete.' });
       } else {
         a.recovery = null;
-        // startTurn already records this agent's failed/unknown outcome. A
-        // rejected continuation must not terminate unrelated agents or helper.
-        this.startTurn(a, CONTINUE).catch(() => {});
+        this.continueAfterCompaction(a).catch(() => {});
       }
       return;
     }
     if (turn.status === 'failed' && (a.overflow || isOverflow(turn.error)) && !a.recoveryUsed) {
       a.recoveryUsed = true; a.overflow = true; a.recovery = { compacted: false }; a.status = 'compacting';
       a.activity = 'compacting context';
-      this.rpc('thread/compact/start', { threadId: a.threadId }).catch((error) => {
-        if (a.recovery && !a.interrupted && !this.closing) { a.recovery = null; this.finish(a, 'failed', { message: `Context compaction failed: ${error.message}` }); }
-      });
+      this.startCompaction(a).catch(() => {});
       return;
     }
     if (turn.status === 'completed') { a.result ??= a.unclassifiedResult ?? ''; this.finish(a, 'completed', { result: a.result }); }
     else this.finish(a, 'failed', { message: turn.error?.message ?? a.lastError?.message ?? 'Codex turn failed.', codexErrorInfo: turn.error?.codexErrorInfo ?? a.lastError?.codexErrorInfo });
+  }
+
+  async startCompaction(a) {
+    try {
+      if (nonempty(a.model)) await this.prepareTurnModel(a);
+      if (a.recovery && !a.interrupted && !this.closing) await this.rpc('thread/compact/start', { threadId: a.threadId });
+    } catch (error) {
+      if (!a.recovery || a.interrupted || this.closing) return;
+      if (nonempty(a.model) && providerModelUnavailable(error)) {
+        a.modelRecovery = pendingModelRecovery(a.model, 'provider_model_unavailable');
+        this.finish(a, 'failed', modelRecoveryDetails(a, null, true));
+      } else this.finishCompactionError(a, error);
+    }
+  }
+
+  async continueAfterCompaction(a) {
+    try {
+      const plan = nonempty(a.model) ? await this.prepareTurnModel(a) : { effort: a.effort };
+      if (!a.interrupted && !this.closing && a.status === 'compacting') await this.startTurn(a, CONTINUE, { plan });
+    } catch (error) {
+      if (a.status === 'compacting' && !a.interrupted && !this.closing) this.finishCompactionError(a, error);
+    }
+  }
+
+  finishCompactionError(a, error) {
+    const details = error.code === 'agent_model_unavailable' ? { ...error, message: error.message, model_turn_started: true } : { message: `Context compaction failed: ${error.message}` };
+    this.finish(a, 'failed', details);
   }
 
   finish(a, kind, details) {
@@ -1052,20 +1256,10 @@ export class AgentController extends EventEmitter {
   }
 
   async models() {
-    const models = [], seen = new Set(); let cursor;
-    do {
-      const page = await this.rpc('model/list', { ...(cursor ? { cursor } : {}) });
-      for (const model of page.data ?? []) {
-        const id = model.model || model.id;
-        models.push({ id, name: model.displayName, description: model.description, default: model.isDefault,
+    const catalog = await this.visibleModels();
+    return { models: [...catalog].map(([id, model]) => ({ id, name: model.displayName, description: model.description, default: model.isDefault,
           efforts: (model.supportedReasoningEfforts ?? []).map((effort) => effort.reasoningEffort), default_effort: model.defaultReasoningEffort,
-          ...(this.guidance.models?.[id]?.selection_note ? { selection_note: this.guidance.models[id].selection_note } : {}) });
-      }
-      cursor = page.nextCursor;
-      if (cursor && seen.has(cursor)) throw new Error('model/list returned a repeated cursor.');
-      seen.add(cursor);
-    } while (cursor);
-    return { models };
+          ...(this.guidance.models?.[id]?.selection_note ? { selection_note: this.guidance.models[id].selection_note } : {}) })) };
   }
 
   publish(a, kind, details) {
@@ -1088,7 +1282,7 @@ export class AgentController extends EventEmitter {
     const write = this.persistTail.then(() => {
       this.persistScheduled = null;
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
-      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, effort: a.effort, role: a.role, status: a.status,
+      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, modelProvider: a.modelProvider, modelRecovery: a.modelRecovery, replacementAttempt: a.replacementAttempt, effort: a.effort, role: a.role, status: a.status,
       activity: a.activity, createdAtMs: a.createdAtMs, lastActivityAtMs: a.lastActivityAtMs, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage,
       snapshot: a.snapshot, injected: a.injected, contextSource: a.contextSource, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus,
     })) };

@@ -133,6 +133,30 @@ test('writer conflicts identify the rejected RPC and actionable reason without e
   } finally { await client.close(); }
 });
 
+test('only decisive model errors on model-bearing RPCs expose a recovery reason', async () => {
+  const { client } = fixture({ handle(frame, child) {
+    if (!frame.params?.simulate) return;
+    child.stdout.write(JSON.stringify({ id: frame.id, error: frame.params.simulate }) + '\n');
+  } });
+  await client.start();
+  try {
+    for (const [method, message, data, confirmed] of [
+      ['turn/start', 'request rejected', { codexErrorInfo: 'modelNotFound', details: 'SENSITIVE' }, true],
+      ['thread/resume', 'provider refused', { error: { code: 'model_not_found' } }, true],
+      ['turn/start', 'The model `private-model` does not exist or you do not have access to it.', null, true],
+      ['turn/start', 'model temporarily unavailable', { status: 503 }, false],
+      ['thread/resume', 'bad effort for this model', { codexErrorInfo: 'badRequest' }, false],
+      ['thread/read', 'opaque', { code: 'model_not_found' }, false],
+    ]) {
+      await assert.rejects(client.request(method, { simulate: { code: -32600, message, data } }), error => {
+        assert.equal(error.reason, confirmed ? 'provider_model_unavailable' : undefined);
+        assert.doesNotMatch(error.message, /private-model|SENSITIVE/);
+        return true;
+      });
+    }
+  } finally { await client.close(); }
+});
+
 test('times out a request without breaking later calls and ignores its late response', async () => {
   const { client, child, frames } = fixture({ handle(frame, child) {
     if (frame.method === 'later') child.stdout.write(`${JSON.stringify({ id: frame.id, result: 'still connected' })}\n`);

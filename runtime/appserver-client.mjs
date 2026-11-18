@@ -14,7 +14,14 @@ const threadIdPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 // Only preserve recognized protocol diagnostics. Arbitrary remote message/data
 // may contain tool input, prompts, paths, or credentials and must stay private.
-function rpcDiagnostic(message) {
+function rpcDiagnostic(method, { message, data }) {
+  if (method === 'turn/start' || method === 'thread/resume' || method === 'thread/start') {
+    const missing = data?.codexErrorInfo === 'modelNotFound'
+      || data?.code === 'model_not_found' || data?.error?.code === 'model_not_found'
+      || /^The model [`'"][\w.:/-]+[`'"] does not exist or you do not have access to it\.?$/i.test(message)
+      || /^The '[\w.:/-]+' model is not supported when using Codex with a ChatGPT account\.?$/i.test(message);
+    if (missing) return { reason: 'provider_model_unavailable', message: 'The provider reported that this model is unavailable for this account.' };
+  }
   if (new RegExp(`^thread ${threadIdPattern} already has an active writer$`, 'i').test(message)) {
     return { reason: 'thread_writer_conflict', message: 'This thread already has an active native writer. Continue through its owning Codex connection, or release the thread there before retrying.' };
   }
@@ -268,7 +275,7 @@ export class AppServerClient extends EventEmitter {
     clearTimeout(pending.timer);
     if (hasOwn(message, 'error')) {
       const rpc = message.error;
-      const diagnostic = rpcDiagnostic(rpc.message);
+      const diagnostic = rpcDiagnostic(pending.method, rpc);
       const error = new Error(`App-server ${pending.method} failed (RPC ${rpc.code}).${diagnostic ? ` ${diagnostic.message}` : ''}`);
       error.code = rpc?.code;
       error.rpcCode = rpc?.code;

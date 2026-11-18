@@ -11,7 +11,7 @@ const resultMessage = (result, tool_use_id = 'wait-1') => ({ role: 'user', conte
 
 async function setup(respond = () => ({}), history = [], userConfig = {}) {
   const { register } = await import('../hooks/register.js?' + randomUUID());
-  const handlers = new Map(), toolHandlers = [], appendHandlers = [], calls = [], envs = [], prompts = [], retained = [...history];
+  const handlers = new Map(), toolHandlers = [], appendHandlers = [], calls = [], envs = [], prompts = [], registered = [], retained = [...history];
   let timer, scans = 0, submit = async () => ({}), appendNote = async args => ({ message: args.message, uuid: 'note' });
   register((event, filter, handler) => {
     if (event === 'session.append') appendHandlers.push({ filter, handler });
@@ -21,7 +21,7 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
   const $ = {
     session: { id: async () => 'owner', cwd: async () => '/workspace', messages: async () => { scans++; return retained; }, append: args => appendNote(args) },
     env: { get: async () => undefined }, plugin: { root: '/plugin' },
-    tool: { register: async () => {} }, clock: { every: (_, callback) => { timer = callback; } }, ui: { status: async () => {}, invalidate: () => {} },
+    tool: { register: async tool => { registered.push(tool); } }, clock: { every: (_, callback) => { timer = callback; } }, ui: { status: async () => {}, invalidate: () => {} },
     prompt: { submit: args => { prompts.push(args); return submit(args); } },
     process: { run: async (_, options) => {
       const body = JSON.parse(options.stdin); calls.push(body); envs.push(options.env);
@@ -29,7 +29,7 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
     } },
   };
   const h = {
-    calls, envs, prompts, retained, appendHandlers, handlers, get scans() { return scans; }, setSubmit: fn => { submit = fn; }, setAppendNote: fn => { appendNote = fn; },
+    calls, envs, prompts, registered, retained, appendHandlers, handlers, get scans() { return scans; }, setSubmit: fn => { submit = fn; }, setAppendNote: fn => { appendNote = fn; },
     start: () => handlers.get('session.start')($, {}, async e => e), observe: () => timer(),
     emit: (name, args = {}) => handlers.get(name)($, args, async e => e),
     step: async (args, downstream = async function* () {}) => {
@@ -68,6 +68,19 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
   };
   return h;
 }
+
+test('followup declares and transports an optional replacement model and structured errors', async () => {
+  const error = { code: 'agent_model_unavailable', message: 'Choose a model', reason: 'model_not_listed', model: 'old', available_models: ['new'], recommended_model: 'new', model_turn_started: false };
+  const h = await setup(() => ({ error }));
+  await h.start();
+  const schema = h.registered.find(tool => tool.name === 'followup_task').inputSchema;
+  assert.equal(schema.properties.replacement_model.type, 'string');
+  assert.deepEqual(schema.required, ['target', 'message']);
+  assert.deepEqual(await h.call('followup_task', { target: 'a', message: 'Continue', replacement_model: 'new', tool_use_id: 'f1' }), { error });
+  assert.deepEqual(h.calls.at(-1).args, { target: 'a', message: 'Continue', replacement_model: 'new' });
+  await h.call('followup_task', { target: 'a', message: 'Continue', tool_use_id: 'f2' });
+  assert.deepEqual(h.calls.at(-1).args, { target: 'a', message: 'Continue' });
+});
 
 test('default wait renews locally until an event without sampling or interrupting workers', async () => {
   const h = await setup((_, count) => count < 3 ? { pending: true } : { events: [event()], delivery_id: 'd1' });

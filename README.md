@@ -4,7 +4,7 @@
 
 仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
-当前安装版本为 **0.2.0-rc.26**，历史换页测量期间显示加载圈，布局稳定后一次定位并显示内容，避免反复位置修正造成晃动。保留 rc.24 的目录修复和 rc.25 的固定代理图标。本文同时描述开发仓库中尚未安装的修正；为避免影响正在工作的 Astra，这些修改未覆盖安装，也未发布 GitHub。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
+当前开发版本为 **0.2.0-rc.27**；当前安装版本为 **0.2.0-rc.26**。本文包含开发仓库中尚未安装的修正。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时只依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 
@@ -73,7 +73,11 @@ claude plugin update codex-subagents@codex-subagents
 
 `context_mode: none` 用于只需要当前任务说明的独立工作。Codex 如果缺少必要细节，会通过问题回传给 Claude。
 
-新建代理未指定 `cwd` 时，使用调用当时 Claude 会话的项目目录；Claude 也可显式指定另一个绝对路径。`followup_task` 沿用原 Codex 线程的目录、历史及已解析的模型配置，不提供切换模型或推理档位的参数。完整过程历史仅供侧栏按需读取，没有额外暴露给 Claude 的历史读取工具。
+新建代理未指定 `cwd` 时，使用调用当时 Claude 会话的项目目录；Claude 也可显式指定另一个绝对路径。`followup_task` 沿用原 Codex 线程的目录、历史及模型配置。已登记代理因模型不可用而失败时，可显式指定 `replacement_model` 在原线程恢复；此参数只用于恢复，不用于普通切换。用户暂停及待处理请求仍受原有控制。完整过程历史仅供侧栏按需读取，没有额外暴露给 Claude 的历史读取工具。
+
+恢复时使用 Codex 当前可见模型目录：原模型已停用或隐藏时，优先推荐同家族、完整后缀一致的最新可见版本；没有匹配时提供当前可见列表供选择。推荐来自实时目录，不依赖固定替换表或 `models.json`。
+
+首次接入闲置外部线程时，插件先登记线程，再预检其模型；预检发现模型不可用时保留登记，可用代理 ID 或原线程链接指定替换模型恢复。错误会区分先前轮次失败与接入时预检发现的问题。
 
 侧栏区分「新建」「继承 Claude」「Codex 历史」三种来源，后续续接不会改变来源；缺少可靠来源信息的旧登记显示「来源未记录」。继承的 Claude 窗口供模型使用，不再作为一串重复气泡显示。接入 Codex 深链接时则显示该线程原有的消息和工具历史，按需分页读取，包括原生接口仍保留的压缩前记录。深链接续接不同时注入 Claude 窗口；需要补充的任务信息可以写在续接消息里。
 
@@ -95,7 +99,7 @@ claude --plugin-dir "/absolute/path/to/codex-subagents"
 |---|---|
 | `spawn_agent` | 新建 Codex；可选 `role: default` 使用 Luna medium 的独立只读探子 |
 | `send_message` | 运行时 steering；空闲时仅将消息写入原历史 |
-| `followup_task` | 续接已有代理；原生线程 ID 或 `codex://threads/<id>` 可接入闲置外部对话 |
+| `followup_task` | 续接已有代理；原生线程 ID 或 `codex://threads/<id>` 可接入闲置外部对话；合条件的模型失败可用 `replacement_model` 恢复 |
 | `wait_agent` | 在程序里等待重要事件，不反复采样 Claude |
 | `answer_agent` | 按原请求 ID 回答问题或审批 |
 | `interrupt_agent` | 中断当前轮，保留历史与文件修改 |
@@ -119,7 +123,7 @@ Claude 忙碌时，插件在每次模型回复结束、工具结果写入后检�
 
 rc.22 不再注册可能被 `cc-plugin-sec-default` 跳过的 `classic.PostToolBatch`，改用公开的模型响应和工具结果事件。无需关闭安全模块或修改组织策略；宿主仍可拒绝插件追加的通知，拒绝时事件保留待后续获取。
 
-模型目录由外部 Codex CLI 管理。配置了 `model_catalog_json` 时，该文件决定列表；把条目的 `visibility` 改为 `hide` 后，重启桥接进程即可隐藏。没有该配置时使用 Codex 自己的目录。插件不内置 CLI 或另设白名单，不过滤 ultra 等原生档位。额外选型提示位于 `config/guidance.json`，未列在该文件里的新模型仍正常返回原始描述和档位。CLI 升级与插件升级相互独立。
+模型目录由外部 Codex CLI 管理。配置了 `model_catalog_json` 时，该文件决定列表；把条目的 `visibility` 改为 `hide` 后，重启桥接进程即可隐藏。没有该配置时使用 Codex 自己的目录。插件不内置 CLI 或另设白名单，不过滤 ultra 等原生档位。额外选型提示位于 `config/guidance.json`，未列在该文件里的新模型仍正常返回原始描述和档位。CLI 升级与插件升级相互独立。更新插件后，新建任务可使用更新的选型建议；已有线程继续沿用其原有模型配置，不会自动升级。模型可用性仍以当前 CLI 目录为准。
 
 ## 默认角色、并发与权限
 

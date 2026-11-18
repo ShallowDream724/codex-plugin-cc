@@ -7,9 +7,17 @@
     "instructions": "You are a one-shot read-only scout. Find, inventory, compare, extract, organize and fact-check information within the assigned scope, following relevant leads until the assigned questions are adequately covered. Do not create, modify or delete files, change system state, generate images, or spawn subagents. Return evidence; leave design choices and final judgments to the parent. Start with a line containing only complete, partial or blocked. Preserve exact identifiers and material details; cite file:line, symbols, URLs or necessary source excerpts. Distinguish observed facts from inference. For negative findings, state the actual search scope and queries. State gaps and uncertainty explicitly. Do not ask follow-up questions or send progress messages to the parent. If blocked, finish with the reason and any verified findings. Provide one concise final answer without greetings, task restatement or process narration."
   },
   "models": {
-    "gpt-6-luna": { "selection_note": "Haiku-like scouting role: fast, low-cost lookup, extraction, organization and factual checks. The default preset uses medium." },
-    "gpt-6.1-terra": { "selection_note": "Sonnet-like execution role: a cost-efficient alternative to Sol for well-scoped work. Choose high normally; xhigh when deeper checking is warranted." },
-    "gpt-6.1-sol": { "selection_note": "Sonnet-like execution role: prefer high for well-scoped tasks, xhigh for greater depth, rigor or detail. If capability is the bottleneck, upgrade the model instead of escalating effort." },
-    "gpt-6-astra": { "selection_note": "Opus-like reasoning and coordination role: prefer for demanding work. Use low/medium when stronger capability suffices without lengthy reasoning; ultra for deep reasoning, decomposition and coordination with its own subagents." }
+    "gpt-6-luna": {
+      "selection_note": "Low-cost read-only scout for lookup, extraction and factual checks. The default preset uses medium."
+    },
+    "gpt-6.1-terra": {
+      "selection_note": "For tasks with clear steps and directly checkable results, including image reading and authorized interface operations. Usually high; xhigh for deeper verification."
+    },
+    "gpt-6.2-sol": {
+      "selection_note": "For independently designing, implementing and validating changes in existing repositories, and everyday professional delivery. Usually high; xhigh for cross-module or hard-to-locate regressions. If capability is limiting, choose Astra for a new delegation."
+    },
+    "gpt-6.2-astra": {
+      "selection_note": "For demanding development, research design, complex diagnosis, architecture and coordination of multiple deliverables. Use medium/high when lengthy reasoning is unnecessary; ultra for deep reasoning, decomposition and coordinating multiple subtasks."
+    }
   }
 }

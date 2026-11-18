@@ -787,6 +787,7 @@ test('none context skips injection and cwd accepts absolute POSIX and Windows pa
 
 test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, and resumes same thread', async (t) => {
   const { client, controller, spawn } = await setup(t);
+  client.handler = method => method === 'model/list' ? { data: [{ model: 'dynamic-model' }], nextCursor: null } : undefined;
   const snapshot = { history: [{ type: 'message', role: 'user', content: [] }], digest: 'hash', stats: { count: 1 } };
   const agent = await spawn({ model: 'dynamic-model', reasoning_effort: 'high', context_mode: 'available', snapshot });
   assert.deepEqual(agent.context_snapshot, { digest: snapshot.digest, stats: snapshot.stats });
