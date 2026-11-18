@@ -1,5 +1,9 @@
 # 验证记录
 
+## rc.28 本机安装（2026-11-18）
+
+Claude 已将用户级安装从 rc.27 更新到 rc.28，登记为启用。安装缓存和本机 marketplace 的 118 个文件均与提交 `526ed95` 的安装包逐个校验一致。客户端重启后生效。
+
 ## 开发版：继承上下文与显式推理档位
 
 在独立临时配置、本机模拟 Claude 供应商和模拟 Codex app-server 下运行 Claude 宿主集成。压缩后的会话含一条普通消息，正文提到 `.claude/settings.json`。验证 `available` 通过 `thread/inject_items` 原样传递此消息，`none` 跳过注入；4,202 条源记录的用例收到宿主最多 4,096 条的导出。用例同时断言 Claude 收到的创建回执和首个 `turn/start.effort` 都是请求的 `high`。
