@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { ensureDirectory, readJson, writeJson } from './storage.mjs';
 
+export const ACTION_PREFLIGHT_FAILURE = Symbol('actionPreflightFailure');
+
 function recordValue(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !['inflight', 'done', 'failed', 'issued', 'acknowledged'].includes(value.status)) {
     throw new Error('Invalid receipt record; refusing to replay an uncertain action.');

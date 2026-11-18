@@ -95,6 +95,7 @@ test('model recovery errors retain options and distinguish confirmed rejection f
     calls++;
     if (args.target === 'catalog-offline') throw Object.assign(new Error('Could not verify the Codex model catalog. No turn was started.'), { code: 'model_catalog_unavailable', model_turn_started: false });
     if (args.target === 'consumed') throw Object.assign(new Error('This replacement was accepted earlier. No new turn was started.'), { code: 'model_recovery_consumed', model_turn_started: false, turn_id: 'recovered-turn' });
+    if (args.model === 'requested') throw Object.assign(new Error('Codex resolved a different model.'), { code: 'model_resolution_mismatch', model: 'requested', resolved_model: 'resolved', model_turn_started: false });
     const started = args.target !== 'certain';
     throw Object.assign(new Error('Model unavailable'), { code: 'agent_model_unavailable', agent_id: 'a', thread_id: 'thread-a', status: 'failed', reason: 'provider_model_unavailable', model: 'old', available_models: ['old', 'new'], recommended_model: 'new', recovery_choices: choices, retry_after_access_fix: afterAccessFix, model_turn_started: started, ...(started ? { turn_id: 'failed-turn' } : {}), recovery: 'Choose a replacement.' });
   };
@@ -119,6 +120,12 @@ test('model recovery errors retain options and distinguish confirmed rejection f
   assert.equal(consumed.model_turn_started, false);
   assert.deepEqual((await post(request('consumed'))).body.error, consumed);
   assert.equal(calls, 4);
+  const spawn = { operation: 'spawn_agent', requestId: 'mismatch', args: { model: 'requested', message: 'Check', context_mode: 'none' } };
+  const mismatch = (await post(spawn)).body.error;
+  assert.equal(mismatch.resolved_model, 'resolved');
+  assert.equal(mismatch.model_turn_started, false);
+  assert.deepEqual((await post(spawn)).body.error, mismatch);
+  assert.equal(calls, 5);
 });
 
 test('model diagnostics are read by explicit list_agents and failure delivery, with no background catalog polling', async t => {
@@ -214,6 +221,66 @@ test('a crash receipt fails explicitly rather than replaying work', async t => {
   const { post, controller } = await setup(t, { receipts: { call1: { operation: 'spawn_agent', status: 'inflight' } } });
   const result = await post({ operation: 'spawn_agent', requestId: 'call1', args: { context_mode: 'none' } });
   assert.equal(result.body.error.code, 'ambiguous_action'); assert.equal(controller.calls.length, 0);
+});
+
+test('the real controller preserves validation errors on exact tool-call replay', async t => {
+  const client = new EventEmitter(), nativeCalls = [], receipts = {};
+  client.request = async method => {
+    nativeCalls.push(method);
+    if (method === 'thread/start') return { thread: { id: 'existing' } };
+    if (method === 'turn/start') return { turn: { id: 'existing-turn', status: 'inProgress' } };
+    throw new Error('Unexpected native request');
+  };
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  t.after(() => controller.close());
+  const { post } = await setup(t, { controller, receipts });
+  const spawnArgs = { message: 'Task', cwd: '/workspace', context_mode: 'none' };
+  const agent = await controller.dispatch('spawn_agent', spawnArgs);
+  assert.equal(agent.name, undefined);
+  nativeCalls.length = 0;
+  const cases = [
+    ['spawn_agent', { ...spawnArgs, cwd: './workspace' }, /cwd must be an absolute path/],
+    ['spawn_agent', { ...spawnArgs, role: 'unknown' }, /Unknown role/],
+    ['spawn_agent', { ...spawnArgs, role: 'default', model: 'unexpected-model' }, /configured model/],
+    ['send_message', { message: 'Task' }, /Unknown agent target/],
+    ['send_message', { target: agent.agent_id }, /message must be nonempty/],
+    ['followup_task', { message: 'Task' }, /native thread IDs/],
+    ['interrupt_agent', {}, /Unknown agent target/],
+    ['close_agent', {}, /targets must be/],
+  ];
+  for (const [index, [operation, args, message]] of cases.entries()) {
+    const requestId = `validation-${index}`;
+    const body = { operation, args, requestId };
+    const first = await post(body);
+    assert.equal(first.status, 400);
+    assert.match(first.body.error.message, message);
+    assert.deepEqual(await post(body), first);
+    assert.equal(receipts[requestId].status, 'failed');
+    assert.equal((await post({ ...body, args: { ...args, name: 'Changed input' } })).body.error.code, 'request_id_conflict');
+  }
+  assert.deepEqual(nativeCalls, []);
+  assert.deepEqual(controller.snapshot().agents.map(row => [row.agent_id, row.status]), [[agent.agent_id, 'running']]);
+});
+
+test('an unconfirmed native turn keeps its inflight receipt even when the cause is a TypeError', async t => {
+  const client = new EventEmitter(), nativeCalls = [], receipts = {};
+  client.request = async method => {
+    nativeCalls.push(method);
+    if (method === 'thread/start') return { thread: { id: 'native' } };
+    if (method === 'turn/start') throw new TypeError('Could not decode the turn reply.');
+    throw new Error('Unexpected native request');
+  };
+  const controller = new AgentController({ client, nativeRoleResolver: async () => undefined });
+  t.after(() => controller.close());
+  const { post } = await setup(t, { controller, receipts });
+  const body = { operation: 'spawn_agent', requestId: 'uncertain-native-turn', args: { message: 'Task', cwd: '/workspace', context_mode: 'none' } };
+  const first = await post(body);
+  assert.equal(first.status, 400);
+  assert.match(first.body.error.message, /Could not decode the turn reply/);
+  assert.equal(first.body.error.thread_id, 'native');
+  assert.equal(receipts[body.requestId].status, 'inflight');
+  assert.equal((await post(body)).body.error.code, 'ambiguous_action');
+  assert.deepEqual(nativeCalls, ['thread/start', 'turn/start']);
 });
 
 test('private-turn followup rejection is a retryable-on-new-call preflight failure rather than ambiguous submission', async t => {

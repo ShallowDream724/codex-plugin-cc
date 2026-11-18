@@ -62,7 +62,8 @@ test('adoption validates metadata, serializes first adoption, and retains native
   await assert.rejects(c.dispatch('followup_task', { target: UUID, message: 'duplicate' }), /already being adopted/);
   release({ thread: { id: UUID, cwd: '/native', status: { type: 'idle' } } });
   const agent = await first; assert.equal(agent.cwd, '/native'); assert.equal(agent.thread_id, UUID);
-  assert.match(agent.limitations[0], /dynamic tools/);
+  assert.deepEqual(agent.client_tools_unavailable, { status: 'unknown', tools: [] });
+  assert.match(agent.limitations[0], /dynamic tools could not be verified/);
   client.emit('request', { id: 9, method: 'item/tool/call', params: { threadId: UUID, turnId: agent.turn_id, tool: 'desktop_tool', arguments: {} } });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(client.lastReply.result.success, false); assert.match(client.lastReply.result.contentItems[0].text, /original Codex client/);
@@ -75,6 +76,21 @@ test('adoption validates metadata, serializes first adoption, and retains native
   client.handler = method => method === 'thread/read' ? { thread: { id: UUID, cwd: '/native', status: { type: 'active' } } } : undefined;
   await assert.rejects(c.dispatch('followup_task', { target: UUID, message: 'continue' }), /active.*cannot be adopted/);
   assert.equal(client.calls.filter(x => x.method === 'turn/start').length, 1);
+});
+
+test('adoption reports unavailable original-client tools only when present in known metadata', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'adopt-tools-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'thread.jsonl');
+  for (const names of [[], ['desktop_tool']]) {
+    const { client, c } = await setup(t);
+    const meta = { type: 'session_meta', payload: { id: UUID, dynamic_tools: names.map(name => ({ type: 'function', name })) } };
+    await writeFile(file, JSON.stringify(meta) + '\n');
+    client.handler = method => method === 'thread/read' ? { thread: { id: UUID, cwd: '/native', path: file, status: { type: 'idle' } } } : undefined;
+    const result = await c.dispatch('followup_task', { target: UUID, message: 'Continue' });
+    assert.deepEqual(result.client_tools_unavailable, { status: 'known', tools: names });
+    if (names.length) assert.match(result.limitations[0], /dynamic tools are unavailable here/);
+    else assert.equal(Object.hasOwn(result, 'limitations'), false);
+  }
 });
 
 test('unmatched UUID read failures explain session scope without diagnosing a fork', async t => {
@@ -200,7 +216,7 @@ test('permission modes and default role use explicit protocol settings', async t
   for (const [mode, reviewer] of [['ask', 'user'], ['auto-review', 'auto_review']]) {
     const { client, c, spawn } = await setup(t, { permissionsMode: mode });
     const a = await spawn({ role: 'default' });
-    const start = client.calls[0].params;
+    const start = client.calls.find(call => call.method === 'thread/start').params;
     assert.equal(start.approvalPolicy, 'on-request'); assert.equal(start.approvalsReviewer, reviewer); assert.equal(start.sandbox, 'workspace-write');
     assert.equal(start.model, 'gpt-6-luna'); assert.equal(client.calls.find(x => x.method === 'turn/start').params.effort, 'medium');
     assert.deepEqual(start.dynamicTools, []); assert.equal(start.config['features.multi_agent_v2'], false); assert.equal(start.config['features.image_generation'], false);
@@ -209,6 +225,146 @@ test('permission modes and default role use explicit protocol settings', async t
     await c.dispatch('followup_task', { target: a.id, message: 'continue' });
     assert.equal(client.calls.find(x => x.method === 'thread/resume').params.approvalsReviewer, reviewer);
   }
+});
+
+const OLD_MODEL = 'gpt-6-astra';
+const NEW_MODEL = 'gpt-6.2-astra';
+const FIRST_CONTEXT = { history: [{ type: 'message', role: 'user', content: [] }], digest: 'digest', stats: {} };
+
+test('spawn checks the complete workspace provider catalog before creating a thread', async t => {
+  const { client, c, spawn } = await setup(t, { maxActiveAgents: 1 });
+  c.nativeRoleResolver = async ({ readConfig }) => { await readConfig(); };
+  c.guidance.default.model = OLD_MODEL;
+  client.handler = (method, params) => {
+    if (method === 'config/read') return { config: { model_provider: 'workspace' } };
+    if (method === 'model/list') return params.cursor
+      ? { data: [{ model: 'other-visible-model' }], nextCursor: null }
+      : { data: [{ model: OLD_MODEL, hidden: true }, { model: NEW_MODEL }], nextCursor: 'next' };
+    if (method === 'thread/start') return { thread: { id: 'new-thread' }, model: params.model, modelProvider: 'workspace' };
+  };
+  const expectedCalls = [
+    { method: 'config/read', params: { cwd: '/workspace', includeLayers: true } },
+    { method: 'model/list', params: { includeHidden: false, modelProvider: 'workspace' } },
+    { method: 'model/list', params: { includeHidden: false, modelProvider: 'workspace', cursor: 'next' } },
+  ];
+  for (const args of [{ model: OLD_MODEL, context_mode: 'available', snapshot: FIRST_CONTEXT }, { role: 'default' }]) {
+    client.calls.length = 0;
+    await assert.rejects(spawn(args), error => {
+      assert.equal(error.code, 'agent_model_unavailable');
+      assert.equal(error.reason, 'model_not_listed');
+      assert.deepEqual(error.available_models, [NEW_MODEL, 'other-visible-model']);
+      assert.equal(error.recovery_choices, undefined);
+      assert.equal(error.agent_id, undefined);
+      assert.equal(error.model_turn_started, false);
+      assert.match(error.message, /Call spawn_agent with a model the user has chosen from available_models/);
+      if (args.role) assert.match(error.message, /role preset/);
+      return true;
+    });
+    assert.deepEqual(client.calls, expectedCalls);
+    assert.equal(c.agents.size, 0);
+  }
+
+  client.calls.length = 0;
+  const agent = await spawn({ model: NEW_MODEL, context_mode: 'available', snapshot: FIRST_CONTEXT });
+  assert.equal(agent.model, NEW_MODEL);
+  assert.deepEqual(client.calls.slice(0, 3), expectedCalls);
+  assert.deepEqual(client.calls.slice(3).map(call => call.method), ['thread/start', 'thread/inject_items', 'turn/start']);
+  assert.equal(client.calls.at(-1).params.model, NEW_MODEL);
+});
+
+test('spawn verifies the native provider and model before forwarding context or a task', async t => {
+  const { client, c, spawn } = await setup(t);
+  const actions = [];
+  c.on('agentAction', action => actions.push(action));
+  let id = 0;
+  client.handler = (method, params) => {
+    if (method === 'config/read') return { config: { model_provider: 'workspace' } };
+    if (method === 'model/list') return { data: [{ model: NEW_MODEL }, { model: 'different-visible-model' }], nextCursor: null };
+    if (method === 'thread/start') return { thread: { id: `native-${++id}` }, model: params.model ? 'different-visible-model' : OLD_MODEL, modelProvider: 'native' };
+  };
+  for (const [args, code, model] of [
+    [{ model: NEW_MODEL }, 'model_resolution_mismatch', NEW_MODEL],
+    [{}, 'agent_model_unavailable', OLD_MODEL],
+  ]) {
+    client.calls.length = 0;
+    await assert.rejects(spawn({ context_mode: 'available', snapshot: FIRST_CONTEXT, ...args }), error => {
+      assert.equal(error.code, code);
+      assert.equal(error.thread_id, `native-${id}`);
+      assert.equal(error.model, model);
+      assert.equal(error.model_turn_started, false);
+      assert.equal(error.status, 'failed');
+      assert.deepEqual(error.available_models, [NEW_MODEL, 'different-visible-model']);
+      assert.match(error.message, /is registered as agent .* No turn was started/);
+      assert.equal(c.find(error.agent_id).modelRecovery, undefined);
+      if (args.model) assert.equal(error.resolved_model, 'different-visible-model');
+      return true;
+    });
+    assert.deepEqual(client.calls.filter(call => call.method === 'model/list').map(call => call.params.modelProvider), args.model ? ['workspace', 'native'] : ['native']);
+    assert.equal(client.calls.some(call => ['thread/inject_items', 'turn/start'].includes(call.method)), false);
+  }
+  assert.deepEqual(actions, []);
+});
+
+test('spawn with an omitted model validates the native default or the matching workspace fallback', async t => {
+  for (const [configured, returned] of [[OLD_MODEL, NEW_MODEL], [NEW_MODEL, undefined]]) {
+    const { client, c, spawn } = await setup(t);
+    c.nativeRoleResolver = async ({ readConfig }) => { await readConfig(); };
+    client.handler = method => {
+      if (method === 'config/read') return { config: { model_provider: 'workspace', model: configured } };
+      if (method === 'thread/start') return { thread: { id: 'native' }, model: returned, modelProvider: 'workspace' };
+      if (method === 'model/list') return { data: [{ model: NEW_MODEL }], nextCursor: null };
+    };
+    assert.equal((await spawn()).model, NEW_MODEL);
+    assert.deepEqual(client.calls.map(call => call.method), ['config/read', 'thread/start', 'model/list', 'turn/start']);
+    assert.equal(client.calls[1].params.model, undefined);
+    assert.equal(client.calls[2].params.modelProvider, 'workspace');
+    assert.equal(client.calls[3].params.model, NEW_MODEL);
+  }
+});
+
+test('spawn reports a catalog failure without marking the model unavailable', async t => {
+  for (const canCheckBeforeCreation of [false, true]) {
+    const { client, c, spawn } = await setup(t);
+    const cause = Object.assign(new Error('Private transport error'), { code: 'ETIMEDOUT' });
+    client.handler = method => {
+      if (method === 'config/read' && canCheckBeforeCreation) return { config: { model_provider: 'native' } };
+      if (method === 'thread/start') return { thread: { id: 'native-thread' }, model: NEW_MODEL, modelProvider: 'native' };
+      if (method === 'model/list') throw cause;
+    };
+    await assert.rejects(spawn({ model: NEW_MODEL }), error => {
+      assert.equal(error.code, 'model_catalog_unavailable');
+      assert.equal(error.cause, cause);
+      assert.equal(error.model_turn_started, false);
+      assert.equal(error.available_models, undefined);
+      assert.equal(error.thread_id, canCheckBeforeCreation ? undefined : 'native-thread');
+      assert.match(error.message, /Could not verify the Codex model catalog for provider native/);
+      assert.match(error.message, /did not answer model\/list in time/);
+      assert.doesNotMatch(error.message, /Private transport error|retired|absent/);
+      return true;
+    });
+    assert.equal(c.agents.size, canCheckBeforeCreation ? 0 : 1);
+    assert.equal(client.calls.some(call => ['thread/inject_items', 'turn/start'].includes(call.method)), false);
+  }
+});
+
+test('stop-all prevents a spawn waiting for its workspace catalog from creating a thread', async t => {
+  const { client, c, spawn } = await setup(t, { maxActiveAgents: 1 });
+  let catalogStarted, releaseCatalog;
+  const started = new Promise(resolve => { catalogStarted = resolve; });
+  const pendingCatalog = new Promise(resolve => { releaseCatalog = resolve; });
+  client.handler = method => {
+    if (method === 'config/read') return { config: { model_provider: 'workspace' } };
+    if (method === 'model/list') { catalogStarted(); return pendingCatalog; }
+  };
+  const pendingSpawn = assert.rejects(spawn({ model: NEW_MODEL }), /stop-all action interrupted agent creation/);
+  await started;
+  await assert.rejects(spawn(), /limit/);
+  await c.dispatch('ui_interrupt_all');
+  releaseCatalog({ data: [{ model: NEW_MODEL }], nextCursor: null });
+  await pendingSpawn;
+  assert.equal(c.agents.size, 0);
+  assert.deepEqual(client.calls.map(call => call.method), ['config/read', 'model/list']);
+  assert.equal((await spawn()).status, 'running');
 });
 
 test('permissions reply example preserves requested nested structures', async t => {

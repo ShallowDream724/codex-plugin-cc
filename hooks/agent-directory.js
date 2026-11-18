@@ -4,7 +4,11 @@ const finished = new Set(['completed', 'failed', 'interrupted']);
 const idOf = agent => String(agent?.agent_id || agent?.id || '');
 const timestamp = value => typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 const activityTime = agent => timestamp(agent?.last_activity_at_ms) ?? timestamp(agent?.created_at_ms);
-const statusLabel = status => ({ waiting: '等待中', unknown: '状态未知', failed: '失败', interrupted: '已停止' })[status] || '';
+const statusLabel = agent => {
+  const current = { stopping: '正在停止', unconfirmed: '停止未确认' }[agent.user_control_status];
+  const task = { waiting: '等待中', unknown: '状态未知', failed: '失败', interrupted: '已停止' }[agent.status];
+  return current || (agent.user_control_status === 'stopped' && !task ? '已暂停' : task || '');
+};
 const safeName = agent => {
   const name = String(agent?.name || '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
   // An ID is an action key, not a useful substitute for a missing name.
@@ -73,7 +77,7 @@ function truncateName(name, maxWidth) {
 }
 
 /** Render with the host's public UI components; actions remain owned by the caller. */
-export function renderAgentDirectory(ui, { agents = [], now = Date.now(), columns, onOpen = () => {}, openOffset = 0, completedOffset = 0, onPage = () => {}, loading = false, error = null, onRetry = () => {}, surface = 'desktop' } = {}) {
+export function renderAgentDirectory(ui, { agents = [], now = Date.now(), columns, onOpen = () => {}, openOffset = 0, completedOffset = 0, onPage = () => {}, loading = false, error = null, onRetry = () => {}, surface = 'desktop', stopAll } = {}) {
   const { Box, Text, Button, Svg, Client } = ui;
   const model = agentDirectoryModel(agents, { now, openOffset, completedOffset });
   const caption = (key, text, extra = {}) => Text({ key, size: 'caption', children: [text], ...extra });
@@ -82,7 +86,7 @@ export function renderAgentDirectory(ui, { agents = [], now = Date.now(), column
     const icon = surface === 'desktop' && typeof Svg === 'function'
       ? Svg({ key: `directory_icon_${item.id}`, source: visual.source, alt: visual.alt, width: 16, height: 16 })
       : caption(`directory_icon_${item.id}`, visual.glyph);
-    const status = statusLabel(item.agent.status);
+    const status = statusLabel(item.agent);
     const available = Number.isFinite(columns) && columns > 0 ? Math.floor(columns) : 80;
     const nameWidth = Math.max(1, Math.min(48, available - 6 - widthOf(item.relativeTime) - (status ? widthOf(status) + 1 : 0)));
     return Box({ key: `directory_row_${item.id}`, position: 'relative', minWidth: 0, height: 1, paddingX: 0.5, flexDirection: 'row', alignItems: 'center', gap: 'sm', hover: { backgroundColor: 'rgba(128,128,128,0.12)' }, children: [
@@ -101,6 +105,28 @@ export function renderAgentDirectory(ui, { agents = [], now = Date.now(), column
     ...(hasMore ? [Button({ key: `directory_next_${key}`, plain: true, label: '更早的 50 个', onPress: () => onPage(key, offset + 50) })] : []),
   ] });
   const children = [];
+  if (stopAll?.available || stopAll?.pending || stopAll?.feedback) {
+    const warningButton = (key, label, onPress) => Box({
+      key: `${key}_warning`, flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', flexShrink: 0,
+      ...(surface === 'desktop' ? { borderStyle: 'round', borderColor: '#e5484d', paddingX: 0.5 } : { gap: 'sm' }),
+      children: [
+        ...(surface === 'desktop' ? [] : [caption(`${key}_mark`, '!', { color: 'red', weight: 'bold' })]),
+        Button({ key, plain: true, label, onPress }),
+      ],
+    });
+    const controls = [];
+    if (stopAll.pending) controls.push(caption('directory_stop_all_pending', '正在暂停全部 Codex 代理…'));
+    else if (stopAll.confirming && stopAll.available) controls.push(
+      caption('directory_stop_all_scope', '将暂停当前会话的全部 Codex 代理及其后代，包括空闲和已完成的代理。恢复时须直接发消息给代理。Claude 会继续工作。'),
+      Box({ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 'sm', children: [
+        Button({ key: 'directory_stop_all_cancel', plain: true, label: '取消', autoFocus: true, onPress: stopAll.onCancel }),
+        warningButton('directory_stop_all_confirm', '确认暂停全部', stopAll.onConfirm),
+      ] }),
+    );
+    else if (stopAll.available) controls.push(warningButton('directory_stop_all', '暂停全部 Codex', stopAll.onRequest));
+    if (stopAll.feedback) controls.push(caption('directory_stop_all_result', stopAll.feedback));
+    children.push(Box({ key: 'directory_stop_all_controls', flexDirection: 'column', gap: 'sm', minWidth: 0, children: controls }));
+  }
   if (loading && !model.open.length && !model.completedTotal) children.push(caption('directory_loading', '正在读取代理'));
   if (error) children.push(Box({ key: 'directory_error', flexDirection: 'row', gap: 'sm', children: [caption('directory_error_text', '读取代理失败', { dimColor: true }), Button({ key: 'directory_retry', plain: true, label: '重试', onPress: onRetry })] }));
   if (!loading || model.open.length || model.completedTotal) {

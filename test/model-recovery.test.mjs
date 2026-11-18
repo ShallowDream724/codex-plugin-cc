@@ -110,7 +110,7 @@ test('a relisted model expires its catalog-only gate and continues without switc
   const current = assertPendingRecovery((await agents())[0], OLD, 'model_not_listed');
   assert.deepEqual(current.available_models, [OLD, REPLACEMENT]);
   assert.deepEqual(current.recovery_choices, []);
-  assert.match(current.message, /gpt-6-astra is visible again.*regular followup_task/);
+  assert.match(current.message, /gpt-6-astra is visible again.*followup_task.*agent ID.*target.*original message/);
   assert.deepEqual(client.writes(), []);
   await assert.rejects(followup(target), /visible again.*recovery choices have expired.*gpt-6-astra.*original agent ID/);
   await assert.rejects(followup(target), /invalid or expired.*list_agents/);
@@ -216,7 +216,7 @@ test('catalog preflight blocks a hidden model before native inference and only o
       assertGate(error, agent, 'model_not_listed');
       assert.deepEqual(error.available_models, visibleModels);
       assert.equal(error.recommended_model, highest);
-      assert.match(error.message, /gpt-6-astra is absent.*No turn was started.*complete visible model list is in available_models.*Possible successor: gpt-6.10-astra.*Use the user's chosen model.*target.*message/);
+      assert.match(error.message, /gpt-6-astra is absent.*No turn was started.*gpt-6\.10-astra is a possible successor.*user's choice from recovery_choices.*followup_task.*target.*original message/);
       assert.deepEqual(error.recovery_choices.map(choice => choice.model), error.available_models);
       return true;
     });
@@ -240,8 +240,8 @@ test('equal and lower versions and different series are choices without a possib
   assert.deepEqual(gated.available_models, models);
   assert.deepEqual(gated.recovery_choices.map(choice => choice.model), models);
   assert.equal(gated.recommended_model, undefined);
-  assert.match(gated.message, /Ask the user which model to use.*pins the selected model for later followups/);
-  assert.doesNotMatch(gated.message, /Possible successor/);
+  assert.match(gated.message, /user's choice from recovery_choices, or ask them to choose.*followup_task.*target.*original message/);
+  assert.doesNotMatch(gated.message, /possible successor/);
   assert.deepEqual(client.writes(), []);
 });
 
@@ -397,7 +397,7 @@ test('provider rejection can open recovery even while the target model remains l
     assertGate(error, agent, 'provider_model_unavailable');
     assert.deepEqual(error.available_models, [OLD, REPLACEMENT]);
     assert.deepEqual(error.recovery_choices.map(choice => choice.model), [REPLACEMENT]);
-    assert.match(error.message, /Codex rejected model gpt-6-astra as unavailable.*No turn was started.*test-provider.*exact model ID.*custom model catalog.*upstream provider.*configured account.*recovery_choices/);
+    assert.match(error.message, /Codex rejected model gpt-6-astra as unavailable.*No turn was started.*test-provider.*exact model ID.*configured account.*recovery_choices.*retry_after_access_fix.*followup_task.*target.*original message/);
     assert.doesNotMatch(error.message, /CLI|install|upgrade/);
     return true;
   });
@@ -410,13 +410,13 @@ test('provider rejection can open recovery even while the target model remains l
   assertGate(unavailable, agent, 'provider_model_unavailable');
   assert.deepEqual(unavailable.available_models, [OLD]);
   assert.deepEqual(unavailable.recovery_choices, []);
-  assert.match(unavailable.message, /visible catalog has no selectable replacement.*list_agents/);
+  assert.match(unavailable.message, /No replacement is available.*list_agents/);
   assert.doesNotMatch(unavailable.message, /catalog is empty/);
   assert.equal(client.writes().length, 1);
 
   const { retry_after_access_fix: [{ model, target }] } = unavailable;
   assert.equal(model, OLD);
-  assert.match(unavailable.message, /If the user confirms that access is restored.*retry_after_access_fix/);
+  assert.match(unavailable.message, /retry a rejected model, use retry_after_access_fix only after the user confirms restored access or a verified compatibility fix.*followup_task.*target.*original message/);
   client.calls.length = 0;
   await assert.rejects(followup(agent.id, { replacement_model: OLD }), /same as the unavailable model/);
   await assert.rejects(followup(target.replace('/retry/', '/')), /invalid or expired/);
@@ -448,12 +448,21 @@ test('a rejected replacement preserves other choices and read-only diagnostics c
   assert.deepEqual(refused.available_models, [REPLACEMENT, SOL, OLDER]);
   assert.deepEqual(refused.recovery_choices.map(choice => choice.model), [SOL, OLDER]);
   assert.equal(refused.recommended_model, undefined);
-  assert.match(refused.message, /Ask the user which model to use/);
+  assert.match(refused.message, /user's choice from recovery_choices, or ask them to choose/);
   assert.equal(refused.recovery, undefined);
   const [failed] = controller.eventsAfter(cursor);
   assert.equal(failed.message, refused.message);
   assert.deepEqual(failed.recovery_choices, refused.recovery_choices);
   assert.doesNotMatch(JSON.stringify(failed), /Private provider detail/);
+
+  client.catalog = [{ model: OLDER }];
+  const [refreshed] = await agents();
+  assert.deepEqual(refreshed.model_recovery.available_models, [OLDER]);
+  assert.deepEqual(refreshed.model_recovery.recovery_choices.map(choice => choice.model), [OLDER]);
+  assert.equal(refreshed.error.model_turn_started, false);
+  assert.equal(refreshed.error.recovery_choices, undefined);
+  assert.ok(!JSON.stringify(refreshed.error).includes(refused.recovery_choices[0].target));
+  client.catalog = [{ model: REPLACEMENT }, { model: SOL }, { model: OLDER }];
 
   client.handler = undefined;
   client.calls.length = 0;
@@ -480,7 +489,7 @@ test('a rejected replacement preserves other choices and read-only diagnostics c
   const unverified = assertPendingRecovery((await agents())[0], SOL, 'provider_model_unavailable');
   assert.equal(unverified.available_models, undefined);
   assert.equal(unverified.recovery_choices, undefined);
-  assert.match(unverified.message, /visible model catalog was not verified.*list_agents.*without sending a task/);
+  assert.match(unverified.message, /Could not verify the model catalog.*list_agents.*refresh recovery choices/);
   assert.doesNotMatch(unverified.message, /Private catalog failure|Turn.*failed|No turn was started/);
 
   client.handler = undefined;
@@ -490,7 +499,7 @@ test('a rejected replacement preserves other choices and read-only diagnostics c
   assert.deepEqual(current.recovery_choices.map(choice => choice.model), [OLDER]);
   assert.deepEqual(current.retry_after_access_fix.map(choice => choice.model), [REPLACEMENT, SOL]);
   assert.equal(current.recommended_model, undefined);
-  assert.match(current.message, /Ask the user which model to use/);
+  assert.match(current.message, /user's choice from recovery_choices, or ask them to choose/);
   assert.equal(listed.error.message, asyncFailure.message);
   assert.deepEqual(client.writes(), []);
 });

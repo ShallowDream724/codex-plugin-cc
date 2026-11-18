@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { prepareContextSnapshot } from './context.mjs';
 import { DeliveryStore } from './delivery.mjs';
-import { MemoryReceipts, requestFingerprint } from './receipts.mjs';
+import { ACTION_PREFLIGHT_FAILURE, MemoryReceipts, requestFingerprint } from './receipts.mjs';
 
 const UI_MUTATIONS = new Set(['ui_interrupt', 'ui_interrupt_all', 'ui_send']);
 const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', ...UI_MUTATIONS]);
@@ -10,7 +10,7 @@ const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
 const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
 const errorBody = error => ({ code: error.code || 'bridge_error', message: error.message,
-  ...Object.fromEntries(['agent_id', 'thread_id', 'turn_id', 'status', 'recovery', 'reason', 'model', 'available_models', 'recommended_model', 'recovery_choices', 'retry_after_access_fix', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
+  ...Object.fromEntries(['agent_id', 'thread_id', 'turn_id', 'status', 'recovery', 'reason', 'model', 'resolved_model', 'available_models', 'recommended_model', 'recovery_choices', 'retry_after_access_fix', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
   ...(error.code === 'invalid_answer' ? { request_id: error.request_id, reply_format: error.reply_format } : {}) });
 
 function authorized(value, token) {
@@ -147,10 +147,12 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       let result;
       try { result = await controller.dispatch(operation, args); }
       catch (error) {
-        // These validations fail before any wire response. Other errors may have
-        // ambiguous side effects, so retain their inflight receipt and never retry.
-        const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable', 'model_recovery_consumed'].includes(error.code) && error.model_turn_started === false;
-        if (['invalid_answer', 'private_turn_active'].includes(error.code) || modelPreflightFailed) await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
+        // Keep the exact result of confirmed rejections. For an uncertain action,
+        // preserve its inflight receipt so a replay cannot dispatch it again.
+        const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable', 'model_recovery_consumed', 'model_resolution_mismatch'].includes(error.code) && error.model_turn_started === false;
+        if (error[ACTION_PREFLIGHT_FAILURE] || ['invalid_answer', 'private_turn_active'].includes(error.code) || modelPreflightFailed) {
+          await journal.put(requestId, { operation, fingerprint, status: 'failed', error: errorBody(error) });
+        }
         throw error;
       }
       await journal.put(requestId, { operation, fingerprint, status: 'done', result });

@@ -5,14 +5,14 @@ import { registerRows } from './rows.js';
 import { configureBridge, requestBridge } from './bridge.js';
 const OBJECT = { type: 'object' };
 const STR = { type: 'string' };
-const TARGET = { type: 'string', description: 'Agent ID from spawn_agent.' };
+const TARGET = { type: 'string', description: 'Agent ID from list_agents or spawn_agent.' };
 const TOOLS = [
   { name: 'spawn_agent', description: 'Delegate to Codex. The default role provides quick lookup, extraction and factual checks.', inputSchema: { ...OBJECT, properties: { message: STR, cwd: { ...STR, description: 'Absolute working directory; default: this session.' }, name: STR, role: { ...STR, enum: ['default'], description: 'One-shot read-only scout; preset model/effort and task-only context. Omit for a regular agent.' }, context_mode: { type: 'string', enum: ['available', 'none'], description: 'available: current host context, up to 4096 API messages; older content may be summarized or omitted. none: task only. Default: available; default role: none.' }, model: { ...STR, description: 'Choose an ID from list_models for a regular agent. Omit for the default role.' }, reasoning_effort: { ...STR, description: 'Choose a supported effort for the selected model. Omit for the default role.' } }, required: ['message'], additionalProperties: false } },
   { name: 'send_message', description: 'Steer a running agent; append to an idle agent’s history without starting it.', inputSchema: { ...OBJECT, properties: { target: TARGET, message: STR }, required: ['target', 'message'], additionalProperties: false } },
   { name: 'followup_task', description: 'Continue a Codex conversation with its history. Steer an owned running agent; adopt an idle external thread.', inputSchema: { ...OBJECT, properties: { target: { ...STR, description: 'Agent ID, native thread ID, or codex://threads/<id>.' }, message: STR }, required: ['target', 'message'], additionalProperties: false } },
   { name: 'wait_agent', description: 'Wait for queued or new events from any agent.', inputSchema: { ...OBJECT, properties: { timeout_ms: { type: 'integer', minimum: 0, maximum: 3600000, description: 'Limit this wait only; agents keep running. Omit to wait for an event.' } }, additionalProperties: false } },
-  { name: 'list_agents', description: 'List this session’s agent IDs and brief status.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
-  { name: 'interrupt_agent', description: 'Stop the current turn; keep history and file changes. Resume with followup_task.', inputSchema: { ...OBJECT, properties: { target: TARGET }, required: ['target'], additionalProperties: false } },
+  { name: 'list_agents', description: 'List this session’s agents with their IDs, models and status.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
+  { name: 'interrupt_agent', description: 'Stop current work on this agent and its descendants. History and file changes are kept. Resume with followup_task.', inputSchema: { ...OBJECT, properties: { target: TARGET }, required: ['target'], additionalProperties: false } },
   { name: 'close_agent', description: 'Close inactive agents; keep Codex history. Use all with except to retain selected agents. Active agents are skipped.', inputSchema: { ...OBJECT, properties: { targets: { anyOf: [{ type: 'array', items: TARGET, minItems: 1 }, { type: 'string', enum: ['all'] }] }, except: { type: 'array', items: TARGET, description: 'IDs to keep; only with targets: all.' } }, required: ['targets'], additionalProperties: false } },
   { name: 'answer_agent', description: 'Answer a pending request using its request_id and reply_format.', inputSchema: { ...OBJECT, properties: { target: TARGET, request_id: STR, answer: { ...OBJECT, description: 'Object matching the event’s reply_format.' } }, required: ['target', 'request_id', 'answer'], additionalProperties: false } },
   { name: 'list_models', description: 'Read available model IDs, descriptions, selection notes and supported reasoning efforts.', inputSchema: { ...OBJECT, properties: {}, additionalProperties: false } },
@@ -125,7 +125,7 @@ async function handle($, e, next, operation) {
       if (e.timeout_ms !== undefined && (!Number.isSafeInteger(e.timeout_ms) || e.timeout_ms < 0 || e.timeout_ms > 3600000)) throw new Error('timeout_ms must be an integer from 0 to 3600000.');
       const deadline = e.timeout_ms === undefined ? Infinity : Date.now() + e.timeout_ms;
       const queuedPrompt = notificationPending && !deliveries.get(notificationPending)?.confirmedEvents;
-      if (waiters || queuedPrompt || [...deliveries.values()].some(delivery => delivery.channel === 'tool' && !delivery.confirmedEvents)) return { result: JSON.stringify({ waiting: true, ...(queuedPrompt ? { notificationPending: true, message: 'A notification is queued; finish this turn to receive it.' } : {}), workersContinue: true }) };
+      if (waiters || queuedPrompt || [...deliveries.values()].some(delivery => delivery.channel === 'tool' && !delivery.confirmedEvents)) return { result: JSON.stringify({ waiting: true, ...(queuedPrompt ? { notificationPending: true, message: 'A Codex notification is queued for delivery.' } : {}), workersContinue: true }) };
       waiters++;
       try {
         while (!next.signal?.aborted) {

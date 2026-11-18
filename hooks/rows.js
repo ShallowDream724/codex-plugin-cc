@@ -43,6 +43,9 @@ export function describeCall(tool, input = {}, output, isRunning = false) {
     if (Array.isArray(value?.events) && value.events.length) return value.events.map(event => ({ id: event.agent_id, name: event.name, kind: event.kind, text: eventText(event) }));
     return [{ text: isRunning ? '正在等待 Codex' : value?.parent_idle && value?.active ? '有代理继续工作' : value?.idle ? 'Codex 空闲' : value?.timed_out ? '等待结束，代理继续工作' : value?.cancelled ? '已取消等待，代理继续工作' : '等待 Codex 更新' }];
   }
+  if ((operation === 'followup_task' || operation === 'send_message') && value?.status === 'steer_unconfirmed') {
+    return [{ id: value.agent_id, name: value.name, text: '消息投递未确认' }];
+  }
   if (operation === 'spawn_agent' || operation === 'followup_task') return [{ id: value?.agent_id, name: value?.name || input?.name, text: isRunning ? '正在启动' : operation === 'spawn_agent' ? '开始工作' : '已收到任务' }];
   if (operation === 'list_agents' && Array.isArray(value?.agents)) return value.agents.map(agent => ({ id: agent.agent_id || agent.id, name: agent.name, text: ({ running: '工作中', starting: '正在启动', waiting: '等待中', completed: '已完成', interrupted: '本轮已停止', failed: '失败', unknown: '状态未知', compacting: '正在压缩上下文' })[agent.status] || '已保存' }));
   if (operation === 'close_agent') return [{ text: isRunning ? '正在关闭代理' : value?.closed_count !== undefined ? `已关闭 ${value.closed_count} 个代理${value.skipped?.length ? `，保留 ${value.skipped.length} 个` : ''}` : '代理已关闭，历史已保留' }];

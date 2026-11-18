@@ -169,7 +169,7 @@ export function groupEntries(entries) {
 // The caller feeds its existing low-frequency observe result to observeUI.
 // There are no session hooks, model calls, or delivery acknowledgements here.
 const state = { agents: [], selected: null, requested: null, view: 'agent', error: '', opened: false, timer: null, pages: new Map(), controls: new Map(), folds: new Set(), scroll: new Map(), restore: false, generation: 0 };
-const directory = { openOffset: 0, completedOffset: 0, offset: 0, loading: false, error: '', request: null, minute: 0, restore: null, actions: new Map() };
+const directory = { openOffset: 0, completedOffset: 0, offset: 0, loading: false, error: '', request: null, minute: 0, restore: null, actions: new Map(), confirmStopAll: false, stopFeedback: '' };
 let toggleQueue = Promise.resolve();
 const mergeSummaries = (agents) => {
   const previous = new Map(state.agents.map(agent => [idOf(agent), agent]));
@@ -466,15 +466,34 @@ async function stopAgent($, id) {
   } catch { if (state.controls.get(id) === control) updateAgent(id, { user_control_status: 'unconfirmed' }); }
   finally { control.stopping = false; if (state.opened && state.selected === id) await invalidate($); }
 }
+const directoryOpen = () => state.opened && state.view === 'directory';
+const canStopAllFromDirectory = () => directoryOpen() && !directory.loading && !directory.error && !stoppingAll &&
+  state.agents.some(agent => agent.user_control_status === 'unconfirmed' || (!agent.user_paused && agent.user_control_status !== 'stopping'));
+
 async function stopAllAgents($) {
   if (stoppingAll) return stoppingAll;
-  stoppingAll = (async () => {
+  directory.confirmStopAll = false;
+  directory.stopFeedback = '';
+  const operation = (async () => {
     try {
       const result = await bridge($, 'ui_interrupt_all', {}, { requestId: actionId() });
       if (result.offline) return { text: '当前会话的 Codex 助手未运行，已有记录保留。' };
       if (result.error || !Array.isArray(result.results)) return { text: `停止结果未确认：${failureText(result)}` };
-      const listed = await bridge($, 'ui_list', {}).catch(() => null);
-      if (Array.isArray(listed?.agents)) await observeUI($, listed);
+      if (stoppingAll === operation) {
+        // A list started before the stop can still contain the old pause state.
+        directory.request = null;
+        for (const item of result.results) {
+          const status = item.user_control_status ?? item.status;
+          if (['stopped', 'stopping', 'unconfirmed'].includes(status)) {
+            updateAgent(item.agent_id, { user_paused: item.user_paused ?? true, user_control_status: status });
+          }
+        }
+        const listed = await bridge($, 'ui_list', {}).catch(() => null);
+        if (stoppingAll === operation && Array.isArray(listed?.agents)) {
+          directory.loading = false; directory.error = '';
+          await observeUI($, listed);
+        }
+      }
       if (!result.results.length) return { text: '当前会话没有 Codex 代理。' };
       const stopped = result.results.filter(item => (item.user_control_status ?? item.status) === 'stopped').length;
       const stopping = result.results.filter(item => (item.user_control_status ?? item.status) === 'stopping').length;
@@ -482,11 +501,22 @@ async function stopAllAgents($) {
       return { text: [stopped && `已停止 ${stopped} 个`, stopping && `正在停止 ${stopping} 个`, unconfirmed && `停止未确认 ${unconfirmed} 个`].filter(Boolean).join('；') + ' Codex 代理（含所属子代理）。' };
     } catch (error) { return { text: `停止结果未确认：${failureText(error)}` }; }
   })();
-  try { return await stoppingAll; } finally { stoppingAll = null; }
+  stoppingAll = operation;
+  if (directoryOpen()) void invalidate($);
+  try {
+    const result = await operation;
+    if (stoppingAll === operation) directory.stopFeedback = result.text;
+    return result;
+  } finally {
+    if (stoppingAll === operation) {
+      stoppingAll = null;
+      if (state.opened) await invalidate($);
+    }
+  }
 }
 async function sendAgent($, id) {
   const control = controlFor(id), message = control.draft, attachments = [...control.attachments], attachmentVersion = control.attachmentVersion, stopEpoch = control.stopEpoch;
-  let accepted = false;
+  let refreshActivity = false;
   const selected = state.agents.find((agent) => idOf(agent) === id);
   if (!selected || control.sending || control.stopping || selected.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
   const page = pageFor(id); cancelNavigation(page); page.scrollGeneration++;
@@ -495,8 +525,11 @@ async function sendAgent($, id) {
     const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
     if (result.error || result.offline) {
       control.sendResult = result.offline || result.error?.code === 'action_status_unknown' ? '发送状态未知，请查看活动后再试。' : `发送失败：${safe(result.error?.message || result.error).slice(0, 600)}。草稿已保留。`;
+    } else if (result.agent_id === id && result.status === 'steer_unconfirmed') {
+      refreshActivity = true;
+      control.sendResult = '发送结果未确认。请查看同一代理的活动后再试。草稿已保留。';
     } else if (result.agent_id === id && typeof result.status === 'string') {
-      accepted = true; control.sendResult = '';
+      refreshActivity = true; control.sendResult = '';
       if (control.draft === message) { control.draft = ''; control.inputVersion++; }
       if (control.attachmentVersion === attachmentVersion) { control.attachments = []; control.attachmentVersion++; }
       if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
@@ -505,7 +538,7 @@ async function sendAgent($, id) {
   finally {
     control.sending = false;
     if (state.opened && state.selected === id && state.controls.get(id) === control) {
-      if (accepted) await poll($, true);
+      if (refreshActivity) await poll($, true);
       if (state.opened && state.selected === id && state.controls.get(id) === control) await invalidate($);
     }
   }
@@ -559,14 +592,14 @@ async function chooseAttachments($, id, source = 'file') {
   }
   function stopPane() {
     state.opened = false; state.opening = false; state.imagePreview = null; state.generation++;
-    state.timer?.cancel(); state.timer = null; directory.request = null; directory.loading = false; directory.restore = null;
+    state.timer?.cancel(); state.timer = null; directory.request = null; directory.loading = false; directory.restore = null; directory.confirmStopAll = false;
     for (const page of state.pages.values()) { cancelNavigation(page); page.tailRequest = null; }
   }
   function startPanePolling($) {
     if (!state.timer) state.timer = $.clock.every(1000, () => (state.view === 'directory' ? refreshDirectory($) : poll($)).catch(() => {}));
   }
   async function refreshDirectory($) {
-    if (!state.opened || state.view !== 'directory' || directory.request) return;
+    if (!directoryOpen() || directory.request || stoppingAll) return;
     const request = { generation: state.generation }; directory.request = request;
     try {
       const result = await bridge($, 'ui_list', {});
@@ -580,7 +613,7 @@ async function chooseAttachments($, id, source = 'file') {
     } catch (error) {
       if (directory.request !== request || request.generation !== state.generation) return;
       const message = failureText(error), dirty = directory.loading || directory.error !== message;
-      directory.loading = false; directory.error = message;
+      directory.loading = false; directory.error = message; directory.confirmStopAll = false;
       if (dirty) await invalidate($);
     } finally { if (directory.request === request) directory.request = null; }
   }
@@ -588,7 +621,7 @@ async function chooseAttachments($, id, source = 'file') {
     const previous = state.pages.get(state.selected); if (previous) { cancelNavigation(previous); previous.tailRequest = null; }
     state.opened = true; state.opening = false; state.view = 'directory'; state.selected = null; state.requested = null; state.restore = false; state.imagePreview = null;
     const generation = ++state.generation;
-    directory.request = null; directory.loading = true; directory.error = '';
+    directory.request = null; directory.loading = true; directory.error = ''; directory.confirmStopAll = false;
     directory.restore = { token: ++navigationSequence, generation, offset: directory.offset };
     await invalidateEntry($); await invalidate($);
     await $.ui.open({ id: PANE, title: 'Codex', focus: true, closeOnEscape: true, rows: 24 });
@@ -1190,11 +1223,26 @@ function renderPane($, e, next) {
         await invalidate($);
       };
       const onRetry = async () => { directory.error = ''; directory.loading = true; await invalidate($); await refreshDirectory($); };
+      const onRequestStop = async () => {
+        if (!canStopAllFromDirectory() || directory.confirmStopAll) return;
+        directory.confirmStopAll = true; directory.stopFeedback = ''; await invalidate($);
+      };
+      const onCancelStop = async () => {
+        if (!directoryOpen() || !directory.confirmStopAll) return;
+        directory.confirmStopAll = false; await invalidate($);
+      };
+      const onConfirmStop = async () => {
+        if (directory.confirmStopAll && canStopAllFromDirectory()) await stopAllAgents($);
+      };
+      const stopAll = { available: canStopAllFromDirectory(), confirming: directory.confirmStopAll, pending: !!stoppingAll, feedback: directory.stopFeedback, onRequest: onRequestStop, onCancel: onCancelStop, onConfirm: onConfirmStop };
       for (const agent of state.agents) directory.actions.set(`directory_open_${idOf(agent)}`, () => openAgent($, idOf(agent)));
       directory.actions.set('directory_retry', onRetry);
+      directory.actions.set('directory_stop_all', onRequestStop);
+      directory.actions.set('directory_stop_all_cancel', onCancelStop);
+      directory.actions.set('directory_stop_all_confirm', onConfirmStop);
       return Box({ key: 'codex_directory', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'sm', children: [
         ...(typeof Client === 'function' && directory.restore ? [Box({ position: 'absolute', top: Math.max(0, e.props?.scroll?.offset || 0), left: 0, width: 1, height: 1, children: [Client({ key: 'codex_directory_sync', module: './navigation-sync.js', props: { token: directory.restore.token }, width: 1, height: 1 })] })] : []),
-        renderAgentDirectory(ui, { agents: state.agents, surface: e.surface, columns: e.props?.bodyColumns, openOffset: directory.openOffset, completedOffset: directory.completedOffset, loading: directory.loading, error: directory.error, onOpen: id => openAgent($, id), onPage, onRetry }),
+        renderAgentDirectory(ui, { agents: state.agents, surface: e.surface, columns: e.props?.bodyColumns, openOffset: directory.openOffset, completedOffset: directory.completedOffset, loading: directory.loading, error: directory.error, onOpen: id => openAgent($, id), onPage, onRetry, stopAll }),
       ] });
     }
     // A native scroll already schedules a render. Reuse the entire transcript
@@ -1698,11 +1746,12 @@ function renderPane($, e, next) {
     page.renderCache = { key: frameKey, draft: control.draft, draw: scroll => root(content, scroll) };
     return tree;
 }
-export function closeUI() { stopPane(); state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.view = 'agent'; state.error = ''; entrySignature = ''; directory.openOffset = 0; directory.completedOffset = 0; directory.offset = 0; directory.error = ''; directory.actions.clear(); }
+export function closeUI() { stopPane(); state.pages.clear(); state.controls.clear(); state.folds.clear(); state.scroll.clear(); state.agents = []; state.selected = null; state.requested = null; state.view = 'agent'; state.error = ''; entrySignature = ''; directory.openOffset = 0; directory.completedOffset = 0; directory.offset = 0; directory.error = ''; directory.stopFeedback = ''; directory.actions.clear(); stoppingAll = null; }
 export async function observeUI($, result) {
     if (!Array.isArray(result?.agents)) return;
     const before = JSON.stringify(state.agents);
     state.agents = mergeSummaries(result.agents);
+    if (!canStopAllFromDirectory()) directory.confirmStopAll = false;
     await invalidateEntry($);
     const ids = new Set(state.agents.map(idOf));
     for (const id of state.controls.keys()) if (!ids.has(id)) state.controls.delete(id);

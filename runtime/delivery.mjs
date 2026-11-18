@@ -27,8 +27,8 @@ export function formatDeliveryEvent(event) {
   const { message, ...receipt } = event;
   const target = `Codex 子代理 ${event.name || event.agent_id}`;
   const tree = `${target} 及其子代理`;
-  const summary = ({ requested: `用户已请求停止 ${tree}。`, stopping: `${tree} 正在按用户要求停止。`,
-      confirmed: `${tree} 已按用户要求停止。`, unconfirmed: `用户请求停止 ${tree}，停止状态未确认。` })[event.phase] || `${tree} 的用户停止请求状态已更新。`;
+  const summary = ({ requested: `用户已请求停止 ${tree}。`, stopping: `${tree}正在按用户要求停止。`,
+      confirmed: `${target} 及其已知子代理已按用户要求停止。`, unconfirmed: `用户请求停止 ${tree}，停止状态未确认。` })[event.phase] || `${tree}的用户停止请求状态已更新。`;
   return { ...receipt, kind: 'user_action_receipt', summary };
 }
 

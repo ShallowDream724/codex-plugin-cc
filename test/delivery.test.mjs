@@ -56,7 +56,7 @@ test('an old lease containing only compaction does not block the next useful not
 
 test('stop receipts distinguish requested, stopped, and unconfirmed without a new task message', () => {
   const base = { seq: 1, agent_id: 'a', name: 'worker', kind: 'message', origin: 'user', action: 'interrupt', message: 'Stop status detail' };
-  for (const [phase, expected] of [['requested', '用户已请求停止 Codex 子代理 worker 及其子代理。'], ['stopping', 'Codex 子代理 worker 及其子代理 正在按用户要求停止。'], ['confirmed', 'Codex 子代理 worker 及其子代理 已按用户要求停止。'], ['unconfirmed', '用户请求停止 Codex 子代理 worker 及其子代理，停止状态未确认。']]) {
+  for (const [phase, expected] of [['requested', '用户已请求停止 Codex 子代理 worker 及其子代理。'], ['stopping', 'Codex 子代理 worker 及其子代理正在按用户要求停止。'], ['confirmed', 'Codex 子代理 worker 及其已知子代理已按用户要求停止。'], ['unconfirmed', '用户请求停止 Codex 子代理 worker 及其子代理，停止状态未确认。']]) {
     const receipt = formatDeliveryEvent({ ...base, phase });
     assert.equal(receipt.summary, expected); assert.equal(receipt.kind, 'user_action_receipt');
     assert.equal(receipt.message, undefined); assert.equal(receipt.status_detail, undefined);

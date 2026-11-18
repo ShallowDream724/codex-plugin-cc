@@ -7,6 +7,7 @@ import { loadSettings, permissionParams } from './settings.mjs';
 import { loadGuidance, defaultRole, resolveNativeDefault, externalClientTools } from './roles.mjs';
 import { prepareAttachments, directUserInput } from './attachments.mjs';
 import { AUTOMATIC_TURN_EVENTS, isCompactionStatus, isUserSend, parentDeliveryEvents } from './event-routing.mjs';
+import { ACTION_PREFLIGHT_FAILURE } from './receipts.mjs';
 import { MODEL_RECOVERY_TARGET_PREFIX, modelRecoveryDetails, modelRecoveryError, modelRecoveryOptions, pendingModelRecovery, providerModelUnavailable, readVisibleModels, replacementEffort, selectModelRecovery, unsupportedChatGPTLogin } from './model-recovery.mjs';
 
 const CONTINUE = 'Continue the existing task from the compacted context. Do not repeat completed work.';
@@ -16,6 +17,7 @@ const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'unknown']);
 const APPROVALS = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'mcpServer/elicitation/request']);
 const object = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const nonempty = (x) => typeof x === 'string' && x.trim().length > 0;
+const preflightFailure = error => Object.assign(error, { [ACTION_PREFLIGHT_FAILURE]: true });
 const CONTEXT_SOURCES = new Set(['new', 'claude', 'codex', 'unknown']);
 function storedContextSource(a) {
   if (CONTEXT_SOURCES.has(a.contextSource)) return a.contextSource;
@@ -196,8 +198,8 @@ export class AgentController extends EventEmitter {
 
   find(target) {
     if (typeof target === 'string' && target.startsWith('codex://threads/')) target = target.slice('codex://threads/'.length);
-    const matches = [...this.agents.values()].filter((a) => a.id === target || a.threadId === target || a.name === target);
-    if (matches.length !== 1) throw new Error(matches.length ? 'Ambiguous agent target.' : 'Unknown agent target.');
+    const matches = nonempty(target) ? [...this.agents.values()].filter((a) => a.id === target || a.threadId === target || a.name === target) : [];
+    if (matches.length !== 1) throw preflightFailure(new Error(matches.length ? 'Ambiguous agent target.' : 'Unknown agent target.'));
     return matches[0];
   }
 
@@ -239,9 +241,9 @@ export class AgentController extends EventEmitter {
     if (nonempty(threadName)) a.threadName = threadName;
   }
 
-  async rpc(method, params) {
+  async rpc(method, params, timeoutMs = 120000) {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
-    return Promise.race([this.client.request(method, params, { timeoutMs: 120000 }), this.closedPromise.then(() => { throw new Error('App-server connection closed.'); })]);
+    return Promise.race([this.client.request(method, params, { timeoutMs }), this.closedPromise.then(() => { throw new Error('App-server connection closed.'); })]);
   }
 
   visibleModels(provider) {
@@ -269,12 +271,25 @@ export class AgentController extends EventEmitter {
 
   async listAgents(includeModelDiagnostics) {
     const agents = [...this.agents.values()];
-    if (!includeModelDiagnostics) return { agents: agents.map(a => this.view(a)) };
+    const status = a => {
+      const row = this.view(a);
+      if (row.error?.code === 'agent_model_unavailable' && Array.isArray(row.error.recovery_choices)) {
+        // Choices belong to a particular catalog read. Expose current choices
+        // under model_recovery; keep only the historical outcome under error.
+        const { available_models, recommended_model, recovery_choices, retry_after_access_fix, ...failure } = row.error;
+        failure.message = failure.during_compaction ? 'Context recovery failed.'
+          : failure.model_turn_started ? 'The turn failed because its model was unavailable.'
+          : 'The requested model was unavailable. No turn was started.';
+        row.error = failure;
+      }
+      return row;
+    };
+    if (!includeModelDiagnostics) return { agents: agents.map(status) };
     const rows = await Promise.all(agents.map(async a => {
       const gate = a.modelRecovery;
       const diagnosis = gate ? await this.failureCatalog(a) : null;
       if (this.agents.get(a.id) !== a) return null;
-      const row = this.view(a);
+      const row = status(a);
       if (gate && a.modelRecovery === gate) {
         Object.assign(row.model_recovery, modelRecoveryOptions(a, diagnosis.catalog));
         if (diagnosis.hint) row.model_recovery.message = diagnosis.hint + ' ' + row.model_recovery.message;
@@ -371,61 +386,108 @@ export class AgentController extends EventEmitter {
     }
   }
 
+  async checkSpawnModel({ model, provider, role, a, catalog, resolvedModel }) {
+    if (!nonempty(model)) return;
+    const state = a ? `Native thread ${a.threadId} is registered as agent ${a.id}. No turn was started.` : 'No agent or native thread was created.';
+    const details = { model, model_turn_started: false, ...(a ? { agent_id: a.id, thread_id: a.threadId } : {}) };
+    const scope = provider ? ` for provider ${provider}` : '';
+    try { catalog ??= await this.visibleModels(provider); }
+    catch (cause) {
+      const recovery = 'Retry spawn_agent once the model catalog is available.';
+      throw Object.assign(new Error([`Could not verify the Codex model catalog${scope}.`, state, catalogFailureHint(cause.code), recovery].filter(Boolean).join(' '), { cause }),
+        { ...details, code: 'model_catalog_unavailable', recovery });
+    }
+    const mismatch = nonempty(resolvedModel) && resolvedModel !== model;
+    if (catalog.has(model) && !mismatch) return catalog;
+    const available_models = [...catalog.keys()];
+    if (!catalog.has(model)) {
+      const recovery = available_models.length
+        ? `Call spawn_agent with a model the user has chosen from available_models. Ask which model to use if their choice is unclear.${role ? ' Omit the unavailable role preset or update its configured model first.' : ''}`
+        : 'Retry spawn_agent when the catalog lists a selectable model.';
+      throw Object.assign(new Error(`Model ${model} is absent from the visible Codex model catalog${scope}. ${state} ${recovery}`),
+        { ...details, code: 'agent_model_unavailable', reason: 'model_not_listed', available_models, recovery });
+    }
+    const recovery = 'Check the Codex configuration, then call spawn_agent with the model you intend to use.';
+    throw Object.assign(new Error(`Codex resolved model ${resolvedModel} for requested model ${model}. ${state} ${recovery}`),
+      { ...details, code: 'model_resolution_mismatch', resolved_model: resolvedModel, available_models, recovery });
+  }
+
   async spawn({ message, cwd, model, reasoning_effort, name, context_mode, snapshot, role }) {
     if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
     let roleInstructions = '';
     if (role !== undefined) {
-      if (role !== 'default') throw new TypeError('Unknown role.');
+      if (role !== 'default') throw preflightFailure(new TypeError('Unknown role.'));
       const preset = defaultRole(this.guidance);
-      if (model !== undefined && model !== preset.model || reasoning_effort !== undefined && reasoning_effort !== preset.reasoning_effort || context_mode !== undefined && context_mode !== 'none') throw new TypeError('role default requires its configured model, effort, and context_mode none.');
+      if (model !== undefined && model !== preset.model || reasoning_effort !== undefined && reasoning_effort !== preset.reasoning_effort || context_mode !== undefined && context_mode !== 'none') throw preflightFailure(new TypeError('role default requires its configured model, effort, and context_mode none.'));
       model = preset.model; reasoning_effort = preset.reasoning_effort; context_mode = 'none'; roleInstructions = `${preset.instructions}\n\n`;
     }
     context_mode ??= 'available';
-    if (!nonempty(message) || !nonempty(cwd)) throw new TypeError('message and cwd are required.');
-    if (!path.posix.isAbsolute(cwd) && !path.win32.isAbsolute(cwd)) throw new TypeError('cwd must be an absolute path.');
-    if (!['available', 'none'].includes(context_mode)) throw new TypeError('context_mode must be available or none.');
+    if (!nonempty(message) || !nonempty(cwd)) throw preflightFailure(new TypeError('message and cwd are required.'));
+    if (!path.posix.isAbsolute(cwd) && !path.win32.isAbsolute(cwd)) throw preflightFailure(new TypeError('cwd must be an absolute path.'));
+    if (!['available', 'none'].includes(context_mode)) throw preflightFailure(new TypeError('context_mode must be available or none.'));
     if (context_mode === 'available' && (!object(snapshot) || !Array.isArray(snapshot.history) || !nonempty(snapshot.digest) || !object(snapshot.stats))) {
-      throw new Error('context_mode available requires a validated snapshot.');
+      throw preflightFailure(new Error('context_mode available requires a validated snapshot.'));
     }
     const reservation = Symbol('spawn'); this.reserve(reservation);
+    const stopAllEpoch = this.stopAllEpoch;
+    let nativeDefault, provider, configuredModel, catalog, pendingConfig;
+    try {
+      // The workspace configuration may establish the provider before thread/start.
+      // Reuse the native role read and prefer the provider returned by thread/start.
+      const readConfig = () => pendingConfig ??= this.rpc('config/read', { cwd, includeLayers: true }, 1500);
+      if (role === undefined) nativeDefault = await this.nativeRoleResolver({ cwd, guidance: this.guidance, readConfig });
+      const configuration = pendingConfig || nonempty(model) ? (await readConfig().catch(() => undefined))?.config : undefined;
+      provider = nonempty(configuration?.model_provider) ? configuration.model_provider : undefined;
+      configuredModel = configuration?.model;
+      if (provider && nonempty(model)) catalog = await this.checkSpawnModel({ model, provider, role });
+      if (this.stopAllInProgress || this.stopAllEpoch !== stopAllEpoch) throw new Error('A user stop-all action interrupted agent creation; retry afterward.');
+    } finally { this.reservations.delete(reservation); }
     const createdAtMs = now();
     const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, role, createdAtMs, lastActivityAtMs: createdAtMs, contextSource: context_mode === 'available' ? 'claude' : 'new', status: 'starting', activity: 'starting',
       pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: true, recoveryUsed: false, interrupted: false, spawning: true };
     this.agents.set(a.id, a);
-    this.reservations.delete(reservation);
     this.starting++;
-    let spawnTurnId = null;
+    let spawnTurnId = null, recordSpawnAction = false;
     try {
-      const nativeDefault = role === undefined ? await this.nativeRoleResolver({ cwd, guidance: this.guidance, readConfig: (params) => this.rpc('config/read', params) }) : undefined;
       const response = await this.rpc('thread/start', { cwd, ...(model ? { model } : {}), ...permissionParams(this.settings), ephemeral: false, serviceTier: 'default',
         config: roleConfig(role) ?? { 'features.default_mode_request_user_input': true, ...nativeDefault }, dynamicTools: role === 'default' ? [] : [{ type: 'function', name: 'notify_parent',
           description: 'Send a necessary coordination message to Claude without waiting for a reply.', inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'], additionalProperties: false } }] });
       if (!nonempty(response.thread?.id)) throw new Error('thread/start returned no thread id.');
       this.updateResolved(a, response);
+      if (!nonempty(a.model) && nonempty(configuredModel) && provider && a.modelProvider === provider) a.model = configuredModel;
+      a.modelProvider ??= provider;
       a.threadId = response.thread.id;
       this.unlinkedTurns.delete(a.threadId);
       if (a.userPaused) { this.pausedThreads.add(a.threadId); a.pauseDurable = this.persist(); await a.pauseDurable; }
       this.threads.set(a.threadId, a);
       this.linkDescendants();
       this.replayEarly(a.threadId);
+      if (!a.interrupted) catalog = await this.checkSpawnModel({ model: model ?? a.model, provider: a.modelProvider, role, a,
+        catalog: a.modelProvider === provider ? catalog : undefined, resolvedModel: a.model });
+      if (a.interrupted) {
+        if (!a.turnId && ACTIVE.has(a.status)) this.finish(a, 'interrupted', { reason: 'interrupt' });
+        return { ...this.view(a), context_snapshot: null };
+      }
+      recordSpawnAction = true;
       if (context_mode === 'available') {
         await this.rpc('thread/inject_items', { threadId: a.threadId, items: snapshot.history });
         a.snapshot = { digest: snapshot.digest, stats: snapshot.stats };
         a.injected = true;
       }
       const collaboration = role === 'default' ? 'Claude is your parent agent.\n\n' : `${this.guidance.collaboration.trim()}\n\n`;
-      if (!a.interrupted) spawnTurnId = await this.startTurn(a, collaboration + roleInstructions + message, { newTask: true });
+      if (!a.interrupted) spawnTurnId = await this.startTurn(a, collaboration + roleInstructions + message, { newTask: true, plan: { model: a.model, effort: a.effort, catalog } });
       return { ...this.view(a), context_snapshot: a.snapshot ? { ...copy(a.snapshot), ...(Object.hasOwn(snapshot, 'preview') ? { preview: copy(snapshot.preview) } : {}) } : null };
     } catch (error) {
       spawnTurnId = error[STARTED_TURN_ID] ?? null;
-      if (ACTIVE.has(a.status) && !a.turnId) this.finish(a, this.closing ? 'interrupted' : 'failed', { message: error.message });
-      if (error.code === 'agent_model_unavailable') throw error;
+      const modelPreflightFailed = ['agent_model_unavailable', 'model_catalog_unavailable', 'model_resolution_mismatch'].includes(error.code);
+      if (ACTIVE.has(a.status) && !a.turnId) this.finish(a, this.closing || a.interrupted ? 'interrupted' : 'failed', { ...(modelPreflightFailed ? error : {}), message: error.message });
+      if (modelPreflightFailed) throw Object.assign(error, { status: a.status });
       const recovery = a.threadId ? `Inspect or continue agent ${a.id} on native thread ${a.threadId}; do not create replacement work until its state is known.` : `Agent ${a.id} has no confirmed native thread; inspect its status or close it before retrying.`;
       throw Object.assign(new Error(`Agent ${a.id}${a.threadId ? ` (thread ${a.threadId})` : ''}: ${error.message} ${recovery}`, { cause: error }), { agent_id: a.id, thread_id: a.threadId ?? null, status: a.status, recovery });
     } finally {
       // Bind the local task placeholder to this exact first turn. A native
       // completion may already have cleared a.turnId before turn/start replies.
-      if (a.threadId) this.action('spawn', a, message, undefined, undefined, spawnTurnId);
+      if (recordSpawnAction) this.action('spawn', a, message, undefined, undefined, spawnTurnId);
       a.spawning = false;
       if (a.interrupted) this.stopTree(a).catch(() => {});
       this.starting--;
@@ -650,25 +712,25 @@ export class AgentController extends EventEmitter {
   }
 
   async followup(target, message, replacementModel) {
-    if (!nonempty(message)) throw new TypeError('message must be nonempty.');
+    if (!nonempty(message)) throw preflightFailure(new TypeError('message must be nonempty.'));
     if (typeof target === 'string' && target.startsWith(MODEL_RECOVERY_TARGET_PREFIX)) {
       const selection = selectModelRecovery(this.agents.values(), target);
-      if (!selection) throw staleModelRecoveryTarget();
+      if (!selection) throw preflightFailure(staleModelRecoveryTarget());
       if (selection.consumed) throw consumedModelRecovery(selection.agent);
       return this.send(selection.agent, message, { followup: true, replacementModel: selection.model, recoveryTicket: selection.ticket, retryAfterFix: selection.retryAfterFix });
     }
-    if (replacementModel !== undefined && !nonempty(replacementModel)) throw new TypeError('replacement_model must be nonempty.');
+    if (replacementModel !== undefined && !nonempty(replacementModel)) throw preflightFailure(new TypeError('replacement_model must be nonempty.'));
     const threadLink = typeof target === 'string' && target.startsWith('codex://threads/');
     let id = threadLink ? target.slice('codex://threads/'.length) : target;
     if (typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) id = id.toLowerCase();
-    const matches = [...this.agents.values()].filter((a) => a.id === id || a.threadId === id || a.name === id);
-    if (matches.length > 1) throw new Error('Ambiguous agent target. Use an agent ID.');
+    const matches = nonempty(id) ? [...this.agents.values()].filter((a) => a.id === id || a.threadId === id || a.name === id) : [];
+    if (matches.length > 1) throw preflightFailure(new Error('Ambiguous agent target. Use an agent ID.'));
     const existing = matches[0];
     if (this.adoptions.has(existing?.threadId ?? id)) throw new Error(`Thread ${existing?.threadId ?? id} is already being adopted; retry using the registered agent after it completes.`);
     if (existing) return this.send(existing, message, { followup: true, replacementModel });
-    if (replacementModel !== undefined) throw new Error('The requested agent has no registered model recovery. Call followup_task with its agent ID or native Codex thread link and your intended message to check its current model.');
+    if (replacementModel !== undefined) throw preflightFailure(new Error('The requested agent has no registered model recovery. Call followup_task with its agent ID or native Codex thread link and your intended message to check its current model.'));
     if (this.stopAllInProgress) throw new Error('A user stop-all action is in progress; retry afterward.');
-    if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Unknown agent target; native thread IDs must be UUIDs.');
+    if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw preflightFailure(new Error('Unknown agent target; native thread IDs must be UUIDs.'));
     const reservation = Symbol('adopt'); this.reserve(reservation);
     const stopAllEpoch = this.stopAllEpoch;
     this.adoptions.set(id, true);
@@ -697,7 +759,10 @@ export class AgentController extends EventEmitter {
         await this.persist();
         if (a.userPaused) throw new Error(`Agent ${a.id} remains paused by the user. Resume it with a direct user message in the interface.`);
         const result = await this.send(a, message, { followup: true, existingReservation: reservation });
-        return { ...result, client_tools_unavailable: clientTools, limitations: ['Original client dynamic tools are unavailable here. Continue in the original Codex client if those tools are needed.'] };
+        const limitation = clientTools.status === 'unknown'
+          ? 'The original client’s dynamic tools could not be verified. If a needed tool is unavailable here, continue in the original Codex client.'
+          : clientTools.tools.length ? 'Original client dynamic tools are unavailable here. Continue in the original Codex client if those tools are needed.' : undefined;
+        return { ...result, client_tools_unavailable: clientTools, ...(limitation ? { limitations: [limitation] } : {}) };
       } catch (error) {
         if (['agent_model_unavailable', 'model_catalog_unavailable'].includes(error.code)) throw error;
         throw new Error(`Thread ${id} is registered as agent ${a.id}. ${error.message} Inspect the thread in Codex or retry using this agent ID; do not create replacement work.`, { cause: error });
@@ -709,7 +774,7 @@ export class AgentController extends EventEmitter {
   }
 
   async send(a, message, { followup = false, existingReservation, origin, resumeToken, attachments = [], replacementModel, recoveryTicket, retryAfterFix } = {}) {
-    if (!nonempty(message) && !(origin === 'user' && attachments.length)) throw new TypeError('message must be nonempty.');
+    if (!nonempty(message) && !(origin === 'user' && attachments.length)) throw preflightFailure(new TypeError('message must be nonempty.'));
     if (a.userResumeToken && a.userResumeToken !== resumeToken) throw new Error('A direct user message is resuming this agent; retry after it completes.');
     if (a.userPaused) throw new Error('This agent is paused by the user. The user can resume it with a direct message in the Codex interface.');
     const epoch = a.controlEpoch ?? 0;
@@ -734,7 +799,12 @@ export class AgentController extends EventEmitter {
         // The acknowledgement can arrive after this turn completed and even
         // after another turn started. Never transfer ownership of that new turn.
         const crossedCompletion = a.turnId !== turnId || a.completedTurns.has(turnId);
-        if (followup && origin !== 'user' && !crossedCompletion && turnOrigin === 'user' && a.turnOrigin === 'user') {
+        if (crossedCompletion) {
+          await this.persist();
+          return { agent_id: a.id, status: 'steer_unconfirmed', turn_id: turnId,
+            recovery: 'The turn completed while Codex was acknowledging the message. The message outcome is unknown. Inspect the same agent before retrying.' };
+        }
+        if (followup && origin !== 'user' && turnOrigin === 'user' && a.turnOrigin === 'user') {
           // A private final item may precede the turn completion notification.
           // Never reuse that already-observed text as the new parent's result.
           a.result = null; a.unclassifiedResult = null;
@@ -742,8 +812,7 @@ export class AgentController extends EventEmitter {
         }
         this.action('send', a, message, origin, attachments, turnId);
         await this.persist();
-        return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId,
-          ...(crossedCompletion ? { recovery: 'The turn completed while the steer was being accepted. The message outcome is unknown; inspect the same agent before retrying.' } : {}) };
+        return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
       } finally { a.sending--; if (a.interrupted) this.stopTree(a).catch(() => {}); }
     }
     if (a.resuming) throw new Error('Agent followup is already starting.');
@@ -822,11 +891,11 @@ export class AgentController extends EventEmitter {
 
   async closeSelected(args) {
     const { target, targets, except } = args;
-    if (target !== undefined && targets !== undefined) throw new TypeError('Specify target or targets, not both.');
-    if (except !== undefined && (!Array.isArray(except) || except.some((x) => !nonempty(x)))) throw new TypeError('except must be an array of nonempty targets.');
-    if (except !== undefined && targets !== 'all') throw new TypeError('except is only valid with targets all.');
+    if (target !== undefined && targets !== undefined) throw preflightFailure(new TypeError('Specify target or targets, not both.'));
+    if (except !== undefined && (!Array.isArray(except) || except.some((x) => !nonempty(x)))) throw preflightFailure(new TypeError('except must be an array of nonempty targets.'));
+    if (except !== undefined && targets !== 'all') throw preflightFailure(new TypeError('except is only valid with targets all.'));
     if (targets === undefined && target !== undefined && except === undefined) return this.closeAgent(this.find(target));
-    if (targets !== 'all' && (!Array.isArray(targets) || targets.length === 0 || targets.some((x) => !nonempty(x)))) throw new TypeError('targets must be all or a nonempty array of targets.');
+    if (targets !== 'all' && (!Array.isArray(targets) || targets.length === 0 || targets.some((x) => !nonempty(x)))) throw preflightFailure(new TypeError('targets must be all or a nonempty array of targets.'));
     const excluded = new Set((except ?? []).map((x) => this.find(x).id));
     const selected = targets === 'all' ? [...this.agents.values()] : targets.map((x) => this.find(x));
     const snapshot = [...new Map(selected.filter((a) => !excluded.has(a.id)).map((a) => [a.id, a])).values()];
@@ -900,7 +969,7 @@ export class AgentController extends EventEmitter {
     } catch (error) {
       a.status = 'unknown'; a.activity = 'subscription recovery required';
       a.error = { code: 'subscription_restore_failed', message: error.message, recovery: `Inspect native thread ${a.threadId} in Codex, then retry an operation on agent ${a.id} to reconcile its state.` };
-      this.publish(a, 'message', { code: 'subscription_restore_failed', message: `Closing agent ${a.id} was cancelled and subscription recovery is unconfirmed: ${error.message}. ${a.error.recovery}` });
+      this.publish(a, 'message', { code: 'subscription_restore_failed', message: `Closing agent ${a.id} was cancelled and subscription recovery is unconfirmed: ${error.message}\n${a.error.recovery}` });
       await this.persist();
     }
   }
@@ -910,16 +979,19 @@ export class AgentController extends EventEmitter {
     return this.stopTree(a);
   }
 
-  prepareUserInterrupt(a) {
+  prepareUserInterrupt(a, { quietIfIdle = false } = {}) {
     const changed = !a.userPaused;
     a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
     if (a.threadId) this.pausedThreads.add(a.threadId);
     for (const [threadId, root] of this.descendants) if (root === a) this.pausedThreads.add(threadId);
     if (!a.stopPromise) a.interruptSent = new Map();
     if (changed) {
-      a.userControlStatus = 'stopping';
+      // Bulk pause also locks completed conversations. Only notify Claude
+      // when this action may actually interrupt work in the agent's tree.
+      const alreadyIdle = quietIfIdle && !this.treeBusy(a);
+      a.userControlStatus = alreadyIdle ? 'stopped' : 'stopping';
       this.action('interrupt', a, undefined, 'user');
-      this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'requested', message: 'The user requested that this agent and its descendants stop.' });
+      if (!alreadyIdle) this.publish(a, 'message', { origin: 'user', action: 'interrupt', phase: 'requested', message: 'The user requested that this agent and its descendants stop.' });
     }
   }
 
@@ -939,7 +1011,7 @@ export class AgentController extends EventEmitter {
     this.stopAllEpoch++;
     const agents = [...this.agents.values()];
     // Install every in-memory barrier before yielding to persistence or RPCs.
-    for (const a of agents) this.prepareUserInterrupt(a);
+    for (const a of agents) this.prepareUserInterrupt(a, { quietIfIdle: true });
     const durable = this.persist();
     for (const a of agents) a.pauseDurable = durable;
     const run = async () => {
@@ -986,7 +1058,8 @@ export class AgentController extends EventEmitter {
         const result = await this.send(a, message, { followup: true, origin: 'user', resumeToken, attachments: files });
         if (wasPaused && !a.userPaused && a.threadId) this.pausedThreads.delete(a.threadId);
         await this.persist();
-        return { ...result, delivery: result.status === 'steered' ? 'steered' : 'started', user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
+        const delivery = ['steered', 'steer_unconfirmed'].includes(result.status) ? result.status : 'started';
+        return { ...result, delivery, user_paused: !!a.userPaused, user_control_status: a.userControlStatus ?? null };
       } catch (error) {
         if (wasPaused && !a.userPaused) {
           a.userPaused = true; a.interrupted = true; a.controlEpoch = (a.controlEpoch ?? 0) + 1;
@@ -1202,7 +1275,10 @@ export class AgentController extends EventEmitter {
       case 'serverRequest/resolved':
         a.pending = a.pending.filter((r) => r.wireId !== p.requestId);
         this.pruneRequestEvents(a);
-        if (!a.pending.length && a.status === 'waiting') a.status = 'running';
+        if (!a.pending.length && a.status === 'waiting') {
+          a.status = 'running';
+          a.activity = 'working';
+        }
         break;
       case 'turn/completed':
         if (!p.turn?.id || a.completedTurns.has(p.turn.id) || a.turnId && a.turnId !== p.turn.id || a.terminalEmitted && a.turnId !== p.turn.id) return;

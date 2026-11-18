@@ -90,15 +90,14 @@ function recommendedModel(oldId, ids) {
 
 export function modelRecoveryOptions(agent, catalog) {
   if (!catalog) {
-    return { message: `The visible model catalog was not verified. Use list_agents to check the current model, status, and recovery choices for agent ${agent.id} without sending a task.` };
+    return { message: `Could not verify the model catalog. Use list_agents to refresh recovery choices for agent ${agent.id}.` };
   }
 
   const { model, reason, ticket, rejectedModels = [] } = agent.modelRecovery;
   const available_models = [...catalog.keys()];
-  const catalogSummary = available_models.length ? 'The complete visible model list is in available_models. ' : '';
   if (reason === MODEL_NOT_LISTED && catalog.has(model)) {
     return { available_models, recovery_choices: [],
-      message: `${catalogSummary}Model ${model} is visible again. Use a regular followup_task with agent ID ${agent.id} and your intended message to continue with this model.` };
+      message: `Model ${model} is visible again. Call followup_task with agent ID ${agent.id} as target and your original message.` };
   }
 
   const rejected = new Set(rejectedModels);
@@ -107,21 +106,22 @@ export function modelRecoveryOptions(agent, catalog) {
   const recommended_model = recommendedModel(model, eligible);
   const recovery_choices = eligible.map(id => ({ model: id, target: recoveryTarget(ticket, id) }));
   const retry_after_access_fix = available_models.filter(id => rejected.has(id)).map(id => ({ model: id, target: recoveryTarget(ticket, id, true) }));
-  let message;
+  const guidance = [];
   if (eligible.length) {
-    const selection = recommended_model
-      ? `Possible successor: ${recommended_model}. Use the user's chosen model from recovery_choices, and ask if their choice is unclear.`
-      : 'Ask the user which model to use from recovery_choices unless they already chose an eligible model.';
-    message = `${selection} Call followup_task with target set to the selected recovery target and message set to your original message. Successful recovery keeps this thread and pins the selected model for later followups.`;
+    if (recommended_model) guidance.push(`${recommended_model} is a possible successor.`);
+    guidance.push("Use the user's choice from recovery_choices, or ask them to choose.");
   } else {
-    const status = available_models.length ? 'The visible catalog has no selectable replacement.' : 'The visible model catalog is empty.';
-    message = `${status} Once the model catalog changes, use list_agents to check for choices for agent ${agent.id}.`;
+    guidance.push(available_models.length ? 'No replacement is available.' : 'The visible model catalog is empty.');
+    guidance.push('Use list_agents after the catalog changes.');
   }
   if (retry_after_access_fix.length) {
-    message += ' If the user confirms that access is restored or a verified compatibility issue is fixed, call followup_task with the matching retry_after_access_fix target and your original message.';
+    guidance.push('To retry a rejected model, use retry_after_access_fix only after the user confirms restored access or a verified compatibility fix.');
+  }
+  if (eligible.length || retry_after_access_fix.length) {
+    guidance.push('Call followup_task with the chosen target and the original message.');
   }
   return { available_models, recovery_choices, ...(recommended_model ? { recommended_model } : {}),
-    ...(retry_after_access_fix.length ? { retry_after_access_fix } : {}), message: catalogSummary + message };
+    ...(retry_after_access_fix.length ? { retry_after_access_fix } : {}), message: guidance.join(' ') };
 }
 
 export function modelRecoveryDetails(agent, catalog, modelTurnStarted, { invalidReplacement, rejectedReplacement, duringCompaction, turnId, chatgptLoginUnsupported } = {}) {
@@ -129,22 +129,24 @@ export function modelRecoveryDetails(agent, catalog, modelTurnStarted, { invalid
   const { message: recovery, ...options } = modelRecoveryOptions(agent, catalog);
   let explanation;
   const previouslyRejected = invalidReplacement !== undefined && rejectedModels.includes(invalidReplacement);
-  if (invalidReplacement === model) explanation = `The requested replacement ${model} is the same as the unavailable model. No turn was started.`;
-  else if (previouslyRejected) explanation = `Codex previously rejected replacement model ${invalidReplacement} as unavailable for this thread. No turn was started.`;
-  else if (invalidReplacement !== undefined) explanation = `The requested replacement ${invalidReplacement} is absent from the visible Codex model catalog. No turn was started.`;
-  else if (rejectedReplacement) explanation = `Codex rejected replacement model ${rejectedReplacement} as unavailable for this thread. No turn was started.`;
-  else if (duringCompaction) {
+  if (invalidReplacement === model) explanation = `The requested replacement ${model} is the same as the unavailable model.`;
+  else if (previouslyRejected) explanation = `Codex previously rejected replacement model ${invalidReplacement} as unavailable.`;
+  else if (invalidReplacement !== undefined) explanation = `The requested replacement ${invalidReplacement} is absent from the visible Codex model catalog.`;
+  else if (rejectedReplacement) explanation = `Codex rejected replacement model ${rejectedReplacement} as unavailable.`;
+  else if (modelTurnStarted) {
+    const turn = duringCompaction ? `Context recovery turn${turnId ? ` ${turnId}` : ''}` : turnId ? `Turn ${turnId}` : 'The turn';
+    explanation = `${turn} failed because Codex rejected model ${model} as unavailable.`;
+  } else if (duringCompaction) {
     explanation = reason === PROVIDER_UNAVAILABLE
       ? `Context recovery stopped because Codex rejected model ${model} as unavailable.`
       : `Context recovery stopped because model ${model} is absent from the visible Codex model catalog.`;
-  }
-  else if (modelTurnStarted) explanation = `${turnId ? `Turn ${turnId}` : 'The turn'} failed because Codex rejected model ${model} as unavailable.`;
-  else if (reason === PROVIDER_UNAVAILABLE) explanation = `Codex rejected model ${model} as unavailable for this thread. No turn was started.`;
-  else explanation = `Model ${model} is absent from the visible Codex model catalog. No turn was started.`;
+  } else if (reason === PROVIDER_UNAVAILABLE) explanation = `Codex rejected model ${model} as unavailable for this thread.`;
+  else explanation = `Model ${model} is absent from the visible Codex model catalog.`;
+  if (!modelTurnStarted) explanation += ' No turn was started.';
   const troubleshoot = chatgptLoginUnsupported
-    ? ' Codex explicitly reports that this model does not support ChatGPT account login. Check whether this CLI session is using the intended account type.'
+    ? " This model does not support ChatGPT account login. Check the CLI session's account type."
     : reason === PROVIDER_UNAVAILABLE || rejectedReplacement || previouslyRejected
-    ? ` Confirm the thread's provider${agent.modelProvider ? ` (${agent.modelProvider})` : ''} and the exact model ID. Check any custom model catalog and verify that the upstream provider offers the ID to the configured account.`
+    ? ` Verify that the thread's provider${agent.modelProvider ? ` (${agent.modelProvider})` : ''} offers this exact model ID to the configured account.`
     : '';
   const message = `${explanation}${troubleshoot} ${recovery}`;
   return { code: 'agent_model_unavailable', message, reason, agent_id: agent.id, thread_id: agent.threadId, model, ...options,

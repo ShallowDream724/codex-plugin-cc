@@ -206,6 +206,11 @@ test('attachments stay scoped to drafts and uncertain or edited sends preserve t
   assert.deepEqual(requests[0], { target: 'a', message: '', attachments: [{ path: 'C:/docs/a.png' }] });
   resolveSend({ error: { code: 'action_status_unknown' } }); await send;
   assert.ok(JSON.stringify(await draw()).includes('a.png'));
+  send = (await item('codex_message_a')).props.onSubmit('Keep this draft'); await new Promise((r) => setImmediate(r));
+  resolveSend({ agent_id: 'a', status: 'steer_unconfirmed', delivery: 'steer_unconfirmed' }); await send;
+  assert.equal((await item('codex_message_a')).props.value, 'Keep this draft');
+  assert.match(JSON.stringify(await draw()), /发送结果未确认。请查看同一代理的活动后再试。草稿已保留。/);
+  assert.ok(JSON.stringify(await draw()).includes('a.png'));
   send = (await item('codex_message_a')).props.onSubmit(''); await new Promise((r) => setImmediate(r));
   await (await item('codex_attach_a')).props.onPress(); (await item('attachment_path_a')).props.onSubmit('C:/docs/b.txt');
   resolveSend({ agent_id: 'a', status: 'steered' }); await send;

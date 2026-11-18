@@ -14,9 +14,10 @@ const notify = (method, params) => send({ method, params });
 const threadId = '12345678-1234-4234-8234-123456789abc';
 const initialTurnId = 'offline-turn';
 const continuedTurnId = 'offline-continued-turn';
+const defaultModel = 'gpt-6.2-sol', initialModel = 'gpt-6.1-astra', modelProvider = 'offline';
 record({ kind: 'started', pid: process.pid, argv: process.argv.slice(2) });
 let asked = false;
-let model, modelRetired = false;
+let modelRetired = false;
 
 function complete(turnId, text) {
   notify('item/completed', { threadId, turnId, item: { id: `${turnId}-final`, type: 'agentMessage', phase: 'final_answer', text } });
@@ -37,13 +38,14 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   switch (frame.method) {
     case 'initialize': respond({ userAgent: 'offline-fake-codex' }); break;
     case 'initialized': break;
+    case 'config/read': respond({ config: { model: defaultModel, model_provider: modelProvider }, layers: [], origins: {} }); break;
     case 'model/list': {
-      const modelIds = ['gpt-6.2-astra', 'gpt-6.2-sol'];
-      if (model && !modelRetired) modelIds.unshift(model);
+      const modelIds = ['gpt-6.2-astra', defaultModel];
+      if (!modelRetired) modelIds.unshift(initialModel);
       respond({ data: modelIds.map(model => ({ model })), nextCursor: null });
       break;
     }
-    case 'thread/start': model = frame.params.model; respond({ thread: { id: threadId, model } }); break;
+    case 'thread/start': respond({ thread: { id: threadId }, model: frame.params.model ?? defaultModel, modelProvider }); break;
     case 'thread/inject_items': respond({}); break;
     case 'turn/start': {
       const turnId = asked ? continuedTurnId : initialTurnId;

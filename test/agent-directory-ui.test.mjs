@@ -9,7 +9,7 @@ const settle = async () => { for (let n = 0; n < 5; n++) await new Promise(setIm
 function harness(t) {
   closeUI(); t.after(closeUI);
   const writes = [], calls = [], panes = new Map(), timers = [], scrolls = [];
-  const fixture = { agents: [], list: null };
+  const fixture = { agents: [], list: null, stopAll: null };
   const $ = {
     state: { get: async () => undefined, set: async (key, value) => { writes.push({ key: key.key, value }); } },
     session: { id: async () => 'session', cwd: async () => 'C:/work' }, env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
@@ -21,8 +21,9 @@ function harness(t) {
       const request = JSON.parse(options.stdin); calls.push(request);
       const op = request.operation;
       const result = op === 'ui_list' ? await (fixture.list ? fixture.list() : { agents: fixture.agents })
-        : op === 'ui_revision' ? { revision: 1, entries: [{ id: 'answer', turn_id: 'turn', type: 'agentMessage', data: { text: 'Finished.' } }] }
-          : op === 'ui_history' ? { entries: [], next_cursor: null } : {};
+        : op === 'ui_interrupt_all' ? await fixture.stopAll?.(request)
+          : op === 'ui_revision' ? { revision: 1, entries: [{ id: 'answer', turn_id: 'turn', type: 'agentMessage', data: { text: 'Finished.' } }] }
+            : op === 'ui_history' ? { entries: [], next_cursor: null } : {};
       return { stdout: JSON.stringify(result), exitCode: 0 };
     } },
     ui: {
@@ -107,6 +108,84 @@ test('directory has empty/error recovery and unchanged refresh does not repaint'
   h.fixture.list = null; h.fixture.agents = [{ agent_id: 'recovered', status: 'completed' }];
   await h.press('directory_retry');
   assert.ok(nodes(await h.draw()).some(n => n.props.key === 'directory_open_recovered'));
+});
+
+test('directory offers bulk pause for idle agents and hides it when none need a pause', async t => {
+  const h = harness(t);
+  const action = async () => nodes(await h.draw()).find(node => node.props.key === 'directory_stop_all');
+  await openDirectory(h.$); await settle();
+  assert.equal(await action(), undefined);
+
+  h.fixture.agents = [
+    { agent_id: 'paused', status: 'completed', user_paused: true, user_control_status: 'stopped' },
+    { agent_id: 'stopping', status: 'running', user_paused: true, user_control_status: 'stopping' },
+  ];
+  await h.timers[0].fn();
+  assert.equal(await action(), undefined);
+  await h.host.dispatch('ui.press', { requestId: PANE, element: 'directory_stop_all_confirm' });
+  assert.ok(h.calls.every(call => call.operation === 'ui_list'));
+
+  h.fixture.agents.push({ agent_id: 'idle', status: 'completed', user_paused: false });
+  await h.timers[0].fn();
+  assert.equal((await action()).props.label, '暂停全部 Codex');
+  assert.equal(nodes(await h.draw()).find(node => node.props.key === 'directory_stop_all_warning').props.borderColor, '#e5484d');
+});
+
+test('directory asks before pausing all Codex agents and submits only once while pending', async t => {
+  const h = harness(t);
+  h.fixture.agents = [{ agent_id: 'a', status: 'running' }, { agent_id: 'b', status: 'completed' }];
+  await openDirectory(h.$); await settle();
+  await h.press('directory_stop_all');
+  let frame = nodes(await h.draw());
+  assert.match(frame.find(node => node.props.key === 'directory_stop_all_scope').props.children[0], /后代.*空闲和已完成.*直接发消息.*Claude 会继续工作/);
+  assert.equal(frame.find(node => node.props.key === 'directory_stop_all_cancel').props.autoFocus, true);
+  await h.press('directory_stop_all_cancel');
+  assert.equal(h.calls.filter(call => call.operation === 'ui_interrupt_all').length, 0);
+
+  let release;
+  h.fixture.stopAll = () => new Promise(resolve => { release = resolve; });
+  await h.press('directory_stop_all');
+  const stop = h.press('directory_stop_all_confirm'); await settle();
+  frame = nodes(await h.draw());
+  assert.match(frame.find(node => node.props.key === 'directory_stop_all_pending').props.children[0], /正在暂停/);
+  assert.equal(frame.some(node => node.props.key === 'directory_stop_all_confirm' || node.props.key === 'directory_stop_all'), false);
+  await h.host.dispatch('ui.press', { requestId: PANE, element: 'directory_stop_all_confirm' });
+  assert.equal(h.calls.filter(call => call.operation === 'ui_interrupt_all').length, 1);
+
+  h.fixture.agents = h.fixture.agents.map(agent => ({ ...agent, user_paused: true, user_control_status: 'stopped' }));
+  release({ results: h.fixture.agents }); await stop;
+  frame = nodes(await h.draw());
+  assert.match(frame.find(node => node.props.key === 'directory_stop_all_result').props.children[0], /已停止 2 个/);
+  assert.equal(frame.find(node => node.props.key === 'directory_status_b').props.children[0], '已暂停');
+  assert.equal(frame.some(node => node.props.key === 'directory_stop_all_pending' || node.props.key === 'directory_stop_all'), false);
+  const call = h.calls.find(call => call.operation === 'ui_interrupt_all');
+  assert.ok(call.requestId);
+  assert.deepEqual(call.args, {});
+});
+
+test('directory shows mixed stop outcomes and allows retry when stopping is unconfirmed', async t => {
+  const h = harness(t);
+  h.fixture.agents = ['a', 'b', 'c'].map(agent_id => ({ agent_id, status: 'running' }));
+  await openDirectory(h.$); await settle();
+  let releaseList;
+  h.fixture.list = () => new Promise(resolve => { releaseList = resolve; });
+  const oldPoll = h.timers[0].fn(); await settle();
+  h.fixture.list = () => ({ error: { message: 'Could not refresh summaries' } });
+  h.fixture.stopAll = () => ({ results: [
+    { agent_id: 'a', status: 'stopped' },
+    { agent_id: 'b', status: 'stopping' },
+    { agent_id: 'c', status: 'unconfirmed' },
+  ] });
+  await h.press('directory_stop_all');
+  await h.press('directory_stop_all_confirm');
+  releaseList({ agents: h.fixture.agents }); await oldPoll;
+  const frame = nodes(await h.draw());
+  const content = key => frame.find(node => node.props.key === key).props.children[0];
+  assert.match(content('directory_stop_all_result'), /已停止 1 个.*正在停止 1 个.*停止未确认 1 个/);
+  assert.equal(content('directory_status_a'), '已暂停');
+  assert.equal(content('directory_status_b'), '正在停止');
+  assert.equal(content('directory_status_c'), '停止未确认');
+  assert.ok(frame.some(node => node.props.key === 'directory_stop_all'));
 });
 
 test('directory to agent and back preserve drafts and independent reading offsets', async t => {

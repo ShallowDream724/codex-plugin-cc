@@ -1,5 +1,15 @@
 # 验证记录
 
+## rc.27 代理总览与 Claude 文案验收
+
+常规回归 562 项通过、2 项跳过，元数据、生成指引和 JavaScript 检查通过。独立离线 Claude 宿主套件 4 项通过，见 `artifacts/rc27-copy-and-directory-full.log` 与 `artifacts/rc27-copy-and-directory-host.log`。新增用例覆盖整批暂停的确认、取消、并发点击、部分停止及空闲代理的静默暂停；也覆盖隐藏型号首次派发、目录刷新、输入校验回执、跨轮消息和深链接工具诊断。
+
+文案审阅稿对照实际注册的 9 个工具、全部字段说明、9 段 Skill 正文和 4 条模型建议检查，23 个 JSON 代码块均通过解析。隔离 Edge 使用提取的宿主组件验证按钮红框、键盘触发及 320/480 像素窄栏布局。Claude Desktop 的实际布局、长历史滚动和真实供应商的账号访问恢复仍待实机验收。
+
+## rc.27 继承历史的显示边界
+
+本机 Codex CLI 0.170.0 在独立临时目录中向本地模拟供应商发送任务。4,096 条带独立标记的 Claude 消息全部进入首轮模型请求。派发前原生历史返回 0 个显示项，派发后只有任务「Check README」及模拟回复「README checked」。结果见 `artifacts/rc27-large-inherited-history.json`。此项核验覆盖模型请求与原生历史接口，未操作桌面窗口。
+
 ## rc.27 原生目录、候选及错误交付（2026-11-18，本地候选）
 
 Codex CLI 0.170.0 使用本机原有 openai 配置读取可见目录，共 4 项；包含隐藏项时为 14 项。将可见目录交给插件控制器，接入模拟的旧 Astra 线程时只产生 thread/read 和 model/list，返回完整 4 项和可能的后继 gpt-6.2-astra。目录及控制器输出见 `artifacts/rc27-model-list-0170.log` 和 `artifacts/rc27-0170-recovery-probe.json`。

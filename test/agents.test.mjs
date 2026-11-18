@@ -158,7 +158,12 @@ test('user steer preserves the parent task when completion crosses its response'
   client.note('item/completed', { threadId: agent.thread_id, turnId: agent.turn_id, item: { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'Private steered answer' } });
   client.complete();
   assert.equal(controller.eventsAfter()[0].result, 'Private steered answer');
-  accept({ turnId: agent.turn_id }); await sending;
+  accept({ turnId: agent.turn_id }); const result = await sending;
+  assert.equal(result.status, 'steer_unconfirmed');
+  assert.equal(result.delivery, 'steer_unconfirmed');
+  assert.equal(result.turn_id, agent.turn_id);
+  assert.match(result.recovery, /Inspect the same agent before retrying/);
+  assert.equal(controller.find(agent.id).status, 'completed');
   assert.equal(controller.find(agent.id).turnOrigin, 'parent');
   assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /"Private steer"/);
 });
@@ -239,7 +244,9 @@ test('parent turn completion before steer acknowledgement reports unknown outcom
   const followup = controller.dispatch('followup_task', { target: agent.id, message: 'Additional parent work' });
   await tick(); client.complete(); accept({ turnId: agent.turn_id });
   const result = await followup;
+  assert.equal(result.status, 'steer_unconfirmed');
   assert.match(result.recovery, /outcome is unknown/);
+  assert.equal(controller.find(agent.id).status, 'completed');
   assert.equal(controller.eventsAfter()[0].kind, 'completed');
 });
 
@@ -254,10 +261,12 @@ test('late parent steer acknowledgement cannot take over a newer user turn', asy
   await controller.dispatch('ui_send', { target: agent.id, message: 'Second private task' });
   assert.equal(controller.find(agent.id).turnId, 'turn-3');
   accept({ turnId: 'turn-2' }); const result = await followup;
+  assert.equal(result.status, 'steer_unconfirmed');
+  assert.equal(result.turn_id, 'turn-2');
   assert.match(result.recovery, /outcome is unknown/);
   assert.equal(controller.find(agent.id).turnOrigin, 'user');
   assert.equal(controller.find(agent.id).turnId, 'turn-3');
-  assert.equal(actions.find(action => action.message === 'Parent assignment')?.turn_id, 'turn-2');
+  assert.ok(!actions.some(action => action.message === 'Parent assignment'));
   client.complete(agent.thread_id, 'turn-3');
   assert.deepEqual(controller.eventsAfter(), []);
 });
@@ -489,6 +498,21 @@ test('stop all pauses every root before interrupting either tree and isolates fa
   for (const [thread, turn] of [[first.thread_id, first.turn_id], [second.thread_id, second.turn_id], ['child-a', 'child-a-turn'], ['child-b', 'child-b-turn']]) client.complete(thread, turn, 'interrupted');
   assert.ok(result.results.every(a => a.user_paused));
   assert.equal((await spawn()).status, 'running');
+});
+
+test('bulk pause quietly locks completed agents and notifies Claude for a running descendant', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const idle = await spawn(), parent = await spawn();
+  client.complete(idle.thread_id, idle.turn_id, 'completed');
+  client.note('thread/started', { thread: { id: 'nested', parentThreadId: parent.thread_id } });
+  client.note('turn/started', { threadId: 'nested', turn: { id: 'nested-turn' } });
+  client.complete(parent.thread_id, parent.turn_id, 'completed');
+  const { results } = await controller.dispatch('ui_interrupt_all');
+  assert.equal(results.find(row => row.agent_id === idle.id).user_control_status, 'stopped');
+  assert.equal(controller.find(idle.id).userPaused, true);
+  client.complete('nested', 'nested-turn', 'interrupted');
+  const notices = controller.eventsAfter().filter(event => event.action === 'interrupt');
+  assert.deepEqual(notices.map(event => [event.agent_id, event.phase]), [[parent.id, 'requested'], [parent.id, 'confirmed']]);
 });
 
 test('stop all persists registrations and pause across controller restart', async t => {
@@ -793,15 +817,16 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   assert.deepEqual(agent.context_snapshot, { digest: snapshot.digest, stats: snapshot.stats });
   assert.deepEqual(controller.snapshot().agents[0].context_snapshot, agent.context_snapshot);
   assert.equal(Object.hasOwn((await controller.dispatch('list_agents')).agents[0], 'context_snapshot'), false);
-  const start = client.calls[0].params;
+  const start = client.calls.find(call => call.method === 'thread/start').params;
   assert.equal(start.serviceTier, 'default'); assert.equal(start.ephemeral, false);
   assert.equal(start.model, 'dynamic-model'); assert.equal(start.config['features.default_mode_request_user_input'], true);
   assert.equal(start.dynamicTools[0].type, 'function'); assert.equal(start.dynamicTools[0].name, 'notify_parent');
   assert.equal(start.sandbox, 'danger-full-access'); assert.equal(start.approvalPolicy, 'never');
   for (const key of ['baseInstructions', 'developerInstructions', 'multiAgentMode']) assert.equal(Object.hasOwn(start, key), false);
-  assert.deepEqual(client.calls[1], { method: 'thread/inject_items', params: { threadId: 'thread-1', items: snapshot.history } });
-  assert.equal(client.calls[2].params.effort, 'high'); assert.equal(client.calls[2].params.serviceTierForTurn, 'default');
-  assert.match(client.calls[2].params.input[0].text, /Claude is your parent/);
+  assert.deepEqual(client.calls.find(call => call.method === 'thread/inject_items'), { method: 'thread/inject_items', params: { threadId: 'thread-1', items: snapshot.history } });
+  const turn = client.calls.find(call => call.method === 'turn/start').params;
+  assert.equal(turn.effort, 'high'); assert.equal(turn.serviceTierForTurn, 'default');
+  assert.match(turn.input[0].text, /Claude is your parent/);
   client.complete(); await tick();
   assert.deepEqual(await controller.dispatch('send_message', { target: agent.id, message: 'hello' }), { agent_id: agent.id, status: 'stored', model_turn_started: false });
   assert.deepEqual(client.calls.at(-1), { method: 'thread/inject_items', params: { threadId: 'thread-1',
@@ -1488,6 +1513,7 @@ test('answered, resolved and completed requests disappear without removing live 
   client.ask('resolve', 'item/tool/requestUserInput', pendingQuestion());
   client.note('serverRequest/resolved', { threadId: 'thread-1', requestId: 'resolve' });
   assert.deepEqual(controller.eventsAfter(0), []);
+  assert.equal(controller.snapshot().agents[0].activity, 'working');
   client.ask('root', 'item/tool/requestUserInput', pendingQuestion());
   client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
   client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });

@@ -53,6 +53,13 @@ test('wrapped MCP results decode; oversized or invalid results preserve native f
   assert.equal(describeCall(full('wait_agent'), {}, 'x'.repeat(524289)), null);
 });
 
+test('compact send and followup rows show unconfirmed delivery without implying receipt', () => {
+  for (const operation of ['send_message', 'followup_task']) {
+    const output = { agent_id: 'a', status: 'steer_unconfirmed' };
+    assert.deepEqual(describeCall(full(operation), {}, output).map(row => [row.id, row.text]), [['a', '消息投递未确认']]);
+  }
+});
+
 test('wait labels distinguish parent idle from all agents idle', () => {
   const label = (result, running = false) => describeCall(full('wait_agent'), {}, result, running)[0].text;
   assert.equal(label({ idle: false, parent_idle: true, active: true, events: [] }), '有代理继续工作');
