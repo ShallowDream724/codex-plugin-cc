@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { timingSafeEqual } from 'node:crypto';
 import { prepareContextSnapshot } from './context.mjs';
+import { ContextUploads, MAX_CONTEXT_BYTES } from './context-uploads.mjs';
 import { DeliveryStore } from './delivery.mjs';
 import { ACTION_PREFLIGHT_FAILURE, MemoryReceipts, requestFingerprint } from './receipts.mjs';
 
@@ -9,7 +10,6 @@ const UI_MUTATIONS = new Set(['ui_interrupt', 'ui_interrupt_all', 'ui_send']);
 const MUTATIONS = new Set(['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', ...UI_MUTATIONS]);
 const START_ACTIONS = new Set(['spawn_agent', 'followup_task']);
 const OPERATIONS = new Set([...MUTATIONS, 'list_agents', 'list_models']);
-const MAX_BODY = 64 * 1024 * 1024;
 const activeStatuses = new Set(['starting', 'running', 'waiting', 'compacting', 'recovering', 'unknown']);
 const errorBody = error => ({ code: error.code || 'bridge_error', message: error.message,
   ...Object.fromEntries(['agent_id', 'thread_id', 'turn_id', 'status', 'recovery', 'reason', 'model', 'resolved_model', 'available_models', 'recommended_model', 'recovery_choices', 'retry_after_access_fix', 'model_turn_started', 'limit', 'active_agents'].filter(key => error[key] !== undefined).map(key => [key, error[key]])),
@@ -24,6 +24,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
   deliveryStore, activity, onActivity = () => {}, onShutdown = () => {}, getHealth, requiredProtocol,
   waitTimeoutMs = 25000 } = {}) {
   const journal = receiptStore ?? new MemoryReceipts(receipts, saveReceipts);
+  const contextUploads = new ContextUploads();
   const delivery = deliveryStore ?? new DeliveryStore({ controller });
   const actions = new Set();
   const requests = new Set(), aborters = new Set();
@@ -49,7 +50,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     const active = controller.hasActiveWork ? controller.hasActiveWork()
       : [...(controller.agents?.values() || [])].some(agent => activeStatuses.has(agent.status) || agent.pending_requests?.length);
     if (active) return { stopped: false, reason: 'active' };
-    if (actions.size || requests.size > 1) return { stopped: false, reason: 'busy' };
+    if (actions.size || requests.size > 1 || contextUploads.pending) return { stopped: false, reason: 'busy' };
     // No await separates the idle check from sealing admission. Mutation
     // dispatch and this check therefore share one atomic admission boundary.
     stopping = true;
@@ -81,6 +82,8 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     }
     if (operation === 'idle_shutdown') return stopIfIdle();
     if (stopping) throw Object.assign(new Error('The idle session helper is restarting. Retry the request.'), { code: 'helper_restarting' });
+    if (operation === 'reserve_context') return { ticket: contextUploads.reserve(requestId, args.count, args.chars) };
+    if (operation === 'discard_context') { contextUploads.discard(args.ticket); return {}; }
     if (['ui_list', 'ui_history', 'ui_detail', 'ui_revision'].includes(operation)) {
       if (!activity) throw new Error('Activity view is unavailable.');
       const method = { ui_list: 'list', ui_history: 'history', ui_detail: 'detail', ui_revision: 'revision' }[operation];
@@ -164,7 +167,10 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
         if (args.context_mode !== undefined && args.context_mode !== 'none') throw new Error('The default role requires context_mode none.');
         args.context_mode = 'none';
       }
-      if (operation === 'spawn_agent' && (args.context_mode || 'available') === 'available') args.snapshot = prepareContextSnapshot(body.context || {});
+      if (operation === 'spawn_agent' && (args.context_mode || 'available') === 'available') {
+        const context = body.context_ticket ? contextUploads.take(body.context_ticket, requestId) : body.context;
+        args.snapshot = prepareContextSnapshot(context || {});
+      }
       const fingerprint = requestFingerprint(operation, requestArgs, args.snapshot?.digest);
       const previous = await journal.get(requestId);
       if (previous) {
@@ -201,7 +207,9 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
   };
 
   const server = createServer(async (req, res) => {
-    if (req.method !== 'POST' || req.url !== '/' || !authorized(req.headers.authorization, token)) {
+    const upload = req.url === '/context';
+    const ticket = upload && /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
+    if (req.method !== 'POST' || (upload ? !contextUploads.accepts(ticket) : req.url !== '/' || !authorized(req.headers.authorization, token))) {
       res.writeHead(403); res.end(); return;
     }
     onActivity();
@@ -213,7 +221,7 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
     res.on('close', () => { if (!res.writableEnded) aborter.abort(); });
     let body;
     const withSummary = result => {
-      if (body?.ui_summary === true && activity) {
+      if (!upload && body?.ui_summary === true && activity) {
         try { return { ...result, ui_summary: activity.list() }; } catch { /* UI failure cannot change an action result. */ }
       }
       return result;
@@ -222,13 +230,14 @@ export function createBroker({ controller, token, receipts = {}, saveReceipts = 
       const chunks = []; let length = 0;
       for await (const chunk of req) {
         length += chunk.length;
-        if (length > MAX_BODY) {
+        if (length > MAX_CONTEXT_BYTES) {
           res.writeHead(413); res.end(JSON.stringify({ error: { code: 'transport_limit', message: 'Snapshot exceeds the 64 MiB transport limit; nothing was truncated or dispatched.' } })); return;
         }
         chunks.push(chunk);
       }
-      body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const result = await dispatch(body, aborter.signal);
+      const text = Buffer.concat(chunks).toString('utf8');
+      if (!upload) body = JSON.parse(text);
+      const result = upload ? contextUploads.append(ticket, req.headers['x-context-offset'], text, length) : await dispatch(body, aborter.signal);
       if (!res.destroyed) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(withSummary(result))); }
     } catch (error) {
       if (!res.destroyed) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(withSummary({ error: errorBody(error) }))); }

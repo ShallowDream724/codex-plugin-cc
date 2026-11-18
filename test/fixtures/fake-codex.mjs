@@ -45,7 +45,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       respond({ data: modelIds.map(model => ({ model })), nextCursor: null });
       break;
     }
-    case 'thread/start': respond({ thread: { id: threadId }, model: frame.params.model ?? defaultModel, modelProvider }); break;
+    case 'thread/start': respond({ thread: { id: threadId }, model: frame.params.model ?? defaultModel, modelProvider, reasoningEffort: frame.params.config?.model_reasoning_effort ?? 'ultra' }); break;
     case 'thread/inject_items': respond({}); break;
     case 'turn/start': {
       const turnId = asked ? continuedTurnId : initialTurnId;

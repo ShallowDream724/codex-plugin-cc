@@ -12,7 +12,9 @@
 
 `runtime/appserver-client.mjs` 负责 JSON-RPC stdio，包括初始化、反向请求、超时、分帧、背压、错误和关闭。`runtime/agents.mjs` 负责线程状态、审批、消息、续接和超限恢复。
 
-`runtime/bridge.mjs` 和 `runtime/broker.mjs` 为每个 Claude 会话提供一个本机桥接进程。端口只监听 `127.0.0.1`，使用随机 bearer token。桥接客户端通过 Node 原生 HTTP 直连该端口，避免浏览器端口限制和环境代理。状态目录按 session ID 哈希隔离。上下文通过进程 stdin 和本机通道传递，不占 Claude 的工具参数输出。
+`runtime/bridge.mjs` 和 `runtime/broker.mjs` 为每个 Claude 会话提供一个本机桥接进程。控制请求使用 Node 原生 HTTP 和会话鉴权令牌，状态目录按 session ID 哈希隔离。继承的消息由 `$.session.messages` 导出，再由 `$.http.fetch` 发往仅监听 `127.0.0.1` 的 broker。进程标准输入只承载派发指令和本次传输的凭据。临时凭据只准写入该次调用的快照，收齐后消费一次；传输中断时不会启动缺少历史的代理。
+
+新建代理时，显式选择的推理档位同时进入 `thread/start.config.model_reasoning_effort` 和 `turn/start.effort`。登记记录保留此选择，以便恢复原线程时继续采用。创建请求省略档位的普通代理、以及没有选择来源记录的旧线程，沿用 Codex 返回的原生档位。
 
 未匹配当前登记的裸 UUID 才进入原生线程查询。该查询失败时，错误仅说明当前登记未匹配及原生读取失败，保留底层原因，并提示当前 `list_agents` 或原始 `thread_id`/链接；不从 RPC 错误码推断 Claude 分支、跨会话来源或历史丢失。显式线程链接的读取失败只给出线程检查指引；线程状态拒绝和登记后的发送失败保持各自诊断。此提示不会扫描其他会话、转换目标或额外发起模型请求。
 

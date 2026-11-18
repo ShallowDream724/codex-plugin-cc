@@ -212,6 +212,40 @@ test('start and resume expose valid native model metadata', async t => {
   assert.equal(resumed.model, 'resolved-model'); assert.equal(resumed.reasoning_effort, 'high');
 });
 
+test('an explicit reasoning effort takes precedence over thread defaults across a restart', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-effort-'));
+  const statePath = path.join(dir, 'state.json');
+  const client = new Client();
+  client.handler = method => method === 'thread/start'
+    ? { thread: { id: 'effort-thread' }, model: 'gpt-6-luna', reasoningEffort: 'ultra' }
+    : undefined;
+  const first = new AgentController({ client, statePath, nativeRoleResolver: async () => undefined });
+  let restarted;
+  t.after(async () => {
+    await first.close();
+    await restarted?.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const agent = await first.dispatch('spawn_agent', { message: 'task', cwd: '/workspace', context_mode: 'none', model: 'gpt-6-luna', reasoning_effort: 'high' });
+  assert.equal(client.calls.find(call => call.method === 'turn/start').params.effort, 'high');
+  assert.equal(client.calls.find(call => call.method === 'thread/start').params.config.model_reasoning_effort, 'high');
+  assert.equal(agent.reasoning_effort, 'high');
+  assert.equal((await first.dispatch('list_agents')).agents[0].reasoning_effort, 'high');
+  client.finish(agent);
+  await first.close();
+
+  const restartedClient = new Client();
+  restartedClient.handler = (method, params) => method === 'thread/resume'
+    ? { thread: { id: params.threadId, status: { type: 'idle' } }, model: params.model, reasoningEffort: 'ultra' }
+    : undefined;
+  restarted = new AgentController({ client: restartedClient, statePath, nativeRoleResolver: async () => undefined });
+  await restarted.init();
+  const followup = await restarted.dispatch('followup_task', { target: agent.id, message: 'continue' });
+  assert.equal(restartedClient.calls.find(call => call.method === 'thread/resume').params.config.model_reasoning_effort, 'high');
+  assert.equal(restartedClient.calls.find(call => call.method === 'turn/start').params.effort, 'high');
+  assert.equal(followup.reasoning_effort, 'high');
+});
+
 test('permission modes and default role use explicit protocol settings', async t => {
   for (const [mode, reviewer] of [['ask', 'user'], ['auto-review', 'auto_review']]) {
     const { client, c, spawn } = await setup(t, { permissionsMode: mode });
@@ -219,6 +253,7 @@ test('permission modes and default role use explicit protocol settings', async t
     const start = client.calls.find(call => call.method === 'thread/start').params;
     assert.equal(start.approvalPolicy, 'on-request'); assert.equal(start.approvalsReviewer, reviewer); assert.equal(start.sandbox, 'workspace-write');
     assert.equal(start.model, 'gpt-6-luna'); assert.equal(client.calls.find(x => x.method === 'turn/start').params.effort, 'medium');
+    assert.equal(start.config.model_reasoning_effort, 'medium');
     assert.deepEqual(start.dynamicTools, []); assert.equal(start.config['features.multi_agent_v2'], false); assert.equal(start.config['features.image_generation'], false);
     await assert.rejects(spawn({ role: 'default', model: 'other' }), /role default/);
     client.finish(a); c.find(a.id).loaded = false;

@@ -41,6 +41,7 @@ function isolatedEnv(directory, port) {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1', DISABLE_AUTOUPDATER: '1',
     NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1',
+    HTTP_PROXY: 'http://127.0.0.1:1', HTTPS_PROXY: 'http://127.0.0.1:1',
     NODE_OPTIONS: `--require="${guard.replaceAll('\\', '/')}"`, CODEX_SUBAGENTS_NODE_COMMAND: process.execPath,
     CODEX_SUBAGENTS_CODEX_COMMAND: fixture, CODEX_SUBAGENTS_STATE_DIR: path.join(directory, 'state'),
     ENABLE_TOOL_SEARCH: 'false',
@@ -50,7 +51,8 @@ function isolatedEnv(directory, port) {
 function results(messages) {
   return messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
     .filter((block) => block.type === 'tool_result').map((block) => {
-      const text = typeof block.content === 'string' ? block.content : (block.content || []).filter((part) => part.type === 'text').map((part) => part.text).join('\n');
+      const content = typeof block.content === 'string' ? block.content : (block.content || []).filter((part) => part.type === 'text').map((part) => part.text).join('\n');
+      const text = content.split('\n\n<system-reminder>', 1)[0];
       try { return JSON.parse(text); } catch {
         try { return JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); } catch { return null; }
       }
@@ -60,7 +62,13 @@ function results(messages) {
 function promptDeliveries(messages) {
   return messages.filter(message => message.role === 'user').flatMap(message => {
     if (!Array.isArray(message.content)) return messageDeliveries(message, { prompt: true });
-    return message.content.filter(part => part.type === 'text').flatMap(part => messageDeliveries({ content: [part] }, { prompt: true }));
+    return message.content.flatMap(part => {
+      if (part.type === 'text') return messageDeliveries({ content: [part] }, { prompt: true });
+      // 2.1.326 attaches plugin notifications to a tool result on the API wire.
+      if (part.type !== 'tool_result' || typeof part.content !== 'string') return [];
+      const frames = part.content.matchAll(/\n<system-reminder>\nNote from the codex-subagents plugin, not from the user:\n([^]*?)\n<\/system-reminder>/g);
+      return [...frames].flatMap(match => messageDeliveries({ content: match[1] }, { prompt: true }));
+    });
   });
 }
 
@@ -120,10 +128,11 @@ async function startProvider(contextMode) {
           assert.equal(count, 1, 'recovery must finish after one bounded wait');
         }
       }
-      else if (count === 0) call = { name: 'spawn_agent', input: { name: 'offline-worker', message: 'OFFLINE_DELEGATED_TASK', context_mode: contextMode, ...(checkModelRecovery ? { model: retiredModel } : {}) } };
+      else if (count === 0) call = { name: 'spawn_agent', input: { name: 'offline-worker', message: 'OFFLINE_DELEGATED_TASK', context_mode: contextMode, model: checkModelRecovery ? retiredModel : replacementModel, reasoning_effort: 'high' } };
       else if (count === 1) {
         const shapes = (body.messages || []).flatMap((message) => Array.isArray(message.content) ? message.content : []).filter((block) => block.type === 'tool_result').map((block) => ({ is_error: block.is_error, contentType: typeof block.content, blockTypes: Array.isArray(block.content) ? block.content.map((part) => part.type) : undefined }));
         assert.ok(agent, `spawn result must traverse the native host (parsed keys: ${JSON.stringify(values.map((value) => Object.keys(value)))}; shapes: ${JSON.stringify(shapes)}; registered plugin tool count: ${(body.tools || []).filter((tool) => tool.name?.includes('codex')).length})`);
+        assert.equal(agent.reasoning_effort, 'high', 'the spawn result must report the requested effort');
         call = { name: 'wait_agent', input: {} };
       }
       else if (count === 2) { assert.ok(question, 'wait must return the synthetic Codex question'); call = { name: 'answer_agent', input: { target: question.agent_id, request_id: question.request_id, answer: { answers: { choice: { answers: ['Proceed'] } } } } }; }
@@ -176,7 +185,8 @@ async function startProvider(contextMode) {
 }
 
 async function runChild(args, options, timeoutMs = 60000) {
-  const child = spawn(process.execPath, args, { ...options, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+  const native = path.extname(args[0]).toLowerCase() === '.exe';
+  const child = spawn(native ? args[0] : process.execPath, native ? args.slice(1) : args, { ...options, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
   let stdout = '', stderrBytes = 0, stderrTail = '';
   child.stdout.on('data', (chunk) => { if (stdout.length < 2_000_000) stdout += chunk; });
   child.stderr.on('data', (chunk) => { stderrBytes += chunk.length; stderrTail = (stderrTail + chunk).slice(-3000); });
@@ -236,7 +246,7 @@ function syntheticTranscript(sessionId, cwd, large = false) {
     add('user', { isCompactSummary: true, isMeta: false, message: { role: 'user', content: `OFFLINE_SUMMARY_${index}` } });
     add('assistant', { message: { id: `old-${index}`, type: 'message', role: 'assistant', content: [{ type: 'text', text: index === 5 ? 'OFFLINE_CURRENT_RESPONSE' : `OFFLINE_DISCARDED_RESPONSE_${index}` }], model: 'offline', stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } } });
   }
-  add('user', { message: { role: 'user', content: 'OFFLINE_NEW_MESSAGE' } });
+  add('user', { message: { role: 'user', content: 'OFFLINE_NEW_MESSAGE. Earlier we discussed .claude/settings.json.' } });
   add('assistant', { message: { id: 'historical-tool', type: 'message', role: 'assistant', content: [
     { type: 'tool_use', id: 'offline-read', name: 'Read', input: { file_path: 'OFFLINE_TOOL_INPUT_MARKER' } },
     { type: 'tool_use', id: 'offline-second-read', name: 'Read', input: { file_path: 'OFFLINE_SECOND_TOOL_INPUT' } },
@@ -250,7 +260,7 @@ function syntheticTranscript(sessionId, cwd, large = false) {
 }
 
 test('real Claude host runs native hook capture and local Codex question lifecycle offline', { skip: !cli, timeout: 270000 }, async (t) => {
-  assert.ok(path.isAbsolute(cli), 'CODEX_SUBAGENTS_TEST_CLAUDE must be an absolute cli.js path');
+  assert.ok(path.isAbsolute(cli), 'CODEX_SUBAGENTS_TEST_CLAUDE must be an absolute path to cli.js or claude.exe');
   const installationBefore = await installedHostHashes();
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'codex-host-offline-'));
   const transportOnly = process.env.CODEX_SUBAGENTS_TEST_TRANSPORT_ONLY === '1';
@@ -295,6 +305,7 @@ test('real Claude host runs native hook capture and local Codex question lifecyc
           assert.equal(JSON.parse(await readFile(receiptPath, 'utf8')).status, 'acknowledged', 'the final append must persist its exact completion delivery acknowledgement');
         }
         const history = frames.find((frame) => frame.method === 'thread/inject_items')?.params.items;
+        assert.equal(frames.find(frame => frame.method === 'turn/start')?.params.effort, 'high', 'the first native turn must use the effort requested through the Claude tool');
         assert.ok(frames.some((frame) => frame.id === 1000 && frame.result?.answers?.choice?.answers?.[0] === 'Proceed'), 'answer_agent must reply to the Codex server request');
         if (inheritedContext) {
           assert.ok(Array.isArray(history), 'native session.messages snapshot must reach Codex thread/inject_items');
@@ -310,7 +321,7 @@ test('real Claude host runs native hook capture and local Codex question lifecyc
           scenarioTest.diagnostic(JSON.stringify({ scenario, synthetic, hostApi: { messages: stats.inputMessages, ...hostRoles }, injectedHistoryItems: history.length, noticeItems: 1, toolUses: stats.toolUses, toolResults: stats.toolResults }));
           assert.ok(inherited.includes('OFFLINE_HOST_USER_REQUEST'), 'current user message must be inherited');
           if (compacted) {
-            for (const marker of ['OFFLINE_SUMMARY_5', 'OFFLINE_EXPLICIT_PRESERVED', 'OFFLINE_NEW_MESSAGE', 'OFFLINE_TOOL_INPUT_MARKER', 'OFFLINE_LONG_TOOL_RESULT_TAIL', 'OFFLINE_SECOND_TOOL_INPUT', 'OFFLINE_SECOND_TOOL_RESULT']) assert.ok(inherited.includes(marker), `effective snapshot must preserve ${marker}`);
+            for (const marker of ['OFFLINE_SUMMARY_5', 'OFFLINE_EXPLICIT_PRESERVED', 'OFFLINE_NEW_MESSAGE. Earlier we discussed .claude/settings.json.', 'OFFLINE_TOOL_INPUT_MARKER', 'OFFLINE_LONG_TOOL_RESULT_TAIL', 'OFFLINE_SECOND_TOOL_INPUT', 'OFFLINE_SECOND_TOOL_RESULT']) assert.ok(inherited.includes(marker), `effective snapshot must preserve ${marker}`);
             for (const marker of ['OFFLINE_ORIGINAL_DISCARDED', ...[1, 2, 3, 4].map((index) => `OFFLINE_SUMMARY_${index}`), ...[1, 2, 3, 4].map((index) => `OFFLINE_DISCARDED_RESPONSE_${index}`)]) assert.ok(!inherited.includes(marker), `effective snapshot must exclude ${marker}`);
             assert.equal(stats.toolResults, 2, 'two results in one user message remain two result blocks');
             assert.ok(stats.toolUses >= 2, 'two calls in one assistant message remain separate tool blocks');

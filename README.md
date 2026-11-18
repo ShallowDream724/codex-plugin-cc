@@ -73,6 +73,8 @@ claude plugin update codex-subagents@codex-subagents
 
 `context_mode: none` 用于只需要当前任务说明的独立工作。Codex 如果缺少必要细节，会通过问题回传给 Claude。
 
+继承的消息通过 Claude 的公开 HTTP 接口直送本机。若 Claude 配置了 HTTP 代理，请让 `127.0.0.1` 走直连。导出被宿主拒绝时，插件会说明原因并停止这次派发。
+
 继承的 Claude 消息按原来的角色和顺序进入 Codex 的模型上下文。新线程的可见对话从 Claude 派发的任务开始。通过深链接继续已有 Codex 线程时，侧栏保留该线程原有的可见对话。
 
 新建代理默认使用 Claude 当前项目目录，也可显式指定绝对路径。插件在首次派发任务前核对供应商目录。指定的型号已隐藏时，返回完整可见列表供重新选择。`followup_task` 使用 `target` 和 `message` 续接原 Codex 线程，沿用其目录、历史及模型。
@@ -132,6 +134,8 @@ rc.22 不再注册可能被 `cc-plugin-sec-default` 跳过的 `classic.PostToolB
 模型目录由外部 Codex CLI 管理。配置了 `model_catalog_json` 时，该文件决定列表；把条目的 `visibility` 改为 `hide` 后，重启桥接进程即可隐藏。使用默认配置时，由 Codex 自己提供目录。插件不内置 CLI 或另设白名单，不过滤 ultra 等原生档位。额外选型提示位于 `config/guidance.json`，未列在该文件里的新模型仍正常返回原始描述和档位。CLI 升级与插件升级相互独立。更新插件后，新建任务可使用更新的选型建议；已有线程继续沿用当前模型配置。
 
 ## 默认角色、并发与权限
+
+为普通代理指定 `reasoning_effort: "high"`，首轮及重启后续接的轮次都会使用 `high`。省略该参数时使用 Codex 的配置档位。
 
 `spawn_agent({"role":"default","message":"…"})` 使用 Luna medium 和任务独立上下文；省略 model、reasoning_effort、context_mode 即可。角色负责快速检索、整理和事实核验，单轮交付；不修改文件、不派生子代理、不生图。普通 Codex 保留多轮协作、原生子代理和其账户支持的生图能力。
 

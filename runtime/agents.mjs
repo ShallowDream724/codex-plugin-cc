@@ -46,6 +46,7 @@ function consumedModelRecovery(a) {
 const pendingModelRecoveryRequest = () => new Error('This agent has a pending approval or question, so model recovery cannot start. Use answer_agent with the pending request_id, then retry followup_task once the agent and its descendants are idle.');
 const isOverflow = (error) => error?.codexErrorInfo === 'contextWindowExceeded' || error?.code === 'contextWindowExceeded';
 const roleConfig = (role) => role === 'default' ? { 'features.default_mode_request_user_input': false, 'features.multi_agent': false, 'features.multi_agent_v2': false, 'features.image_generation': false } : undefined;
+const configWithEffort = (config, effort) => nonempty(effort) ? { ...config, model_reasoning_effort: effort } : config;
 
 /** Owns directly-created Codex threads; never forwards nested agents or tool traces. */
 export class AgentController extends EventEmitter {
@@ -247,13 +248,19 @@ export class AgentController extends EventEmitter {
     const matchesModel = !keepModel || !nonempty(a.model) || !nonempty(model) || model === a.model;
     if (nonempty(model) && (!keepModel || !nonempty(a.model))) a.model = model;
     if (nonempty(provider) && (!keepModel || !nonempty(a.modelProvider))) a.modelProvider = provider;
-    if (nonempty(effort) && matchesModel) a.effort = effort;
+    // Native thread metadata can still report the configured default.
+    if (nonempty(effort) && matchesModel && !a.effortPinned) a.effort = effort;
     if (nonempty(threadName)) a.threadName = threadName;
   }
 
   async rpc(method, params, timeoutMs = 120000) {
     if (this.closed || this.closing) throw new Error('Agent controller is closed or closing.');
     return Promise.race([this.client.request(method, params, { timeoutMs }), this.closedPromise.then(() => { throw new Error('App-server connection closed.'); })]);
+  }
+
+  resumeThread(a, { effort = a.effort, ...overrides } = {}) {
+    const config = configWithEffort(roleConfig(a.role), a.effortPinned ? effort : undefined);
+    return this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...overrides, ...(config ? { config } : {}) });
   }
 
   visibleModels(provider) {
@@ -453,14 +460,15 @@ export class AgentController extends EventEmitter {
       if (this.stopAllInProgress || this.stopAllEpoch !== stopAllEpoch) throw new Error('A user stop-all action interrupted agent creation; retry afterward.');
     } finally { this.reservations.delete(reservation); }
     const createdAtMs = now();
-    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, role, createdAtMs, lastActivityAtMs: createdAtMs, contextSource: context_mode === 'available' ? 'claude' : 'new', status: 'starting', activity: 'starting',
+    const a = { id: randomUUID(), name, cwd, model, effort: reasoning_effort, effortPinned: nonempty(reasoning_effort), role, createdAtMs, lastActivityAtMs: createdAtMs, contextSource: context_mode === 'available' ? 'claude' : 'new', status: 'starting', activity: 'starting',
       pending: [], turnId: null, completedTurns: new Set(), compactItems: new Set(), loaded: true, recoveryUsed: false, interrupted: false, spawning: true };
     this.agents.set(a.id, a);
     this.starting++;
     let spawnTurnId = null, recordSpawnAction = false;
     try {
+      const config = configWithEffort(roleConfig(role) ?? { 'features.default_mode_request_user_input': true, ...nativeDefault }, reasoning_effort);
       const response = await this.rpc('thread/start', { cwd, ...(model ? { model } : {}), ...permissionParams(this.settings), ephemeral: false, serviceTier: 'default',
-        config: roleConfig(role) ?? { 'features.default_mode_request_user_input': true, ...nativeDefault }, dynamicTools: role === 'default' ? [] : [{ type: 'function', name: 'notify_parent',
+        config, dynamicTools: role === 'default' ? [] : [{ type: 'function', name: 'notify_parent',
           description: 'Send a necessary coordination message to Claude without waiting for a reply.', inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'], additionalProperties: false } }] });
       if (!nonempty(response.thread?.id)) throw new Error('thread/start returned no thread id.');
       this.updateResolved(a, response);
@@ -669,7 +677,7 @@ export class AgentController extends EventEmitter {
         let status = response?.thread?.status?.type;
         let model = response?.thread?.model;
         if (status === 'active' && !a.loaded) {
-          const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+          const response = await this.resumeThread(a);
           this.updateResolved(a, response, { keepModel: true });
           model = response?.model ?? response?.thread?.model ?? model;
           resumed = true; a.loaded = true;
@@ -870,8 +878,8 @@ export class AgentController extends EventEmitter {
       if (!a.loaded) {
         let response;
         try {
-          response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings),
-            ...(plan.model ? { model: plan.model } : {}), ...(a.modelProvider ? { modelProvider: a.modelProvider } : {}), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+          response = await this.resumeThread(a, { effort: plan.effort,
+            ...(plan.model ? { model: plan.model } : {}), ...(a.modelProvider ? { modelProvider: a.modelProvider } : {}) });
         } catch (error) {
           if (followup && plan.model && providerModelUnavailable(error)) {
             const unavailable = this.noteUnavailableModel(a, plan, error);
@@ -999,7 +1007,7 @@ export class AgentController extends EventEmitter {
 
   async restoreSubscription(a) {
     try {
-      const response = await this.rpc('thread/resume', { threadId: a.threadId, excludeTurns: true, ...permissionParams(this.settings), ...(a.role === 'default' ? { config: roleConfig(a.role) } : {}) });
+      const response = await this.resumeThread(a);
       this.updateResolved(a, response, { keepModel: true });
       a.loaded = true;
       if (response?.thread?.status?.type !== 'idle') {
@@ -1614,7 +1622,7 @@ export class AgentController extends EventEmitter {
       this.persistScheduled = null;
       const pauseOperations = [...this.pauseOperations.values()].map(({ timer, ...operation }) => operation);
       const data = { version: 1, nextSeq: this.nextSeq, retiredThreads: [...this.retiredThreads], pausedThreads: [...this.pausedThreads], pauseOperations, unlinkedThreads: [...this.unlinkedThreads], unlinkedTurns: [...this.unlinkedTurns], descendants: [...this.descendants].map(([id, root]) => [id, root.id]), descendantTurns: [...this.descendantTurns], pendingEvents: copy(this.pendingEvents), agents: [...this.agents.values()].map((a) => ({
-      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, modelProvider: a.modelProvider, modelRecovery: a.modelRecovery, replacementAttempt: a.replacementAttempt, lastModelRecovery: a.lastModelRecovery, effort: a.effort, role: a.role, status: a.status,
+      id: a.id, threadId: a.threadId, name: a.name, threadName: a.threadName, cwd: a.cwd, model: a.model, modelProvider: a.modelProvider, modelRecovery: a.modelRecovery, replacementAttempt: a.replacementAttempt, lastModelRecovery: a.lastModelRecovery, effort: a.effort, effortPinned: a.effortPinned, role: a.role, status: a.status,
       activity: a.activity, createdAtMs: a.createdAtMs, lastActivityAtMs: a.lastActivityAtMs, turnId: a.turnId, lastTurnId: a.lastTurnId, turnOrigin: a.turnOrigin, pendingUserSteer: a.pendingUserSteer, result: a.result, error: a.error, tokenUsage: a.tokenUsage, pauseReconcileTurnId: a.pauseReconcileTurnId,
       snapshot: a.snapshot, injected: a.injected, contextSource: a.contextSource, recoveryUsed: a.recoveryUsed, externalAdopted: a.externalAdopted, externalConflict: a.externalConflict, externalThread: a.externalThread, unavailableTools: a.unavailableTools, userPaused: a.userPaused, userControlStatus: a.userControlStatus, userPauseId: a.userPauseId,
     })) };

@@ -243,6 +243,9 @@ export async function main(argv = process.argv.slice(2)) {
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
   const body = JSON.parse(input);
+  if (body.operation === 'reserve_context' && !directContextRoute(process.env)) {
+    return { error: { code: 'context_export_failed', message: 'Claude uses an HTTP proxy. Include 127.0.0.1 in NO_PROXY for local context export, or use context_mode none with a task summary.' } };
+  }
   const dir = ownerDirectory(body.owner);
   const endpointPath = join(dir, 'endpoint.json');
   const existing = await probe(endpointPath);
@@ -255,13 +258,25 @@ export async function main(argv = process.argv.slice(2)) {
   if (body.operation === 'ui_interrupt_all' && !endpoint) return { error: { code: 'helper_restart_required', message: 'The running session helper is incompatible; agent status is unconfirmed.' } };
   if (!existing && ['observe', 'ack', 'confirm', 'release', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
   endpoint ||= await ensureBroker(body.owner, body.cwd || process.cwd());
-  try { return await call(endpoint, body, body.operation === 'wait' ? 35000 : 150000); }
+  try {
+    const result = await call(endpoint, body, body.operation === 'wait' ? 35000 : 150000);
+    if (body.operation === 'reserve_context' && !result.error) return { port: endpoint.port, ticket: result.ticket };
+    return result;
+  }
   catch (error) {
     if (['spawn_agent', 'send_message', 'followup_task', 'interrupt_agent', 'close_agent', 'answer_agent', 'ui_interrupt', 'ui_interrupt_all', 'ui_send'].includes(body.operation)) {
       return { error: { code: 'action_status_unknown', message: 'The local connection ended before confirmation. The action may already have been submitted. Use list_agents before issuing another action.' } };
     }
     throw error;
   }
+}
+
+// Host fetch follows the host's proxy configuration. Only allow a proxy when
+// its bypass list explicitly covers the exact loopback address used here.
+export function directContextRoute(env) {
+  if (!['http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY'].some(name => env[name])) return true;
+  const lists = [env.no_proxy, env.NO_PROXY].filter(Boolean);
+  return lists.length > 0 && lists.every(list => list === '*' || list.split(',').some(host => host.trim() === '127.0.0.1'));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === entry) {

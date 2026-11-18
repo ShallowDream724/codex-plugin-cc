@@ -813,7 +813,18 @@ Codex 已在此线程接收了使用 `gpt-6.2-sol` 的轮次 `019a6d28-51fe-7c59
 | `runtime/broker.mjs:66`，请求撞上 helper 已接受的空闲重启，`helper_restarting` | `The idle session helper is restarting. Retry the request.` | 空闲会话的 helper 正在重启。请重试请求。 |
 | `runtime/broker.mjs:184`，请求主体超过 64 MiB，`transport_limit` | `Snapshot exceeds the 64 MiB transport limit; nothing was truncated or dispatched.` | 快照超过 64 MiB 的传输上限。未截断任何内容，也未派发请求。 |
 
-宿主 `session.messages`、`session.id`、`session.cwd`、环境查询或 `process.run` 本身抛出的文字由 hook 直接装进 `plugin_error`。实测注入 `Simulated Claude host export permission failure.`（模拟 Claude 宿主导出时的权限错误），返回 `{"error":{"code":"plugin_error","message":"Simulated Claude host export permission failure."}}`。JSON 解析异常、`EACCES`、断线时间和地址等 Node/操作系统诊断也取决于实际异常，代码不提供一组固定英文句子。`bridge.mjs:129` 读取 helper 启动错误时重新构造 `Error`，因此原错误代码通常变成 `bridge_error`，其 `message` 保留。（`hooks/register.js:100`–`103`、`:145`–`160`、`hooks/bridge.js:12`–`31`、`runtime/bridge.mjs:128`–`129`、`:229`–`232`、`:258`–`269`）
+**继承上下文时的导出错误**　`context_export_failed` 出现在派发前。代理只有在快照收齐后才会启动。普通 `spawn_agent` 工具说明沿用原文。
+
+| 情境 | Claude 收到的英文示例 | 中文 |
+| --- | --- | --- |
+| Claude 配置了代理，回环地址未列入直连范围 | `Claude uses an HTTP proxy. Include 127.0.0.1 in NO_PROXY for local context export, or use context_mode none with a task summary.` | Claude 使用 HTTP 代理。将 127.0.0.1 加入 NO_PROXY 以允许本机导出，或使用 none 并附任务背景。 |
+| 导出时宿主返回 HTTP 403，响应未给出更多原因 | `Claude context export failed before task dispatch: Local context export returned HTTP 403. Use context_mode none with a task summary to delegate without history.` | 在派发前导出失败，本机请求返回 HTTP 403。如果只需任务背景，可用 none 并附上摘要。 |
+| 本机同时已有七笔传输 | `Seven Claude context uploads are in progress. Retry when one finishes.` | 当前有七笔 Claude 上下文正在传输，等其中一笔完成后再试。 |
+| 申请时已能确定总量超过限制 | `The Claude context exceeds the 64 MiB transport limit.` | Claude 上下文超过 64 MiB 的传输限制。 |
+
+本机通道还会检查上传凭据、消息总数、分片顺序、长度和确认位置。若这些检查失败，错误中保留具体原因，例如 `The Claude context upload expired.`（此次传输已过期）或 `The local helper did not acknowledge the full context upload.`（本机辅助进程未确认完整接收）。宿主本身拒绝 HTTP 导出时保留宿主原因。
+
+宿主 `session.messages` 读取失败或普通控制调用抛错，hook 会将原因放入 `plugin_error`。准备及上传继承快照期间的错误使用上表的 `context_export_failed`。实测注入 `Simulated Claude host export permission failure.`（模拟 Claude 宿主导出时的权限错误），返回 `{"error":{"code":"plugin_error","message":"Simulated Claude host export permission failure."}}`。JSON 解析异常、`EACCES`、断线时间和地址等 Node/操作系统诊断也取决于实际异常，代码不提供一组固定英文句子。`bridge.mjs:129` 读取 helper 启动错误时重新构造 `Error`，因此原错误代码通常变成 `bridge_error`，其 `message` 保留。（`hooks/register.js:100`–`103`、`:145`–`160`、`hooks/bridge.js:12`–`31`、`runtime/bridge.mjs:128`–`129`、`:229`–`232`、`:258`–`269`）
 
 ## Broker、上下文及默认角色验证
 
