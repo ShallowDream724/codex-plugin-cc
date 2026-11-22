@@ -128,7 +128,7 @@ Claude 将选中的目标和原任务交给 `followup_task`，普通续接和恢
 
 turn/start 的明确 RPC 拒绝产生本代理 failed；没有启动证据的传输异常产生 unknown。若已观察到有效启动或完成，则保留真实状态。unknown 的显式操作先用 thread/read(includeTurns:false) 查询：idle/notLoaded 可恢复；active 必要时 resume(excludeTurns:true) 建立订阅，再读取最新一条无 items 的 turn。未确定状态前不自动重放任务。审批只能选择该请求 availableDecisions 提供的决策。
 
-启动和服务锁使用 PID 与随机 owner token，锁内再次核验 endpoint；helper 在建立 Codex 连接前取得整个生命周期的服务锁。活 PID 不按文件年龄抢占。构建不一致时，仅同协议且声明 `idle_shutdown` 能力的 helper 可以自动更换：旧 helper 在同一个同步检查中确认没有活动工作和其他在途请求，并封闭新操作准入；调用方等待 endpoint 和服务锁都释放后启动新版本。活动任务、协议不兼容或旧 helper 未提供该能力时明确报错，不强行停止。连接关闭监听先于初始化，health 反映实际状态；休眠或长事件循环暂停后留续租宽限。上述升级保护不改变宿主失联租约的清理语义。
+启动和服务锁使用 PID 与随机 owner token，锁内再次核验 endpoint；helper 在建立 Codex 连接前取得整个生命周期的服务锁。Windows 在释放锁期间可能短暂拒绝读取目录。遇到 `EPERM` 时先重读，持续失败则返回原始权限错误。活 PID 不按文件年龄抢占。构建不一致时，仅同协议且声明 `idle_shutdown` 能力的 helper 可以自动更换：旧 helper 在同一个同步检查中确认没有活动工作和其他在途请求，并封闭新操作准入；调用方等待 endpoint 和服务锁都释放后启动新版本。活动任务、协议不兼容或旧 helper 未提供该能力时明确报错，不强行停止。连接关闭监听先于初始化，health 反映实际状态；休眠或长事件循环暂停后留续租宽限。上述升级保护不改变宿主失联租约的清理语义。
 
 状态写入按微任务批合并，同一批调用共同等待保存结果；普通代理错误局部处理，真实持久化失败统一停止 helper。按当前任务/轮次管理去重集合，已回答、已过期和不可恢复的请求事件不继续交付。必要的动作 ID、关闭线程 ID 继续保留，以避免重复执行和迟到事件重新关联。
 

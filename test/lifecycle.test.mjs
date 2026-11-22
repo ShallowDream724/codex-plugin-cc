@@ -44,6 +44,36 @@ test('owner locks preserve live owners and late release cannot delete a replacem
   assert.equal((await readdir(directory)).length, 0);
 });
 
+test('a contender retries a denied directory scan while the starting lock is released', async t => {
+  const directory = await temporary(t);
+  const path = join(directory, 'starting');
+  const owner = await acquireOwnedLock(path);
+  let scans = 0;
+  const next = await acquireOwnedLock(path, { readEntries: async lockPath => {
+    if (++scans === 1) {
+      await owner.release();
+      throw Object.assign(new Error('Lock deletion pending'), { code: 'EPERM' });
+    }
+    return readdir(lockPath);
+  } });
+  assert.ok(next);
+  assert.notEqual(next.token, owner.token);
+  await next.release();
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test('a persistent lock scan error reaches the caller and preserves the live owner', async t => {
+  const directory = await temporary(t);
+  const path = join(directory, 'starting');
+  const owner = await acquireOwnedLock(path);
+  const denied = Object.assign(new Error('Access denied'), { code: 'EPERM' });
+  await assert.rejects(acquireOwnedLock(path, { readEntries: async () => { throw denied; } }),
+    error => error === denied);
+  assert.deepEqual(await readdir(path), [`${owner.pid}-${owner.token}.json`]);
+  await owner.release();
+  assert.deepEqual(await readdir(directory), []);
+});
+
 test('concurrent startup creates one fixture helper and shutdown permits a fresh helper', async t => {
   const directory = await temporary(t), children = [];
   let launches = 0;

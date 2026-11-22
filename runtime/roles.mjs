@@ -17,7 +17,7 @@ export function defaultRole(guidance) {
 
 // config/read does not include auto-discovered role files. Refuse to override
 // anything when metadata or a directory cannot be inspected reliably.
-export async function resolveNativeDefault({ readConfig, cwd, guidance, roleFile = fileURLToPath(new URL('../config/default-agent.toml', import.meta.url)) }) {
+export async function resolveNativeDefault({ readConfig, cwd, guidance, roleFile = fileURLToPath(new URL('../config/default-agent.toml', import.meta.url)), readDirectory = readdir }) {
   let timer;
   try {
     if (!(await stat(roleFile)).isFile()) return undefined;
@@ -41,7 +41,7 @@ export async function resolveNativeDefault({ readConfig, cwd, guidance, roleFile
       const parent = path.dirname(current); if (parent === current) break; current = parent;
     }
     for (const dir of directories) {
-      try { if ((await readdir(dir, { withFileTypes: true })).some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !entry.isFile() || entry.name.toLowerCase().endsWith('.toml'))) return undefined; }
+      try { if ((await readDirectory(dir, { withFileTypes: true })).some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !entry.isFile() || entry.name.toLowerCase().endsWith('.toml'))) return undefined; }
       catch (error) { if (error.code !== 'ENOENT') return undefined; }
     }
     const preset = defaultRole(guidance);

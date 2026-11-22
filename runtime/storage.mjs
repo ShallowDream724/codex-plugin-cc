@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export function ownerDirectory(owner, base = process.env.CODEX_SUBAGENTS_STATE_DIR || join(homedir(), '.claude', 'codex-subagents')) {
   if (typeof owner !== 'string' || !owner || owner.length > 256) throw new Error('A valid Claude session id is required.');
@@ -36,11 +37,23 @@ const removeEmpty = path => rmdir(path).catch(error => {
   if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
 });
 
+async function readLockEntries(path, readEntries) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await readEntries(path); }
+    catch (error) {
+      if (error.code === 'ENOENT') return null;
+      // Windows can deny scandir while another process finishes deleting the lock.
+      if (error.code !== 'EPERM' || attempt >= 3) throw error;
+      await sleep(25 * (2 ** attempt));
+    }
+  }
+}
+
 /** Publish a populated directory atomically: there is never an ownerless lock.
  * Release/recovery removes only the exact owner's entry, then an empty directory.
  * A concurrent recovery cannot unlink a replacement owner's entry.
  */
-export async function acquireOwnedLock(path, { pid = process.pid, isAlive = processAlive } = {}) {
+export async function acquireOwnedLock(path, { pid = process.pid, isAlive = processAlive, readEntries = readdir } = {}) {
   const token = randomUUID();
   const name = `${pid}-${token}.json`;
   const candidate = `${path}.${token}.candidate`;
@@ -60,7 +73,7 @@ export async function acquireOwnedLock(path, { pid = process.pid, isAlive = proc
       } catch (error) {
         if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(error.code)) throw error;
       }
-      const entries = await readdir(path).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      const entries = await readLockEntries(path, readEntries);
       if (entries === null) continue;
       if (entries.length === 0) { await removeEmpty(path); continue; }
       if (entries.length !== 1) return null;

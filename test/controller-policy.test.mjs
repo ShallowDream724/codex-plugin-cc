@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentController } from '../runtime/agents.mjs';
@@ -158,7 +158,10 @@ test('native default fallback leaves all existing role configurations untouched'
   const dir = await mkdtemp(path.join(os.tmpdir(), 'roles-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const home = path.join(dir, 'home'), cwd = path.join(dir, 'project', 'work'); await mkdir(home, { recursive: true }); await mkdir(cwd, { recursive: true });
   const response = { config: { agents: null }, origins: {}, layers: [{ name: { type: 'user', file: path.join(home, 'config.toml') } }] };
-  const args = { cwd, guidance: loadGuidance(), roleFile: path.join(dir, 'plugin.toml'), readConfig: async () => response };
+  // On Windows the temp folder can sit inside a real Codex user's home.
+  const args = { cwd, guidance: loadGuidance(), roleFile: path.join(dir, 'plugin.toml'), readConfig: async () => response,
+    readDirectory: (directory, options) => directory.startsWith(dir + path.sep) ? readdir(directory, options) : [],
+  };
   await writeFile(args.roleFile, 'model = "test"');
   assert.equal((await resolveNativeDefault(args))['agents.default.config_file'], args.roleFile);
   response.config.agents = { default: { description: 'user role' } };
