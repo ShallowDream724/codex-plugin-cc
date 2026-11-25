@@ -95,7 +95,8 @@ test('historical timestamps prefer local today and yesterday across Monday and N
   assert.equal(finalTimestamp(at(2025, 12, 31, 23, 59), newYear), '昨天 23:59');
   assert.equal(finalTimestamp(at(2025, 12, 30, 16, 0), newYear), '周二 16:00');
   assert.equal(finalTimestamp(null, monday), '');
-  assert.equal(durationLabel(null), '查看过程');
+  assert.equal(durationLabel(null), '执行过程');
+  assert.equal(durationLabel(65000, 'interrupted'), '已中断 · 用时 1分5秒');
 });
 
 test('historical timestamps use local day boundaries when daylight saving starts or ends', t => {
@@ -215,7 +216,7 @@ test('a history-only turn folds on interruption even when no live item arrives',
 
   client.emit('notification', { method: 'turn/completed', params: { threadId: 'root', turn: { id: 't', status: 'interrupted' } } });
   await poll(); tree = await draw();
-  assert.match(byKey(tree, 'turn_process_a:t').props.label, /查看过程/);
+  assert.match(byKey(tree, 'turn_process_a:t').props.label, /已中断/);
   assert.ok(byKey(tree, 'message_a:t:ask'));
   assert.ok(!byKey(tree, 'message_a:t:progress'));
   assert.ok(!byKey(tree, 'message_a:t:steer'));
@@ -249,7 +250,7 @@ test('a native successor closes a previous turn with no completion without inven
   assert.deepEqual(initial.get('old'), { id: 'old', status: 'inProgress', started_at_ms: 100000, history_start_loaded: true, superseded: true });
   const folded = turnTimeline(entries, initial, () => false);
   assert.deepEqual(folded.map(entry => entry.id), ['ask', '@turn-summary']);
-  assert.equal(durationLabel(folded[1].duration_ms), '查看过程');
+  assert.equal(durationLabel(folded[1].duration_ms, folded[1].status), '执行过程');
   assert.deepEqual(turnTimeline(entries, initial, () => true).map(entry => entry.id), ['ask', '@turn-summary', 'progress', 'compact', 'steer']);
   assert.deepEqual(turnTimeline([{ id: 'new-work', turn_id: 'next', type: 'contextCompaction' }], initial, () => false).map(entry => entry.id), ['new-work']);
 
@@ -317,6 +318,81 @@ test('only a sole unphased reply in complete success history stays outside its f
   turns.get('legacy').history_start_loaded = false;
   const partial = turnTimeline(entries.filter(entry => entry.id !== 'legacy-prompt'), turns, () => false);
   assert.ok(!partial.some(entry => entry.id === 'legacy-reply'));
+});
+
+test('the native turn chooses one final across bridge pages and keeps asynchronous messages in order', async t => {
+  const asyncMessage = id => ({ ...message(id, 'final_answer', id), delivery: 'async' });
+  const { store } = fixture([
+    { id: 'next', status: 'completed', items: [prompt('next-ask', 'new task'), asyncMessage('next-note')] },
+    { id: 'interrupted', status: 'interrupted', items: [prompt('stopped-ask', 'interrupted task'),
+      { ...message('stopped-draft', 'final_answer', 'draft from the interrupted task'), completedAtMs: 300000 }] },
+    { id: 't', status: 'completed', items: [prompt('ask', 'initial task'), asyncMessage('first-note'),
+      { id: 'tool', type: 'commandExecution' }, message('draft', 'final_answer', 'earlier candidate'), asyncMessage('second-note'),
+      message('answer', 'final_answer', 'published reply'), asyncMessage('late-note'), message('empty', 'final_answer', '  ')] },
+  ]);
+  t.after(() => store.close());
+
+  const turns = new Map(), args = { target: 'a', limit: 2, fold_turns: true };
+  let entries = [], cursor;
+  do {
+    const result = await store.history({ ...args, cursor });
+    entries = expandProcessReferences(result.entries).concat(entries);
+    for (const turn of result.turns) turns.set(turn.id, turn);
+    cursor = result.next_cursor;
+    store.turnStates.clear();
+  } while (cursor);
+
+  assert.equal(turns.get('t').final_item_id, 'answer');
+  const folded = turnTimeline(entries, turns, () => false);
+  assert.deepEqual(folded.map(entry => entry.id), ['ask', '@turn-summary', 'answer', 'stopped-ask', '@turn-summary', 'next-ask', '@turn-summary']);
+  assert.deepEqual(folded.filter(entry => entry.message?.is_final).map(entry => entry.id), ['answer']);
+  assert.ok(entries.find(entry => entry.id === 'draft').locator, 'earlier explicit phases stay lazy even after a helper restart');
+
+  const pages = new Map();
+  for (const { pageKey, locator } of entries.filter(entry => entry.locator)) {
+    if (pages.has(pageKey)) continue;
+    const { entries: records } = await store.history({ target: 'a', process_page: locator });
+    pages.set(pageKey, { records: new Map(records.map(entry => [entry.id, entry])) });
+  }
+  const opened = turnTimeline(entries, turns, () => true, pages);
+  assert.deepEqual(opened.filter(entry => entry.turn_id === 't').map(entry => entry.id),
+    ['ask', '@turn-summary', 'first-note', 'tool', 'draft', 'second-note', 'late-note', 'empty', 'answer']);
+  assert.deepEqual(opened.filter(entry => entry.message?.is_final).map(entry => entry.id), ['answer']);
+});
+
+test('the live pane gives only the confirmed final copy and time when an active turn ends', async t => {
+  const ended = Date.now();
+  const ask = prompt('ask', 'initial task');
+  const draft = message('draft', 'final_answer', 'draft while running');
+  const answer = message('answer', 'final_answer', 'complete answer');
+  const note = { ...message('note', 'final_answer', 'supplement'), delivery: 'async' };
+  const { store, client } = fixture([{ id: 't', status: 'inProgress', items: [ask, draft] }]);
+  const emit = (method, params) => client.emit('notification', { method, params: { threadId: 'root', turnId: 't', ...params } });
+  emit('turn/started', { turn: { id: 't', status: 'inProgress', items: [ask] } });
+  emit('item/completed', { item: draft, completedAtMs: ended - 2000 });
+  emit('item/started', { item: { ...answer, text: 'prefix' } });
+  emit('item/completed', { item: note, completedAtMs: ended + 1000 });
+  const liveWithoutTurn = turnTimeline(store.revision({ target: 'a' }).entries, new Map(), () => false);
+  assert.ok(liveWithoutTurn.some(entry => entry.id === 'draft' && !entry.message.is_final));
+
+  const { draw, byKey, poll } = await openFixturePane(t, store);
+  let tree = await draw();
+  assert.ok(byKey(tree, 'message_a:t:draft')); assert.ok(byKey(tree, 'message_a:t:note'));
+  assert.ok(!tree.some(node => node.props.key?.startsWith('message_copy_a:t:')));
+
+  emit('turn/completed', { turn: { id: 't', status: 'completed', itemsView: 'full',
+    items: [ask, draft, { ...answer, completedAtMs: ended }, { ...note, delivery: null }] } });
+  emit('item/agentMessage/delta', { itemId: 'answer', delta: 'late duplicated delta' });
+  await poll(); tree = await draw();
+  assert.equal(byKey(tree, 'message_a:t:answer').props.text, answer.text);
+  assert.equal(byKey(tree, 'message_time_a:t:answer').props.children[0], finalTimestamp(ended));
+  assert.ok(byKey(tree, 'message_copy_a:t:answer'));
+  assert.ok(!byKey(tree, 'message_a:t:note')); assert.ok(!byKey(tree, 'message_a:t:draft'));
+
+  await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
+  assert.ok(tree.indexOf(byKey(tree, 'message_a:t:draft')) < tree.indexOf(byKey(tree, 'message_a:t:note')));
+  assert.deepEqual(tree.filter(node => node.props.key?.startsWith('message_copy_a:t:')).map(node => node.props.key), ['message_copy_a:t:answer']);
+  assert.deepEqual(tree.filter(node => node.props.key?.startsWith('message_time_a:t:')).map(node => node.props.key), ['message_time_a:t:answer']);
 });
 
 test('native pane folds intermediate guidance, keeps the prompt and final copy/time visible, and reuses hydrated records', async t => {

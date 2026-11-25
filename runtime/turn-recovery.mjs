@@ -1,3 +1,5 @@
+import { finalAnswer } from '../shared/turn-history.mjs';
+
 // Fetch only the registered native turn. A different client can have added
 // more turns to the same thread while the controller was offline.
 async function* pages(request, method, params) {
@@ -23,9 +25,8 @@ export async function findOwnedTurn(request, threadId, turnId) {
 export function answerFromItems(items) {
   let final, legacy;
   for (const item of items ?? []) {
-    if (item.type !== 'agentMessage' || typeof item.text !== 'string') continue;
-    if (['final_answer', 'finalAnswer'].includes(item.phase)) final = item.text;
-    else if (item.phase == null) legacy = item.text;
+    if (finalAnswer(item)) final = item.text;
+    else if (item?.type === 'agentMessage' && item.phase == null && item.delivery !== 'async' && typeof item.text === 'string') legacy = item.text;
   }
   return { final, legacy };
 }

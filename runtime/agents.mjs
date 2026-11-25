@@ -819,8 +819,9 @@ export class AgentController extends EventEmitter {
       bindAnswer(a, turn.id);
       if (turn.status === 'completed' && !a.interrupted && !a.recovery && !a.liveAnswerOnly && a.result == null) {
         const { final, legacy } = answerFromItems(turn.items);
-        a.result = final ?? await readOwnedAnswer(this.rpc.bind(this), a.threadId, turn.id);
-        if (!a.result) a.result = legacy ?? a.unclassifiedResult ?? '';
+        const recovered = final ?? await readOwnedAnswer(this.rpc.bind(this), a.threadId, turn.id);
+        // A live final can arrive while the native history read is pending.
+        a.result ??= recovered || (legacy ?? a.unclassifiedResult ?? '');
       }
       if (this.closed || a.reconcileTurnId !== turn.id) return;
       a.terminalEmitted = false; a.error = null;
@@ -1500,8 +1501,9 @@ export class AgentController extends EventEmitter {
         if (a.turnId && p.turnId && a.turnId !== p.turnId) return;
         if (item.type === 'agentMessage' && message.method === 'item/completed' && p.turnId && p.turnId === (a.turnId ?? a.reconcileTurnId)) {
           bindAnswer(a, p.turnId);
-          if (['final_answer', 'finalAnswer'].includes(item.phase)) a.result = item.text;
-          else if (item.phase == null) a.unclassifiedResult = item.text;
+          const { final, legacy } = answerFromItems([item]);
+          if (final !== undefined) a.result = final;
+          if (legacy !== undefined) a.unclassifiedResult = legacy;
         }
         if (item.type === 'contextCompaction') {
           if (!a.compactItems.has(item.id)) {

@@ -319,7 +319,8 @@ test('selecting parent reporting shares only the marked private turn’s final a
   assert.equal(activity.list().agents[0].final_report_pending, true);
   client.ask('duplicate', 'item/tool/call', { threadId: agent.thread_id, turnId: report.turn_id, tool: 'notify_parent', arguments: { message: 'Do not send twice' } });
   client.note('item/completed', { threadId: agent.thread_id, turnId: report.turn_id, item: { type: 'agentMessage', phase: 'commentary', text: 'Private commentary' } });
-  client.note('item/completed', { threadId: agent.thread_id, turnId: report.turn_id, item: { type: 'agentMessage', phase: 'final_answer', text: 'Final report' } });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: report.turn_id, item: { type: 'agentMessage', phase: 'final_answer', delivery: null, text: 'Final report' } });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: report.turn_id, item: { type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Interim report' } });
   await tick();
   assert.equal(client.replies.find(reply => reply.id === 'duplicate')?.result.success, false);
   assert.deepEqual(controller.eventsAfter(), []);
@@ -1148,8 +1149,9 @@ test('external request IDs are strings while replies preserve numeric wire IDs a
 
 test('unclassified final fallback applies only on success and explicit final beats it', async (t) => {
   const { client, controller, spawn } = await setup(t); await spawn();
-  const message = (text, phase) => client.note('item/completed', { threadId: 'thread-1', turnId: `turn-${client.turnCount}`, item: { type: 'agentMessage', text, phase } });
+  const message = (text, phase, delivery) => client.note('item/completed', { threadId: 'thread-1', turnId: `turn-${client.turnCount}`, item: { type: 'agentMessage', text, phase, delivery } });
   message('Legacy final response', null); message('Explicit commentary after legacy response', 'commentary');
+  message('Asynchronous unclassified response', null, 'async');
   client.complete(); assert.equal(controller.eventsAfter(0).at(-1).result, 'Legacy final response');
   await controller.dispatch('followup_task', { target: 'thread-1', message: 'second' });
   message('Explicit final', 'final_answer'); message('Unclassified after explicit', null);
@@ -1159,6 +1161,21 @@ test('unclassified final fallback applies only on success and explicit final bea
   client.complete('thread-1', 'turn-3', 'failed', { message: 'Failure' });
   assert.equal(controller.eventsAfter(0).at(-1).kind, 'failed');
   assert.equal(controller.snapshot().agents[0].result, null);
+});
+
+test('async messages alone yield an empty parent result with either a full or stub completion', async t => {
+  for (const fullCompletion of [false, true]) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn();
+    const asyncMessage = { type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Interim response' };
+    const item = { threadId: agent.thread_id, turnId: agent.turn_id, item: asyncMessage };
+    client.note('item/completed', item);
+    client.note('turn/completed', { threadId: agent.thread_id, turn: {
+      id: agent.turn_id, status: 'completed', ...(fullCompletion ? { items: [asyncMessage] } : {}),
+    } });
+    client.note('item/completed', item);
+    assert.deepEqual(controller.eventsAfter().map(event => [event.kind, event.result]), [['completed', '']]);
+    assert.equal(controller.snapshot().agents[0].result, '');
+  }
 });
 
 test('restart recovers exactly the owned native final across pages, ACK and another restart', async t => {
@@ -1178,6 +1195,7 @@ test('restart recovers exactly the owned native final across pages, ACK and anot
       return p.cursor ? { data: [{ turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', text: 'Owned answer' } }] }
         : { data: [
           { turnId: 'unrelated', item: { type: 'agentMessage', phase: 'final_answer', text: 'Wrong answer' } },
+          { turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Newer interim update' } },
           { turnId: 'owned', item: { type: 'agentMessage', text: 'Legacy text' } },
         ], nextCursor: 'more-items' };
     }
@@ -1200,7 +1218,7 @@ test('restart recovers exactly the owned native final across pages, ACK and anot
   assert.ok(client.calls.every(c => !['thread/resume', 'turn/start', 'turn/steer'].includes(c.method)));
 });
 
-test('a completion crossing subscription restoration retries its own history after a transient read failure', async t => {
+test('a completion crossing subscription restoration retries its history and keeps the live final', async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-resume-race-')), statePath = path.join(dir, 'state.json');
   await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: [
     { id: 'a', threadId: 'thread', turnId: 'owned', status: 'running', turnOrigin: 'parent' },
@@ -1215,7 +1233,8 @@ test('a completion crossing subscription restoration retries its own history aft
     }
     if (method === 'thread/items/list') {
       if (!attempts++) throw new Error('Temporarily unavailable');
-      return { data: [{ turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', text: 'Recovered while reattaching' } }] };
+      client.note('item/completed', { threadId: 'thread', turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', delivery: null, text: 'Recovered while reattaching' } });
+      return { data: [{ turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', delivery: 'async', text: 'Interim update in history' } }] };
     }
   };
   const controller = new AgentController({ client, statePath }); await controller.init();

@@ -1,10 +1,12 @@
-import { foldableTurn, inputItem, processItem } from '../shared/turn-history.mjs';
+import { foldableTurn, inputItem } from '../shared/turn-history.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 
-export function durationLabel(ms) {
-  if (!Number.isFinite(ms) || ms < 0) return '查看过程';
+export function durationLabel(ms, status) {
+  const outcome = status === 'interrupted' ? '已中断' : status === 'failed' ? '执行失败' : '';
+  if (!Number.isFinite(ms) || ms < 0) return outcome || '执行过程';
   const seconds = Math.floor(ms / 1000), minutes = Math.floor(seconds / 60);
-  return `用时 ${minutes >= 60 ? Math.floor(minutes / 60) + '小时' : ''}${minutes % 60}分${seconds % 60}秒`;
+  const duration = `用时 ${minutes >= 60 ? Math.floor(minutes / 60) + '小时' : ''}${minutes % 60}分${seconds % 60}秒`;
+  return outcome ? `${outcome} · ${duration}` : duration;
 }
 
 export function finalTimestamp(ms, now = new Date()) {
@@ -56,8 +58,11 @@ function openingInput(items, meta) {
 
 export function turnTimeline(entries, turns, isOpen, pages) {
   // Apply native wait ordering after hydration, before placing the turn header.
-  entries = orderWaits(pages?.size ? entries.map(entry => entry.type === 'turnProcessRef' && isOpen(entry.turn_id)
-    ? pages.get(entry.pageKey)?.records?.get(entry.id) ?? entry : entry) : entries);
+  entries = orderWaits(pages?.size ? entries.map(entry => {
+    if (entry.type !== 'turnProcessRef' || !isOpen(entry.turn_id)) return entry;
+    const record = pages.get(entry.pageKey)?.records?.get(entry.id);
+    return record?.type === 'agentMessage' ? { ...record, turn_process: true } : record ?? entry;
+  }) : entries);
   const spans = new Map();
   for (const entry of entries) {
     if (!entry.turn_id || !foldableTurn(turns?.get(entry.turn_id))) continue;
@@ -67,36 +72,44 @@ export function turnTimeline(entries, turns, isOpen, pages) {
   const out = [];
   for (const entry of entries) {
     const items = spans.get(entry.turn_id);
-    if (!items) { out.push(entry); continue; }
+    const meta = turns?.get(entry.turn_id);
+    if (!items) {
+      out.push(withoutFinalActions(entry));
+      continue;
+    }
     if (entry !== items[0]) continue;
-    const meta = turns.get(entry.turn_id), open = isOpen(entry.turn_id);
+    const open = isOpen(entry.turn_id);
     const opener = openingInput(items, meta);
-    const isFinal = item => item.message?.phase === 'final_answer' || item.message?.is_final;
-    const unphased = item => item.type === 'agentMessage' && item.message?.phase == null;
+    // History can identify the final before earlier pages are loaded. A
+    // live-only turn uses the last completed candidate in its current order.
+    const final = meta.status === 'completed' ? items.findLast(item => item.type === 'agentMessage' && item.message?.is_final
+      && (meta.final_item_id !== undefined ? item.id === meta.final_item_id : !item.turn_process)) : undefined;
     let legacyReply;
-    if (meta.status === 'completed' && meta.history_start_loaded === true && !items.some(isFinal)) {
-      const candidates = items.filter(item => unphased(item) && !item.turn_process);
+    if (meta.status === 'completed' && meta.history_start_loaded === true && !meta.final_item_id && !final
+        && !items.some(item => item.message?.phase === 'final_answer')) {
+      const candidates = items.filter(item => item.type === 'agentMessage' && item.message?.phase == null && item.message?.delivery !== 'async' && !item.turn_process);
       if (candidates.length === 1 && candidates[0].message?.complete) [legacyReply] = candidates;
     }
-    const process = item => item !== opener && item !== legacyReply && !isFinal(item)
-      && (item.turn_process || unphased(item) || processItem(item.type, item.message?.phase, true));
+    const process = item => item !== opener && item !== final && item !== legacyReply;
     const firstProcess = items.find(process);
     if (opener) out.push(opener);
     if (firstProcess || Number.isFinite(meta.duration_ms)) {
-      out.push({ type: 'turnSummary', id: '@turn-summary', turn_id: entry.turn_id, duration_ms: meta.duration_ms,
+      out.push({ type: 'turnSummary', id: '@turn-summary', turn_id: entry.turn_id, duration_ms: meta.duration_ms, status: meta.status,
         open, hasProcess: !!firstProcess,
         firstPage: firstProcess?.locator && !pages?.get(firstProcess.pageKey)?.records ? firstProcess : undefined });
     }
-    // Late native echoes can arrive after the final or even after the next
-    // turn starts. Keep their native order within this turn and its final last.
-    const finals = [];
-    for (const item of items) {
-      if (item === opener) continue;
-      if (isFinal(item)) { finals.push(item); continue; }
-      if (!open && process(item)) continue;
-      out.push(item.type === 'turnProcessRef' ? { ...item, type: 'turnProcessPending', error: pages?.get(item.pageKey)?.error } : item);
+    // Keep earlier replies and late echoes in process order, even if their
+    // notifications arrived after the turn closed.
+    if (open) {
+      for (const item of items.filter(process)) {
+        out.push(item.type === 'turnProcessRef' ? { ...item, type: 'turnProcessPending', error: pages?.get(item.pageKey)?.error } : withoutFinalActions(item));
+      }
     }
-    for (const final of finals) out.push(final);
+    if (final || legacyReply) out.push(final ?? legacyReply);
   }
   return out;
+}
+
+function withoutFinalActions(entry) {
+  return entry.message?.is_final ? { ...entry, message: { ...entry.message, is_final: false } } : entry;
 }

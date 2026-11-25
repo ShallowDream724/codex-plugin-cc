@@ -7,6 +7,10 @@ const phases = new Map([
   ['partialAnswer', 'partial_answer'], ['finalAnswer', 'final_answer'],
 ]);
 export const messagePhase = phase => phases.get(phase) ?? null;
+// Codex can deliver asynchronous messages with a final-answer phase while
+// the owning native turn is still running.
+export const finalAnswer = item => item?.type === 'agentMessage' && messagePhase(item.phase) === 'final_answer'
+  && item.delivery !== 'async' && typeof item.text === 'string' && item.text.trim().length > 0;
 
 export function mergeTurnMetadata(previous, incoming, preferPrevious) {
   const next = preferPrevious ? { ...incoming, ...previous } : { ...previous, ...incoming };

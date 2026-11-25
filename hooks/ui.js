@@ -8,7 +8,7 @@ import { mergeTurnMetadata } from '../shared/turn-history.mjs';
 import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences } from './turn-history.js';
 import { renderDiff } from './diff-view.js';
 import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
-import { GROUP_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
+import { GROUP_RENDER_LIMIT, INPUT_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
 import { paneScroll } from './pane-scroll.js';
 import { historyWindowCost, historyWindowFits, planHistoryWindow } from './history-window.js';
 import { renderAgentDirectory } from './agent-directory.js';
@@ -246,12 +246,13 @@ function mergeLive(page, entries, prepend = false, turns = []) {
         const old = page.live[index];
         const origin = !messageOrigin(old) && messageOrigin(entry);
         const process = entry.type === 'turnProcessRef' && old.type === 'agentMessage' && !old.turn_process;
-        const completeMessage = entry.message?.complete && (!old.message?.complete || entry.message.is_final && !old.message?.is_final);
+        const completeMessage = entry.message?.complete && (!old.message?.complete || entry.message.is_final && !old.message?.is_final ||
+          entry.message.delivery === 'async' && old.message?.delivery !== 'async');
         if (origin || process || entry.turn_input && !old.turn_input || entry.completed_at_ms && !old.completed_at_ms || completeMessage) {
           page.live[index] = { ...old, ...(entry.completed_at_ms ? { completed_at_ms: entry.completed_at_ms } : {}),
             ...(origin ? { data: { ...old.data, message_origin: origin } } : {}), ...(entry.turn_input ? { turn_input: entry.turn_input } : {}),
             ...(process ? { turn_process: true } : {}),
-            ...(completeMessage ? { message: { ...old.message, ...entry.message } } : {}) };
+            ...(completeMessage ? { data: entry.data, preview: entry.preview, message: entry.message } : {}) };
           changed = true;
         }
       }
@@ -273,11 +274,15 @@ function mergeLive(page, entries, prepend = false, turns = []) {
     if (index === undefined) { positions.set(entryKey(entry), page.live.length); page.live.push(entry); changed = true; }
     else {
       const previous = page.live[index];
-      const value = { ...entry, ...(entry.started_at_ms == null && previous.started_at_ms != null ? { started_at_ms: previous.started_at_ms } : {}),
+      const staleMessage = previous.message?.complete && entry.message && !entry.message.complete;
+      const value = { ...(staleMessage ? previous : entry), ...(entry.started_at_ms == null && previous.started_at_ms != null ? { started_at_ms: previous.started_at_ms } : {}),
         ...(!messageOrigin(entry) && messageOrigin(previous) ? { data: { ...entry.data, message_origin: messageOrigin(previous) } } : {}),
         ...(!entry.turn_input && previous.turn_input ? { turn_input: previous.turn_input } : {}),
         ...(entry.type === 'agentMessage' && (previous.turn_process || previous.type === 'turnProcessRef') ? { turn_process: true } : {}),
         ...(entry.completed_at_ms == null && previous.completed_at_ms != null ? { completed_at_ms: previous.completed_at_ms } : {}) };
+      if (previous.message?.delivery === 'async' && value.message && value.message.delivery !== 'async') {
+        value.message = { ...value.message, delivery: 'async', is_final: false };
+      }
       if (JSON.stringify(page.live[index]) !== JSON.stringify(value)) { page.live[index] = value; changed = true; }
     }
   }
@@ -1719,7 +1724,7 @@ function renderPane($, e, next) {
       const itemRows = [];
       for (const entry of group.items) {
         if (entry.type === 'turnSummary') {
-          const key = `turn_process_${id}:${entry.turn_id}`, label = durationLabel(entry.duration_ms);
+          const key = `turn_process_${id}:${entry.turn_id}`, label = durationLabel(entry.duration_ms, entry.status);
           if (!entry.hasProcess) {
             if (Number.isFinite(entry.duration_ms)) itemRows.push(caption(key, label));
           } else itemRows.push(disclosure(key, label, async () => {
@@ -1971,7 +1976,9 @@ function renderPane($, e, next) {
       return Box({ key: `codex_jump_overlay_${id}`, position: 'absolute', alignSelf: 'center', width: 4, top: Math.max(0, offset + bodyRows - 3), height: 2, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', display: visible ? 'flex' : 'none', children: [jumpNode] });
     };
     const headerNode = Box({ key: 'codex_navigation', flexDirection: 'column', gap: 'sm', children: navigation });
-    const composerNode = Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer });
+    // Keep the history window stable as the draft consumes its wire allowance.
+    const draftReserve = Math.max(0, INPUT_RENDER_LIMIT - control.draft.length);
+    const composerNode = budget.reserveChars(Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer }), 0, draftReserve);
     let renderedContent;
     const root = (content, scroll = e.props?.scroll) => {
       renderedContent = content;

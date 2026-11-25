@@ -7,6 +7,7 @@ import { copyIcon, copyPendingIcon, copiedIcon, copyFailedIcon, copyFileIcon } f
 const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 async function fixture(t, entries, copy, detail) {
   const hooks = [], timers = [], requests = [], scrollCalls = [];
+  const turns = entries.filter(entry => entry.message?.is_final).map(entry => ({ id: entry.turn_id, status: 'completed' }));
   const $ = {
     ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async options => { scrollCalls.push(options); return {}; }, copy },
     clock: { every: () => ({ cancel() {} }), after(ms, fn) { if (ms === 1600) timers.push(fn); else setImmediate(fn); return { cancel() {} }; } },
@@ -15,7 +16,7 @@ async function fixture(t, entries, copy, detail) {
     process: { run: async (_argv, options) => {
       const { operation, args } = JSON.parse(options.stdin); requests.push({ operation, args });
       const value = operation === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] }
-        : operation === 'ui_revision' ? { revision: 1, entries }
+        : operation === 'ui_revision' ? { revision: 1, entries, turns }
         : operation === 'ui_detail' ? await detail(args) : { entries: [], next_cursor: null };
       return { stdout: JSON.stringify(value), exitCode: 0 };
     } },
@@ -26,7 +27,7 @@ async function fixture(t, entries, copy, detail) {
   const press = async key => { const all = await draw(), button = all.find(n => n.type === 'Button' && n.props.key === key); if (button) return button.props.onPress({ surface: 'desktop' }); return hooks.find(h => h.event === 'ui.message').fn($, { element: key, surface: 'desktop', data: { action: 'activate', expanded: false } }, () => { throw new Error(`Unmatched ${key}`); }); };
   return { render, draw, press, timers, requests, scrollCalls };
 }
-const final = id => ({ id, turn_id: 't', type: 'agentMessage', data: { text: `raw ${id}` }, message: { is_final: true } });
+const final = (id, turnId = 't') => ({ id, turn_id: turnId, type: 'agentMessage', data: { text: `raw ${id}` }, message: { is_final: true } });
 const hasText = (all, value) => all.some(n => n.type === 'Text' && n.props.children.includes(value));
 const copyGraphic = (all, key) => all.find(n => n.props.key === `${key}_graphic`);
 const desktopNodeCount = node => 1 + (node.props?.children ?? []).reduce((sum, child) => sum + desktopNodeCount(child), 0);
@@ -51,7 +52,7 @@ test('desktop draws the copy graphic beneath the native press target, with a rea
 
 test('copy feedback is immediate, reports actual success, and old timers do not erase newer feedback', async t => {
   let finish; const copied = [];
-  const f = await fixture(t, [final('one'), final('two')], value => { copied.push(value.text); return new Promise(resolve => { finish = resolve; }); });
+  const f = await fixture(t, [final('one'), final('two', 't2')], value => { copied.push(value.text); return new Promise(resolve => { finish = resolve; }); });
   const control = (await f.draw()).find(n => n.props.key === 'message_copy_a:t:one');
   assert.equal(control.type, 'Button');
   assert.equal(control.props.onPress({ surface: 'desktop' }), undefined);
@@ -63,7 +64,7 @@ test('copy feedback is immediate, reports actual success, and old timers do not 
   finish({ isCopied: true });
   assert.ok(hasText(await f.draw(), '已复制'));
   assert.equal(copyGraphic(await f.draw(), 'message_copy_a:t:one').props.children[0].props.source, copiedIcon);
-  await f.press('message_copy_a:t:two');
+  await f.press('message_copy_a:t2:two');
   finish({ isCopied: true });
   await f.timers[0]();
   assert.ok(hasText(await f.draw(), '已复制'));
@@ -73,7 +74,7 @@ test('copy feedback is immediate, reports actual success, and old timers do not 
 });
 
 test('copying from a dense desktop conversation keeps the same host-sized history window and footer', async t => {
-  const entries = Array.from({ length: 300 }, (_, index) => final(`reply-${index}`));
+  const entries = Array.from({ length: 300 }, (_, i) => final(`reply-${i}`, `019e6408-c62a-7113-a117-${String(i).padStart(12, '0')}`));
   const copied = [];
   let finish;
   const f = await fixture(t, entries, ({ text }) => {
@@ -89,7 +90,7 @@ test('copying from a dense desktop conversation keeps the same host-sized histor
     return { drawn, messages: drawn.filter(node => node.type === 'Markdown').map(node => node.props.key) };
   };
   const before = await paint();
-  const key = 'message_copy_a:t:reply-299';
+  const key = `message_copy_a:${entries.at(-1).turn_id}:reply-299`;
   const scrollCount = f.scrollCalls.length;
   before.drawn.find(node => node.type === 'Button' && node.props.key === key).props.onPress({ surface: 'desktop' });
   const pending = await paint();
@@ -113,8 +114,8 @@ test('copying from a dense desktop conversation keeps the same host-sized histor
 test('a final reply file notice cannot make the Desktop host discard a dense conversation', async t => {
   const fileUrl = 'file:///C:/Temp/complete.md';
   const entries = [
-    ...Array.from({ length: 10 }, (_, index) => ({ ...final(`f${index}`), message: undefined })),
-    ...Array.from({ length: 146 }, (_, index) => final(`m${index}`)),
+    ...Array.from({ length: 10 }, (_, index) => ({ ...final(`f${index}`, 'unknown'), message: undefined })),
+    ...Array.from({ length: 146 }, (_, index) => final(`m${index}`, `t${index}`)),
     { ...final('end'), message: { is_final: true, truncated: true } },
   ];
   const f = await fixture(t, entries, async () => assert.fail('the whole reply was exported'), async () => ({ file_url: fileUrl }));
