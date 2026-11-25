@@ -6,7 +6,7 @@ import { materializeImage, pngDimensions } from './tool-media-files.mjs';
 import { RolloutMedia } from './rollout-media.mjs';
 import { parentNotificationCapability, parentReportPending } from './parent-notification.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
-import { finishedTurn, processItem } from '../shared/turn-history.mjs';
+import { finishedTurn, inputItem, processItem } from '../shared/turn-history.mjs';
 import { claudeMessagePrefix, communication, safeBoundary } from '../shared/communication.mjs';
 import { fileChanges, fileChangeSummary, fileChangePage, fileChangeSource } from '../shared/file-changes.mjs';
 import { MAX_CLIPBOARD_LENGTH } from '../shared/clipboard.mjs';
@@ -124,6 +124,9 @@ export function formatItem(item) {
   }
 }
 const visible = (item) => item && item.type !== 'reasoning';
+const messageDigest = (text, attachments = []) => createHash('sha256').update(JSON.stringify([text, attachments.map(part => part.path)])).digest('hex');
+const singleText = item => item.type === 'userMessage' && item.content?.length === 1 && typeof item.content[0]?.text === 'string' &&
+  (!item.content[0].type || item.content[0].type === 'text') ? item.content[0].text : undefined;
 const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) => {
   const message = communication(item, threadId);
   let projected = project(item);
@@ -139,12 +142,17 @@ const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) 
   }
   const { images, omitted } = collectImages(item);
   const data = clean(sanitizeMedia({ ...(stage ? { stage } : {}), ...projected }), PREVIEW_BUDGET / 2);
+  // Authorship and echo identity describe the original input, independent of how
+  // much of its body fits in the display preview.
+  const text = item.type === 'directUserMessage' ? item.text : singleText(item);
+  const input = text === undefined ? {} : { input_digest: messageDigest(text, item.attachments) };
+  if (item.type === 'userMessage' && ['user', 'parent'].includes(item.message_origin)) data.message_origin = item.message_origin;
   const end = message ? Math.min(message.text.length, 2048) : 0;
   const safeEnd = message && end < message.text.length && safeBoundary(message.text, end) !== end ? end - 1 : end;
   const communicationPreview = message && { title: message.title, text: message.text.slice(0, safeEnd), truncated: safeEnd < message.text.length };
   const phase = ['final_answer', 'commentary', 'partial_answer'].includes(item.phase) ? item.phase : null;
   const messageMeta = item.type === 'agentMessage' ? { phase, complete: stage === 'completed', truncated: typeof item.text === 'string' && data.text !== item.text, is_final: phase === 'final_answer' && stage === 'completed' } : null;
-  return { ...(images.length || omitted ? { media: { count: images.length, has_images: images.length > 0, ...(omitted ? { omitted: true } : {}) } } : {}), ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), ...(item.type === 'fileChange' ? { file_preview: { complete: filePreviewComplete(item, data) } } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
+  return { ...input, ...(item.turn_input ? { turn_input: item.turn_input } : {}), ...(images.length || omitted ? { media: { count: images.length, has_images: images.length > 0, ...(omitted ? { omitted: true } : {}) } } : {}), ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), ...(item.type === 'fileChange' ? { file_preview: { complete: filePreviewComplete(item, data) } } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
 function removeGuidance(item, guidance) {
   if (item.type !== 'userMessage' || !Array.isArray(item.content)) return item;
@@ -167,21 +175,21 @@ function removeGuidance(item, guidance) {
   }
   const legacyCollaboration = 'Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.';
   const parentPrefixes = [guidance?.collaboration?.trim(), legacyCollaboration, 'Claude is your parent agent.'].filter(Boolean);
-  const prefixes = [...parentPrefixes, guidance?.default?.instructions?.trim()].filter(Boolean);
-  const parent = item.content.some(part => typeof part.text === 'string' && parentPrefixes.some(prefix => part.text.startsWith(prefix + '\n\n')));
-  return { ...item, ...(parent ? { message_origin: 'parent' } : {}), content: item.content.map((part) => {
-    if (typeof part.text !== 'string') return part;
-    let text = part.text;
-    for (const prefix of prefixes) if (text.startsWith(prefix + '\n\n')) text = text.slice(prefix.length + 2);
-    return { ...part, text };
-  }) };
+  const [first, ...rest] = item.content;
+  const wrapper = parentPrefixes.find(prefix => first?.text?.startsWith(prefix + '\n\n'));
+  if (!wrapper) return item;
+  let text = first.text.slice(wrapper.length + 2);
+  const instructions = guidance?.default?.instructions?.trim();
+  if (instructions && text.startsWith(instructions + '\n\n')) text = text.slice(instructions.length + 2);
+  return { ...item, message_origin: 'parent', content: [{ ...first, text }, ...rest] };
 }
 
 export class ActivityStore {
-  static attach(client, controller) { return new ActivityStore({ client, controller }); }
-  constructor({ client, controller, cacheLimits = { bytes: 256 * 1024 * 1024, files: 512 } }) {
+  static attach(client, controller, receipts) { return new ActivityStore({ client, controller, receipts }); }
+  constructor({ client, controller, receipts, cacheLimits = { bytes: 256 * 1024 * 1024, files: 512 } }) {
     this.client = client; this.controller = controller; this.live = new Map(); this.nextRevision = 1;
     this.agentNames = new Map(); this.turnStates = new Map();
+    this.receipts = receipts;
     this.rolloutMedia = new RolloutMedia(client);
     this.exportDir = null; this.exports = new Map(); this.exportSizes = new Map(); this.exportBytes = 0; this.cacheLimits = cacheLimits; this.exportQueue = Promise.resolve(); this.closed = false;
     this.inlineCache = new Map();
@@ -433,7 +441,10 @@ export class ActivityStore {
     const agent = this.controller.agents.get(action.agent_id);
     if (action.kind === 'close') { this.live.delete(action.agent_id); this.metadataRetry.delete(action.agent_id); return; }
     if (!agent || action.thread_id !== agent.threadId || typeof action.message !== 'string') return;
-    this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '', type: action.origin === 'user' ? 'directUserMessage' : 'parentMessage', data: { text: clean(action.message), ...(action.attachments?.length ? { attachments: clean(action.attachments) } : {}) } });
+    this.put(agent, { id: `action:${action.kind}:${this.bucket(agent.id).revision}`, turn_id: action.turn_id ?? '',
+      type: action.origin === 'user' ? 'directUserMessage' : 'parentMessage', input_digest: messageDigest(action.message, action.attachments),
+      ...(action.turn_input ? { turn_input: action.turn_input } : {}),
+      data: { text: clean(action.message), ...(action.attachments?.length ? { attachments: clean(action.attachments) } : {}) } });
   }
   decorate(item) {
     if (['collabAgentToolCall', 'collabToolCall'].includes(item.type)) return { ...item, displayAgentNames: Object.fromEntries([...(item.receiverThreadIds ?? []), ...Object.keys(item.agentsStates ?? {})].filter(id => this.agentNames.has(id)).map(id => [id, this.agentNames.get(id)])) };
@@ -451,7 +462,7 @@ export class ActivityStore {
     const ended = nativeTimeMs(turn.completedAt) ?? previous?.completed_at_ms;
     const duration = Number.isSafeInteger(turn.durationMs) && turn.durationMs >= 0 ? turn.durationMs
       : previous?.duration_ms ?? (ended >= started ? ended - started : undefined);
-    const meta = { id: turn.id, status: finishedTurn(previous) ? previous.status : turn.status ?? previous?.status,
+    const meta = { ...previous, id: turn.id, status: finishedTurn(previous) ? previous.status : turn.status ?? previous?.status,
       ...(started != null ? { started_at_ms: started } : {}), ...(ended != null ? { completed_at_ms: ended } : {}),
       ...(Number.isFinite(duration) ? { duration_ms: duration } : {}) };
     this.remember(this.turnStates, key, meta);
@@ -472,6 +483,8 @@ export class ActivityStore {
     if (!agent || agent.threadId !== p.threadId) return;
     if (message.method === 'item/started' || message.method === 'item/completed') {
       if (visible(p.item)) {
+        const meta = this.turnStates.get(`${p.threadId}:${p.turnId}`);
+        if (meta?.opening_item_id === null && inputItem(p.item.type) && p.item.id) meta.opening_item_id = p.item.id;
         const previous = this.bucket(agent.id).entries.find(entry => entry.turn_id === p.turnId && entry.id === p.item.id);
         const startedAtMs = p.item.startedAtMs ?? (message.method === 'item/started' ? p.startedAtMs : undefined) ?? previous?.started_at_ms;
         const entry = simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started', startedAtMs, agent.threadId);
@@ -482,7 +495,10 @@ export class ActivityStore {
       return;
     }
     if (['turn/started', 'turn/completed'].includes(message.method) && p.turn?.id) {
-      this.rememberTurn(p.threadId, p.turn);
+      const meta = this.rememberTurn(p.threadId, p.turn);
+      if (message.method === 'turn/started' || p.turn.itemsView === 'full') {
+        meta.opening_item_id ??= p.turn.items?.find(item => inputItem(item.type))?.id ?? null;
+      }
       const bucket = this.bucket(agent.id);
       bucket.revision = this.nextRevision++;
       if (message.method === 'turn/completed' && p.turn.status === 'completed') {
@@ -517,20 +533,38 @@ export class ActivityStore {
   }
   revision({ target, revision } = {}) {
     const agent = this.find(target), bucket = this.bucket(agent.id);
-    const turns = [...new Set(bucket.entries.map(entry => entry.turn_id))].map(id => this.turnStates.get(`${agent.threadId}:${id}`)).filter(Boolean);
-    return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: orderWaits(bucket.entries), ...(turns.length ? { turns } : {}) }) };
+    const summary = { agent: this.summary(agent), revision: bucket.revision };
+    if (revision === bucket.revision) return summary;
+    const inputTurns = new Set(bucket.entries.filter(entry => inputItem(entry.type)).map(entry => entry.turn_id));
+    const turns = [...new Set(bucket.entries.map(entry => entry.turn_id))].map(id => {
+      const meta = this.turnStates.get(`${agent.threadId}:${id}`);
+      // Attaching after turn/started yields only a suffix until history arrives.
+      return meta && !meta.opening_item_id && inputTurns.has(id) ? { ...meta, history_start_loaded: false } : meta;
+    }).filter(Boolean);
+    return { ...summary, entries: orderWaits(bucket.entries), ...(turns.length ? { turns } : {}) };
   }
   projectRecord(record, agent, turnId) {
     const item = record.item;
-    const entry = simplify(this.decorate(removeGuidance(item, this.controller.guidance)), turnId, record.outputDeferred === true,
+    let input = removeGuidance(item, this.controller.guidance);
+    const text = singleText(item);
+    if (this.messageInputs && text !== undefined && input.type === 'userMessage' && !input.message_origin) {
+      const evidence = this.messageInputs.match(agent, turnId, text);
+      if (evidence) input = { ...input, ...evidence };
+    }
+    const entry = simplify(this.decorate(input), turnId, record.outputDeferred === true,
       this.stage(item, agent.threadId, turnId, record), record.startedAtMs ?? item.startedAtMs, agent.threadId);
     const ended = timestamp(record.completedAtMs ?? item.completedAtMs);
     if (entry.message && ended) entry.completed_at_ms = ended;
     return entry;
   }
-  itemPage(agent, turnId, cursor, limit) {
-    return this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit, sortDirection: 'desc',
+  async itemPage(agent, turnId, cursor, limit) {
+    const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit, sortDirection: 'desc',
       deferOutput: { commandExecution: true, mcpToolCall: true }, ...(cursor ? { cursor } : {}) });
+    if (this.receipts && !this.messageInputs && page.data?.some(({ item }) => item && singleText(item) !== undefined &&
+        !item.message_origin && !item.content[0].text.startsWith(claudeMessagePrefix) && !item.content[0].text.startsWith('[Direct message from the user]\n\n'))) {
+      this.messageInputs = await this.receipts.messageInputs().catch(() => null);
+    }
+    return page;
   }
   async history({ target, cursor, limit = 30, character_budget: characterBudget, fold_turns: foldTurns = false, process_page: processPage } = {}) {
     const agent = this.find(target);
@@ -589,7 +623,7 @@ export class ActivityStore {
       if ((page.data?.length ?? 0) > pageLimit) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
       const meta = this.turnStates.get(`${agent.threadId}:${turnId}`);
-      if (meta) turns.set(turnId, meta);
+      if (meta) turns.set(turnId, foldTurns ? { ...meta, history_start_loaded: !itemsCursor } : meta);
       const projected = [];
       let run;
       for (const record of page.data ?? []) {

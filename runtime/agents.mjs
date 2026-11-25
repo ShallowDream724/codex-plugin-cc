@@ -262,9 +262,9 @@ export class AgentController extends EventEmitter {
     return true;
   }
 
-  action(kind, a, message, origin, attachments, turnId = a.turnId ?? null) {
+  action(kind, a, message, origin, attachments, turnId = a.turnId ?? null, turnInput) {
     if (kind === 'send' || kind === 'interrupt') { a.lastActivityAtMs = now(); this.persist().catch(() => {}); this.emit('state'); }
-    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: turnId, name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }), ...(attachments?.length ? { attachments: copy(attachments) } : {}) });
+    this.emit('agentAction', { kind, agent_id: a.id, thread_id: a.threadId ?? null, turn_id: turnId, ...(turnId && turnInput ? { turn_input: turnInput } : {}), name: a.name ?? null, ...(origin ? { origin } : {}), ...(message === undefined ? {} : { message }), ...(attachments?.length ? { attachments: copy(attachments) } : {}) });
   }
 
   updateResolved(a, response, { keepModel = false } = {}) {
@@ -547,7 +547,7 @@ export class AgentController extends EventEmitter {
       // Bind the local task placeholder to this exact first turn. A native
       // completion may already have cleared a.turnId before turn/start replies.
       a.startAction = null;
-      if (recordSpawnAction) this.action('spawn', a, message, undefined, undefined, spawnTurnId);
+      if (recordSpawnAction) this.action('spawn', a, message, undefined, undefined, spawnTurnId, 'start');
       a.spawning = false;
       if (a.interrupted) this.stopTree(a).catch(() => {});
       this.starting--;
@@ -963,7 +963,7 @@ export class AgentController extends EventEmitter {
           a.liveAnswerOnly = true;
           a.turnOrigin = 'parent';
         }
-        this.action('send', a, message, origin, attachments, turnId);
+        this.action('send', a, message, origin, attachments, turnId, 'steer');
         await this.persist();
         return { agent_id: a.id, status: 'steered', turn_id: response.turnId ?? turnId };
       } finally { a.sending--; if (a.interrupted) this.stopTree(a).catch(() => {}); }
@@ -1030,14 +1030,14 @@ export class AgentController extends EventEmitter {
       if (plan.replacement) this.requireIdleReplacement(a, { allowResume: true });
       if (!followup) {
         await this.rpc('thread/inject_items', { threadId: a.threadId,
-          items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] }] });
+          items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: claudeMessagePrefix + message }] }] });
         this.action('send', a, message, origin, attachments);
         await this.persist();
         return { agent_id: a.id, status: 'stored', model_turn_started: false };
       }
       const recipient = origin === 'user' && (privateTask || !a.parentContinuationPending) ? 'user' : 'parent';
-      await this.startTurn(a, wireInput, { newTask: true, origin: recipient, reportToParent, plan, action });
-      this.action('send', a, message, origin, attachments);
+      const startedTurnId = await this.startTurn(a, wireInput, { newTask: true, origin: recipient, reportToParent, plan, action });
+      this.action('send', a, message, origin, attachments, startedTurnId, 'start');
       await this.persist();
       const result = this.view(a);
       this.markActionFailureReported(action, a.error, result);

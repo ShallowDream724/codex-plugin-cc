@@ -289,6 +289,8 @@ test('activity deduplication matches origin, turn and exact content one-to-one',
     entry('action:send:1', 'directUserMessage', { text: 'same' }),
     entry('action:send:2', 'parentMessage', { text: 'same' }),
     entry('action:send:repeat', 'parentMessage', { text: 'same' }),
+    entry('native-parent', 'userMessage', { content: [{ text: 'only Claude sent this' }] }),
+    entry('action:send:only-parent', 'parentMessage', { text: 'only Claude sent this' }),
     { ...entry('action:send:next-turn', 'parentMessage', { text: 'same' }), turn_id: 'next' },
     entry('action:send:substring', 'parentMessage', { text: 'sam' }),
     entry('native-image', 'directUserMessage', { text: '', attachments: [{ path: 'C:/a.png' }] }),
@@ -298,7 +300,8 @@ test('activity deduplication matches origin, turn and exact content one-to-one',
   closeUI(); registerUI(on); await openAgent($, 'a'); await new Promise((r) => setImmediate(r));
   const tree = await hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null);
   assert.ok(nodes(tree).some((node) => node.props.key?.includes('action:send:1')));
-  assert.ok(!nodes(tree).some((node) => node.props.key?.includes('action:send:2')));
+  assert.ok(nodes(tree).some((node) => node.props.key?.includes('action:send:2')));
+  assert.ok(!nodes(tree).some((node) => node.props.key?.includes('action:send:only-parent')));
   for (const key of ['repeat', 'next-turn', 'substring', 'image-b']) assert.ok(nodes(tree).some(node => node.props.key?.includes(`action:send:${key}`)));
   assert.ok(!nodes(tree).some(node => node.props.key?.includes('action:send:image-a')));
   closeUI();

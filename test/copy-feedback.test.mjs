@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerUI, openAgent, closeUI } from '../hooks/ui.js';
 import { fileChangePage } from '../shared/file-changes.mjs';
+import { copyIcon, copyPendingIcon, copiedIcon, copyFailedIcon, copyFileIcon } from '../hooks/tool-icons.js';
 
 const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 async function fixture(t, entries, copy, detail) {
@@ -20,12 +21,30 @@ async function fixture(t, entries, copy, detail) {
     } },
   };
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
-  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
+  const draw = async (surface = 'desktop') => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null));
   const press = async key => { const all = await draw(), button = all.find(n => n.type === 'Button' && n.props.key === key); if (button) return button.props.onPress({ surface: 'desktop' }); return hooks.find(h => h.event === 'ui.message').fn($, { element: key, surface: 'desktop', data: { action: 'activate', expanded: false } }, () => { throw new Error(`Unmatched ${key}`); }); };
   return { draw, press, timers, requests };
 }
 const final = id => ({ id, turn_id: 't', type: 'agentMessage', data: { text: `raw ${id}` }, message: { is_final: true } });
 const hasText = (all, value) => all.some(n => n.type === 'Text' && n.props.children.includes(value));
+const copyGraphic = (all, key) => all.find(n => n.props.key === `${key}_graphic`);
+
+test('desktop draws the copy graphic beneath the native press target, with a readable terminal fallback', async t => {
+  const key = 'message_copy_a:t:reply';
+  const f = await fixture(t, [final('reply')], async () => ({ isCopied: true }));
+  const graphic = copyGraphic(await f.draw(), key);
+  const [icon, hitArea] = graphic.props.children;
+  assert.equal(icon.type, 'Svg');
+  assert.equal(icon.props.source, copyIcon);
+  assert.equal(graphic.props.overflow, 'hidden');
+  assert.equal(hitArea.props.position, 'absolute');
+  assert.equal(hitArea.props.children[0].type, 'Button');
+  assert.equal(hitArea.props.children[0].props.key, key);
+  assert.equal(hitArea.props.children[0].props.label.trim(), '复制回复');
+  const terminal = await f.draw('terminal');
+  assert.equal(copyGraphic(terminal, key), undefined);
+  assert.equal(terminal.find(n => n.type === 'Button' && n.props.key === key).props.label, '复制回复');
+});
 
 test('copy feedback is immediate, reports actual success, and old timers do not erase newer feedback', async t => {
   let finish; const copied = [];
@@ -35,10 +54,12 @@ test('copy feedback is immediate, reports actual success, and old timers do not 
   assert.equal(control.props.onPress({ surface: 'desktop' }), undefined);
   assert.deepEqual(copied, ['raw one']);
   assert.ok(hasText(await f.draw(), '正在复制…'));
+  assert.equal(copyGraphic(await f.draw(), 'message_copy_a:t:one').props.children[0].props.source, copyPendingIcon);
   await f.press('message_copy_a:t:one');
   assert.deepEqual(copied, ['raw one']);
   finish({ isCopied: true });
   assert.ok(hasText(await f.draw(), '已复制'));
+  assert.equal(copyGraphic(await f.draw(), 'message_copy_a:t:one').props.children[0].props.source, copiedIcon);
   await f.press('message_copy_a:t:two');
   finish({ isCopied: true });
   await f.timers[0]();
@@ -74,13 +95,17 @@ test('long final and unavailable clipboard offer the full file and a missing hel
     async ({ copy }) => copy === 'file' ? { file_url } : response);
   const press = async () => { await f.press('message_copy_a:t:final'); await new Promise(setImmediate); return f.draw(); };
   const link = all => all.some(n => n.type === 'Markdown' && n.props.text.includes(file_url));
-  assert.ok(link(await press()));
+  let all = await press();
+  assert.ok(link(all));
+  assert.equal(copyGraphic(all, 'message_copy_a:t:final').props.children[0].props.source, copyFileIcon);
   assert.equal(clipboardCalls, 0);
   response = { text: 'exact source' };
   assert.ok(link(await press()));
   assert.equal(clipboardCalls, 1);
   response = { error: { message: 'content unavailable' } };
-  assert.ok(hasText(await press(), '复制失败：content unavailable'));
+  all = await press();
+  assert.ok(hasText(all, '复制失败：content unavailable'));
+  assert.equal(copyGraphic(all, 'message_copy_a:t:final').props.children[0].props.source, copyFailedIcon);
   assert.equal(clipboardCalls, 1);
   assert.deepEqual(f.requests.filter(r => r.operation === 'ui_detail').map(r => r.args.copy), [true, true, 'file', true]);
 });

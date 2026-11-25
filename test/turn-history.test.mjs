@@ -44,7 +44,7 @@ test('over forty native process pages fit alongside older answers without transf
   assert.equal(result.entries.find(e => e.id === 'answer').completed_at_ms, 3999999);
   const all = expandProcessReferences(result.entries), turns = new Map(result.turns.map(turn => [turn.id, turn]));
   const folded = turnTimeline(all, turns, () => false);
-  assert.deepEqual(folded.map(e => e.id), ['old-answer', 'start', 'steer', '@turn-summary', 'answer']);
+  assert.deepEqual(folded.map(e => e.id), ['old-answer', 'start', '@turn-summary', 'answer']);
   assert.equal(durationLabel(folded.at(-2).duration_ms), '用时 1小时5分0秒');
   const ref = folded.at(-2).firstPage, before = requests.length;
   const loaded = await store.history({ target: 'a', process_page: ref.locator });
@@ -54,6 +54,8 @@ test('over forty native process pages fit alongside older answers without transf
   assert.equal(opened[2].type, 'turnSummary');
   assert.ok(opened.some(e => e.id === 'cmd-0' && e.type === 'commandExecution'));
   assert.equal(opened.filter(e => e.id === 'steer').length, 1);
+  const steer = opened.findIndex(e => e.id === 'steer');
+  assert.deepEqual(opened.slice(steer - 1, steer + 2).map(e => e.id), ['cmd-499', 'steer', 'cmd-500']);
   assert.ok(opened.some(e => e.type === 'turnProcessPending'));
   assert.equal(opened.at(-1).id, 'answer');
 });
@@ -102,18 +104,76 @@ test('completion notification timestamps stay scoped to each turn and unavailabl
   assert.equal(store.revision({ target: 'a' }).entries.at(-1).message.is_final, true);
 });
 
-test('native pane folds process, keeps guidance and final copy/time visible, and reuses hydrated records', async t => {
+test('a suffix containing only a steer and a final never promotes the steer to a new prompt', async t => {
+  const turns = [
+    { id: 'later', status: 'completed', items: [prompt('next-prompt', '[Direct message from the user]\n\nnext task'), message('next-final', 'final_answer', 'done')] },
+    { id: 'prior', status: 'completed', items: [prompt('first', 'assignment'), message('progress', 'commentary', 'working'),
+      { id: 'compact', type: 'contextCompaction' }, prompt('steer', 'Claude is your parent agent.\n\nclarification'), message('final', 'final_answer', 'done')] },
+  ];
+  const { store } = fixture(turns); t.after(() => store.close());
+  const meta = new Map(), args = { target: 'a', limit: 2, fold_turns: true };
+  let cursor, entries = [];
+  const read = async () => {
+    const result = await store.history({ ...args, cursor });
+    entries = expandProcessReferences(result.entries).concat(entries);
+    for (const turn of result.turns) meta.set(turn.id, turn);
+    cursor = result.next_cursor;
+    store.turnStates.clear();
+  };
+  const ids = open => turnTimeline(entries, meta, () => open).map(item => item.id);
+  await read(); await read();
+  assert.equal(meta.get('prior').history_start_loaded, false);
+  assert.deepEqual(ids(false), ['@turn-summary', 'final', 'next-prompt', 'next-final']);
+  assert.deepEqual(ids(true), ['@turn-summary', 'steer', 'final', 'next-prompt', 'next-final']);
+  while (cursor) await read();
+  assert.deepEqual(ids(false), ['first', '@turn-summary', 'final', 'next-prompt', 'next-final']);
+  assert.deepEqual(ids(true), ['first', '@turn-summary', 'progress', 'compact', 'steer', 'final', 'next-prompt', 'next-final']);
+});
+
+test('an evicted live prompt and late action echoes stay scoped to their native turn', async t => {
+  const { store, client } = fixture([]); t.after(() => store.close());
+  const emit = (method, params) => client.emit('notification', { method, params: { threadId: 'root', ...params } });
+  const add = (turnId, item) => emit('item/completed', { turnId, item });
+  const start = id => emit('turn/started', { turn: { id, status: 'inProgress' } });
+  const finish = id => emit('turn/completed', { turn: { id, status: 'completed' } });
+  start('old'); add('old', prompt('assignment', 'original task'));
+  for (let i = 0; i < 64; i++) add('old', { id: 'step' + i, type: 'commandExecution' });
+  add('old', prompt('direct', '[Direct message from the user]\n\ncorrect this')); add('old', message('old-final', 'final_answer', 'old answer')); finish('old');
+  start('new'); add('new', prompt('new-task', 'later task')); add('new', message('new-final', 'final_answer', 'later answer')); finish('new');
+  store.recordAction({ kind: 'send', turn_input: 'steer', agent_id: 'a', thread_id: 'root', turn_id: 'old', message: 'parent steer' });
+  const result = store.revision({ target: 'a' }), meta = new Map(result.turns.map(turn => [turn.id, turn]));
+  assert.equal(meta.get('old').opening_item_id, 'assignment');
+  assert.ok(!result.entries.some(entry => entry.id === 'assignment'));
+  const action = result.entries.at(-1);
+  assert.equal(action.turn_input, 'steer');
+  assert.deepEqual(turnTimeline(result.entries, meta, () => false).map(item => item.id), ['@turn-summary', 'old-final', 'new-task', 'new-final']);
+  assert.deepEqual(turnTimeline(result.entries, meta, () => true).slice(-5).map(item => item.id), ['direct', action.id, 'old-final', 'new-task', 'new-final']);
+  // Reconnect during a native turn with neither a start event nor a receipt.
+  add('resumed', prompt('native-steer', 'mid-turn input')); add('resumed', message('resumed-final', 'final_answer', 'answer')); finish('resumed');
+  const resumed = store.revision({ target: 'a' });
+  const suffix = turnTimeline(resumed.entries.filter(entry => entry.turn_id === 'resumed'), new Map(resumed.turns.map(turn => [turn.id, turn])), () => false);
+  assert.deepEqual(suffix.map(item => item.id), ['@turn-summary', 'resumed-final']);
+});
+
+test('native pane folds intermediate guidance, keeps the prompt and final copy/time visible, and reuses hydrated records', async t => {
   const ended = new Date(2026, 6, 9, 15, 42).getTime();
-  const { store, requests } = fixture([{ id: 't', status: 'completed', durationMs: 65000, completedAt: (ended + 60000) / 1000,
+  const { store, requests, client } = fixture([{ id: 't', status: 'completed', durationMs: 65000, completedAt: (ended + 60000) / 1000,
     items: [prompt('ask', 'initial assignment'), message('comment', 'commentary', 'investigating the issue'),
       prompt('follow', 'Claude is your parent agent.\n\nclarification'), message('comment2', 'commentary', 'checking the result'),
       ...Array.from({ length: 55 }, (_, i) => message('part' + i, 'commentary', 'step ' + i)),
       { ...message('done', 'final_answer', 'shipped'), completedAtMs: ended }] }]);
+  // The send was acknowledged before its native echo. The later commentary
+  // reached the live cache first, while persisted native order is unambiguous.
+  store.recordAction({ kind: 'send', turn_input: 'steer', agent_id: 'a', thread_id: 'root', turn_id: 't', message: 'clarification' });
+  for (const item of [message('comment2', 'commentary', 'checking the result'), prompt('follow', 'Claude is your parent agent.\n\nclarification')]) {
+    client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
+  }
   const hooks = [];
   let poll;
+  const scrolls = [];
   const $ = {
     ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Svg', 'Client', 'Code'].map(type => [type, props => ({ type, props })])),
-      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) },
+      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async request => { scrolls.push(request); return {}; } },
     clock: { every: (_, fn) => { poll = fn; return { cancel() {} }; }, after: () => ({ cancel() {} }) },
     state: { get: async () => ({}), set: async () => ({ isSet: true }) },
     env: { get: async () => undefined }, plugin: { root: 'C:/plugin' }, session: { id: async () => 'owner', cwd: async () => 'C:/work' },
@@ -126,17 +186,21 @@ test('native pane folds process, keeps guidance and final copy/time visible, and
   closeUI(); t.after(async () => { closeUI(); await store.close(); });
   registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
   const leaves = node => node && typeof node === 'object' ? [node, ...(node.props?.children ?? []).flatMap(leaves)] : [];
-  const draw = async () => leaves(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity' }, () => null));
+  const draw = async surface => leaves(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null));
   const byKey = (nodes, key) => nodes.find(n => n.props.key === key);
   let tree = await draw();
   assert.equal(byKey(tree, 'message_time_a:t:done').props.children[0], finalTimestamp(ended));
   assert.ok(byKey(tree, 'message_copy_a:t:done'));
   assert.match(byKey(tree, 'turn_process_a:t').props.label, /用时 1分5秒/);
-  assert.ok(!byKey(tree, 'message_a:t:comment')); assert.ok(byKey(tree, 'message_a:t:follow'));
+  assert.ok(byKey(tree, 'message_a:t:ask')); assert.ok(!byKey(tree, 'message_a:t:comment')); assert.ok(!byKey(tree, 'message_a:t:follow'));
   const before = requests.length;
+  scrolls.length = 0;
   await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
   assert.ok(byKey(tree, 'message_a:t:comment')); assert.ok(byKey(tree, 'message_a:t:comment2'));
   assert.ok(tree.indexOf(byKey(tree, 'message_a:t:comment')) < tree.indexOf(byKey(tree, 'message_a:t:follow')));
+  assert.ok(tree.indexOf(byKey(tree, 'message_a:t:follow')) < tree.indexOf(byKey(tree, 'message_a:t:comment2')));
+  assert.equal(tree.filter(n => n.props.text === 'clarification').length, 1);
+  assert.ok(!scrolls.some(request => request.to === 'end'), 'opening a reconciled turn retains its reading anchor');
   assert.equal(requests.length, before + 1);
   assert.ok(!byKey(tree, 'message_a:t:part54'));
   await poll(); await new Promise(setImmediate); tree = await draw();
@@ -145,4 +209,10 @@ test('native pane folds process, keeps guidance and final copy/time visible, and
   await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
   assert.ok(!byKey(tree, 'message_a:t:comment')); assert.ok(byKey(tree, 'message_a:t:done'));
   await byKey(tree, 'turn_process_a:t').props.onPress(); assert.equal(requests.length, before + 2);
+  const desktop = await draw('desktop');
+  const title = byKey(desktop, 'turn_process_a:t_graphic');
+  assert.equal(title.props.alignSelf, 'flex-start');
+  assert.deepEqual(title.props.children.slice(0, 2).map(child => child.type), ['Text', 'Svg']);
+  assert.equal(title.props.children[0].props.children[0], '用时 1分5秒');
+  assert.equal(byKey(desktop, 'turn_process_a:t').type, 'Button');
 });

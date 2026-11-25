@@ -209,9 +209,9 @@ export async function serve(owner, { directory = ownerDirectory(owner), clientFa
         .finally(() => shutdown()).catch(() => exit(1));
     });
     await controller.init();
-    activity = ActivityStore.attach(client, controller);
     assertConnected();
     const receiptStore = await DiskReceipts.open(join(directory, 'receipts'), { legacyPath: join(directory, 'receipts.json') });
+    activity = ActivityStore.attach(client, controller, receiptStore);
     const deliveryStore = await DeliveryStore.open({ directory: join(directory, 'deliveries'), controller });
     assertConnected();
     server = brokerFactory({ controller, token, receiptStore, deliveryStore, activity, requiredProtocol: PROTOCOL,

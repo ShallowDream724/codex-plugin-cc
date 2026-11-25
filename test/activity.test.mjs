@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFileSync, unlinkSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ActivityStore } from '../runtime/activity.mjs';
+import { DiskReceipts, requestFingerprint } from '../runtime/receipts.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { toolSections, communicationFailure } from '../hooks/tool-presentation.js';
 
@@ -356,6 +358,11 @@ test('previews bound deep data and image payloads while details format native it
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'later-turn', item: { id: 'quoted-guidance', type: 'userMessage', content: [{ text: quoted }] } } });
   assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').preview, quoted);
   assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').data.message_origin, undefined);
+  const quotedParts = [{ text: 'Scout rules.\n\nReview the following quotation.' }, { text: legacy + '\n\nA historical prompt.' }];
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'later-turn', item: { id: 'quoted-parts', type: 'userMessage', content: quotedParts } } });
+  const historicalQuote = store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-parts');
+  assert.equal(historicalQuote.data.message_origin, undefined);
+  assert.deepEqual(historicalQuote.data.content, quotedParts);
 });
 
 test('labels a native Claude follow-up after reopening and exposes its exact body', async () => {
@@ -367,6 +374,65 @@ test('labels a native Claude follow-up after reopening and exposes its exact bod
   assert.equal(entry.data.message_origin, 'parent');
   assert.equal((await store.detail({ target: 'a', turn_id: 'turn', item_id: 'followup', view: 'message' })).text, text);
   assert.equal(item.content[0].text, `[Message from Claude]\n\n${text}`);
+});
+
+test('reopened historical inputs recover their sender from the exact session, turn and successful request', async t => {
+  const { client, store, controller } = fixture();
+  const agent = controller.agents.get('a');
+  agent.externalThread = true; agent.turnOrigin = 'parent';
+  const directory = await mkdtemp(join(tmpdir(), 'codex-message-receipts-'));
+  t.after(async () => { await store.close(); await rm(directory, { recursive: true, force: true }); });
+  const receipts = await DiskReceipts.open(directory);
+  store.receipts = receipts;
+  let seq = 0;
+  const add = (operation, message, result, { target = 'a', status = 'done', ...route } = {}) => receipts.put(String(++seq), {
+    operation, fingerprint: requestFingerprint(operation, { target, message, ...route }), status,
+    result: { agent_id: agent.id, turn_id: 'turn', status: 'steered', ...result } });
+  const long = 'Do this.\r\n'.repeat(1500);
+  await add('followup_task', long, { thread_id: agent.threadId, status: 'running' }, { target: 'codex://threads/root' });
+  await add('send_message', 'exact steer');
+  await add('ui_send', 'private', {}, { private_task: true });
+  await add('followup_task', 'same', {});
+  await add('ui_send', 'same', {});
+  await add('followup_task', 'never accepted', {}, { status: 'inflight' });
+  await add('followup_task', 'foreign', { thread_id: 'other' });
+  await add('followup_task', 'other agent', { agent_id: 'b' });
+  await add('followup_task', 'other turn', { turn_id: 'yesterday' });
+  await add('followup_task', 'crossed', { status: 'steer_unconfirmed' });
+  await writeFile(receipts.path('damaged'), '{');
+  const texts = [long, 'exact steer', 'private', 'same', 'never accepted', 'foreign', 'other agent', 'other turn', 'crossed', 'exact steer ', '[Direct message from the user]\n\nexact steer', '[Message from Claude]\n\n' + long];
+  client.request = async method => method === 'thread/turns/list' ? { data: [{ id: 'turn' }] } : {
+    data: texts.map((text, index) => ({ item: { id: String(index), type: 'userMessage', content: [{ type: 'text', text }] } })).reverse() };
+  const { entries } = await store.history({ target: 'a' });
+  assert.deepEqual(entries.map(e => e.data.message_origin), ['parent', 'parent', 'user', ...Array(8).fill(undefined), 'parent']);
+  assert.equal(entries[0].turn_input, 'start'); assert.equal(entries[1].turn_input, 'steer');
+  assert.equal(entries[10].type, 'directUserMessage');
+  assert.equal(entries[11].input_digest, entries[0].input_digest);
+  assert.ok(entries[0].preview.length < long.length);
+  // New accepted receipts update the already-loaded index without a directory rescan.
+  await add('followup_task', 'later');
+  texts.push('later');
+  assert.equal((await store.history({ target: 'a' })).entries.at(-1).data.message_origin, 'parent');
+});
+
+test('history renders through a temporarily unavailable receipt directory and retries the index', async t => {
+  const { client, store } = fixture();
+  const directory = await mkdtemp(join(tmpdir(), 'codex-receipt-retry-'));
+  t.after(async () => { await store.close(); await rm(directory, { recursive: true, force: true }); });
+  const missing = join(directory, 'receipts');
+  store.receipts = new DiskReceipts(missing);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  client.request = async method => method === 'thread/turns/list' ? { data: [{ id: 't' }] } : {
+    data: [{ item: { id: 'prompt', type: 'userMessage', content: [{ type: 'text', text: 'continue' }] } }] };
+  const read = async () => (await store.history({ target: 'a' })).entries[0];
+  assert.equal((await read()).preview, 'continue');
+  const recovered = await DiskReceipts.open(missing);
+  await recovered.put('ok', { status: 'done', operation: 'followup_task', fingerprint: requestFingerprint('followup_task', { target: 'a', message: 'continue' }),
+    result: { agent_id: 'a', thread_id: 'root', turn_id: 't', status: 'running' } });
+  assert.equal((await read()).data.message_origin, undefined);
+  now += 6000;
+  assert.equal((await read()).data.message_origin, 'parent');
 });
 
 test('tool call titles survive live and deferred history projection without reading output titles', async () => {

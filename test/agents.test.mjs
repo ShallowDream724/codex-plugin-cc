@@ -991,7 +991,7 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   client.complete(); await tick();
   assert.deepEqual(await controller.dispatch('send_message', { target: agent.id, message: 'hello' }), { agent_id: agent.id, status: 'stored', model_turn_started: false });
   assert.deepEqual(client.calls.at(-1), { method: 'thread/inject_items', params: { threadId: 'thread-1',
-    items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }] } });
+    items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Message from Claude]\n\nhello' }] }] } });
   assert.equal(client.calls.filter((c) => c.method === 'turn/start').length, 1);
   await controller.dispatch('followup_task', { target: agent.id, message: 'second task' });
   assert.equal(client.calls.filter((c) => c.method === 'thread/start').length, 1);

@@ -46,6 +46,8 @@ export function disclosureIcon(expanded) {
 }
 
 export const copyIcon = svg('<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>');
+export const copyPendingIcon = svg('<path d="M5 12h.1m6.9 0h.1m6.9 0h.1" stroke-width="2.5"/>');
 export const copiedIcon = svg('<path d="m5 12 4 4L19 6"/>');
 export const copyFailedIcon = svg('<path d="M6 6l12 12M18 6 6 18"/>');
+export const copyFileIcon = svg('<path d="M13 4h7v7m0-7-9 9m7 1v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>');
 export const jumpIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="#ffffff" stroke="#dddddd"/><path d="M16 9v14m-5-5 5 5 5-5" fill="none" stroke="#333333" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';

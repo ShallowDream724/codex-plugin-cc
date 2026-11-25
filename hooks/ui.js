@@ -1,7 +1,7 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
 import { agentIcon, agentVisual, displayLabel, agentDisplayName } from './presentation.js';
 import { toolSections, communicationFailure } from './tool-presentation.js';
-import { activityIcon, contextIndicator, disclosureIcon, jumpIcon } from './tool-icons.js';
+import { activityIcon, contextIndicator, disclosureIcon, jumpIcon, copyIcon, copyPendingIcon, copiedIcon, copyFailedIcon, copyFileIcon } from './tool-icons.js';
 import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences } from './turn-history.js';
@@ -14,6 +14,7 @@ import { renderAgentDirectory } from './agent-directory.js';
 import { fileViewEntries, appendFilePage } from './file-stream.js';
 import { parseUnifiedDiffDetailed } from '../shared/unified-diff.mjs';
 import { MAX_CLIPBOARD_LENGTH } from '../shared/clipboard.mjs';
+import { nativeGraphicButton } from './native-graphic-button.js';
 
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
@@ -27,6 +28,7 @@ const VISIBLE_ENTRIES = 400;
 const RAW_WINDOW_LIMIT = 400;
 let copyIntent = 0;
 const copyLabels = { pending: '正在复制…', copied: '已复制', failed: '复制失败，请重试', file: '已保存完整内容' };
+const copyIcons = { pending: copyPendingIcon, copied: copiedIcon, failed: copyFailedIcon, file: copyFileIcon };
 const clipboardUnavailable = new Set(['no-clipboard', 'no-surface', 'unanswered']);
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
@@ -187,6 +189,27 @@ const mergeSummaries = (agents) => {
   return summaries(agents).map(agent => ({ ...previous.get(idOf(agent)), ...agent }));
 };
 const failureText = (error) => safe(error?.message || error?.error?.message || error?.error || (typeof error === 'string' ? error : JSON.stringify(error)) || '连接未返回有效响应').slice(0, 400);
+function restoreNativeOrder(live, history, positions) {
+  const matched = new Map(), seen = new Set();
+  for (const entry of history) {
+    const index = positions.get(entryKey(entry));
+    if (!entry.turn_id || index === undefined || seen.has(index)) continue;
+    seen.add(index);
+    if (!matched.has(entry.turn_id)) matched.set(entry.turn_id, []);
+    matched.get(entry.turn_id).push(index);
+  }
+  let changed = false;
+  for (const indices of matched.values()) {
+    if (!indices.some((index, i) => i && index < indices[i - 1])) continue;
+    // Reorder only same-turn rows that this native batch actually returned.
+    // Live-only records and other turns retain their positions and identities.
+    const records = indices.map(index => live[index]);
+    indices.sort((a, b) => a - b);
+    indices.forEach((slot, i) => { live[slot] = records[i]; positions.set(entryKey(records[i]), slot); });
+    changed = true;
+  }
+  return changed;
+}
 function mergeLive(page, entries, prepend = false, turns = []) {
   let changed = false;
   page.turns ??= new Map();
@@ -196,10 +219,13 @@ function mergeLive(page, entries, prepend = false, turns = []) {
     // History may return after a final stream notification, or be the first
     // source to learn that a formerly active turn has finished.
     if (['completed', 'failed', 'interrupted'].includes(turn.status)) next.status = turn.status;
+    if (old?.history_start_loaded || turn.history_start_loaded) next.history_start_loaded = true;
     if (JSON.stringify(next) !== JSON.stringify(old)) { page.turns.set(turn.id, next); changed = true; }
   }
   const positions = new Map(page.live.map((entry, index) => [entryKey(entry), index]));
   if (prepend) {
+    const history = expandProcessReferences(entries);
+    if (restoreNativeOrder(page.live, history, positions)) changed = true;
     // Insert gaps at the matching native record. The live cache can contain a
     // prompt and answer while some intervening process records are absent.
     const insertions = new Map(), seen = new Set();
@@ -208,7 +234,7 @@ function mergeLive(page, entries, prepend = false, turns = []) {
       if (!pending.length) return;
       insertions.set(index, (insertions.get(index) ?? []).concat(pending)); pending = [];
     };
-    for (const entry of expandProcessReferences(entries)) {
+    for (const entry of history) {
       const key = entryKey(entry);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -217,8 +243,10 @@ function mergeLive(page, entries, prepend = false, turns = []) {
       else {
         insert(index); last = index;
         const old = page.live[index];
-        if (entry.completed_at_ms && !old.completed_at_ms || entry.message?.is_final && !old.message?.is_final) {
+        const origin = !messageOrigin(old) && messageOrigin(entry);
+        if (origin || entry.turn_input && !old.turn_input || entry.completed_at_ms && !old.completed_at_ms || entry.message?.is_final && !old.message?.is_final) {
           page.live[index] = { ...old, ...(entry.completed_at_ms ? { completed_at_ms: entry.completed_at_ms } : {}),
+            ...(origin ? { data: { ...old.data, message_origin: origin } } : {}), ...(entry.turn_input ? { turn_input: entry.turn_input } : {}),
             ...(entry.message?.is_final ? { message: { ...old.message, ...entry.message } } : {}) };
           changed = true;
         }
@@ -242,6 +270,8 @@ function mergeLive(page, entries, prepend = false, turns = []) {
     else {
       const previous = page.live[index];
       const value = { ...entry, ...(entry.started_at_ms == null && previous.started_at_ms != null ? { started_at_ms: previous.started_at_ms } : {}),
+        ...(!messageOrigin(entry) && messageOrigin(previous) ? { data: { ...entry.data, message_origin: messageOrigin(previous) } } : {}),
+        ...(!entry.turn_input && previous.turn_input ? { turn_input: previous.turn_input } : {}),
         ...(entry.completed_at_ms == null && previous.completed_at_ms != null ? { completed_at_ms: previous.completed_at_ms } : {}) };
       if (JSON.stringify(page.live[index]) !== JSON.stringify(value)) { page.live[index] = value; changed = true; }
     }
@@ -259,30 +289,33 @@ function fileStreamDetail(page, entry, path) {
   return { chunks: [{ offset: 0, ...source, rows: source.format === 'diff' ? parseUnifiedDiffDetailed(source.text) : undefined }], next_offset: null, offset: 0 };
 }
 function conversationEntries(all, page) {
-  const messageKey = (entry) => {
-    if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) return null;
-    const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
-    return JSON.stringify([entry.turn_id, messageOrigin(entry) ?? 'parent', body(entry), attachments.map(part => part.path)]);
-  };
-  const nativeCopies = new Map();
+  const copies = new Map(), matchedActions = new Set(), nativeMetadata = new Map();
   for (const entry of all) {
-    const key = messageKey(entry);
-    if (!key || String(entry.id).startsWith('action:')) continue;
-    if (!nativeCopies.has(key)) nativeCopies.set(key, { known: 0, unknown: [] });
-    const copies = nativeCopies.get(key);
-    if (messageOrigin(entry)) copies.known++;
-    else if (!entry.deferred && (entry.preview?.length ?? 0) < 4096) copies.unknown.push(entry);
+    if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) continue;
+    const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
+    if (!entry.input_digest && (entry.deferred || (entry.preview?.length ?? 0) >= 4096)) continue;
+    const key = JSON.stringify([entry.turn_id, entry.input_digest ?? [body(entry), attachments.map(part => part.path)]]);
+    if (!copies.has(key)) copies.set(key, { parent: [], user: [], unknown: [], actions: [] });
+    const group = copies.get(key);
+    group[String(entry.id).startsWith('action:') ? 'actions' : messageOrigin(entry) ?? 'unknown'].push(entry);
   }
-  const inferredParents = new Set();
-  const entries = all.filter((entry) => {
-    if (!String(entry.id).startsWith('action:')) return true;
-    const copies = nativeCopies.get(messageKey(entry));
-    if (!copies) return true;
-    if (copies.known) { copies.known--; return false; }
-    if (messageOrigin(entry) !== 'parent' || copies.unknown.length !== 1) return true;
-    inferredParents.add(copies.unknown.pop());
-    return false;
-  }).map(entry => inferredParents.has(entry) ? { ...entry, data: { ...entry.data, message_origin: 'parent' } } : entry);
+  const match = (native, action) => {
+    matchedActions.add(action);
+    nativeMetadata.set(native, { ...native, ...(!native.turn_input && action.turn_input ? { turn_input: action.turn_input } : {}),
+      data: { ...native.data, message_origin: messageOrigin(action) } });
+  };
+  for (const group of copies.values()) {
+    const pending = [];
+    for (const action of group.actions) {
+      const native = group[messageOrigin(action)]?.shift();
+      if (native) match(native, action);
+      else pending.push(action);
+    }
+    // With conflicting senders or multiple indistinguishable native records,
+    // retain the original rows. An action must account for exactly one echo.
+    if (group.unknown.length === 1 && pending.length && new Set(pending.map(messageOrigin)).size === 1) match(group.unknown[0], pending[0]);
+  }
+  const entries = all.filter(entry => !matchedActions.has(entry)).map(entry => nativeMetadata.get(entry) ?? entry);
   if (!page) return orderWaits(entries);
   const timeline = turnTimeline(entries, page.turns, turnId => page.openTurns?.has(turnId), page.processPages);
   return timeline.flatMap(entry => fileViewEntries(entry, page.agentId, { isOpen: key => state.folds.has(key), getDetail: path => fileStreamDetail(page, entry, path) }));
@@ -1518,10 +1551,12 @@ function renderPane($, e, next) {
     const copyButton = (key, feedbackKey, label, onPress) => {
       const feedback = copyStatus(feedbackKey);
       const status = copyLabels[feedback?.phase];
-      const glyph = { pending: '…', copied: '✓', failed: '×', file: '↗' }[feedback?.phase] || '⧉';
-      const desktop = e.surface === 'desktop';
-      const button = Button({ key, plain: true, label: status || label, ...(desktop ? { children: [Text({ size: 'caption', children: [glyph] })] } : {}), onPress });
-      return desktop ? hint(`${key}_hint`, button, status || label, 18, -10, !!status) : button;
+      const name = status || label;
+      if (e.surface !== 'desktop' || typeof Svg !== 'function') return Button({ key, plain: true, label: name, onPress });
+      const control = nativeGraphicButton({ Box, Button }, { key, label: name, onPress, width: 3, children: [
+        Svg({ key: `${key}_icon`, source: copyIcons[feedback?.phase] || copyIcon, alt: '', width: 15, height: 15 }),
+      ] });
+      return hint(`${key}_hint`, control, name, 18, 0, !!status);
     };
     const disclosure = (key, label, onPress, entry, integration = false, expanded) => {
       const activate = entry ? (...args) => {
@@ -1531,6 +1566,13 @@ function renderPane($, e, next) {
         return onPress(...args);
       } : onPress;
       const vector = typeof expanded === 'boolean' && e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function';
+      if (entry?.type === 'turnSummary' && e.surface === 'desktop') {
+        return nativeGraphicButton({ Box, Button }, { key, label, onPress: activate, gap: 0, dimColor: true, children: [
+          Text({ key: `label_${key}`, dimColor: true, children: [label] }),
+          typeof Svg === 'function' ? Svg({ key: `icon_${key}`, source: disclosureIcon(expanded), alt: '', width: 12, height: 12 })
+            : caption(`icon_${key}`, expanded ? '⌄' : '›'),
+        ] });
+      }
       const button = Button({ key, plain: true, dimColor: true, label: `${label}${typeof expanded === 'boolean' && !vector ? ` ${expanded ? '⌄' : '›'}` : ''}`, onPress: activate });
       const children = [button];
       if (vector) {

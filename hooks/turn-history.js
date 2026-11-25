@@ -1,4 +1,4 @@
-import { finishedTurn, processItem } from '../shared/turn-history.mjs';
+import { finishedTurn, inputItem, processItem } from '../shared/turn-history.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 
 export function durationLabel(ms) {
@@ -32,46 +32,55 @@ export function expandProcessReferences(entries) {
   });
 }
 
+function openingInput(items, meta) {
+  const explicit = items.find(item => item.turn_input === 'start' && inputItem(item.type));
+  if (explicit) return explicit;
+  if (meta.opening_item_id) {
+    const native = items.find(item => item.id === meta.opening_item_id && inputItem(item.type));
+    if (native?.turn_input !== 'steer') return native;
+  }
+  // A bounded revision or history suffix may begin at a steer. Only native
+  // order from the actual turn start can identify an otherwise unmarked input.
+  if (meta.history_start_loaded === false || meta.opening_item_id === null && !meta.history_start_loaded) return;
+  const first = items.find(item => inputItem(item.type));
+  return first?.turn_input !== 'steer' ? first : undefined;
+}
+
 export function turnTimeline(entries, turns, isOpen, pages) {
   // Apply native wait ordering after hydration, before placing the turn header.
   entries = orderWaits(pages?.size ? entries.map(entry => entry.type === 'turnProcessRef' && isOpen(entry.turn_id)
     ? pages.get(entry.pageKey)?.records?.get(entry.id) ?? entry : entry) : entries);
   const spans = new Map();
   for (const entry of entries) {
-    const meta = turns?.get(entry.turn_id);
-    if (!finishedTurn(meta)) continue;
-    let span = spans.get(entry.turn_id);
-    if (!span) {
-      span = { meta, open: isOpen(entry.turn_id) };
-      spans.set(entry.turn_id, span);
-    }
-    if (processItem(entry.type, entry.message?.phase)) {
-      if (!span.firstProcess) {
-        span.firstProcess = entry;
-        if (entry.locator && !pages?.get(entry.pageKey)?.records) span.firstPage = entry;
-      }
-    } else if (entry.message?.is_final) span.firstFinal ??= entry;
-    span.last = entry;
+    if (!entry.turn_id || !finishedTurn(turns?.get(entry.turn_id))) continue;
+    if (!spans.has(entry.turn_id)) spans.set(entry.turn_id, []);
+    spans.get(entry.turn_id).push(entry);
   }
   const out = [];
   for (const entry of entries) {
-    const span = spans.get(entry.turn_id);
-    if (!span) { out.push(entry); continue; }
-    const before = span.open && span.firstProcess ? span.firstProcess : span.firstFinal;
-    const header = (span.firstProcess || Number.isFinite(span.meta.duration_ms)) && (entry === before || (!before && entry === span.last)) &&
-      { type: 'turnSummary', id: '@turn-summary', turn_id: entry.turn_id, duration_ms: span.meta.duration_ms,
-        open: span.open, hasProcess: !!span.firstProcess, firstPage: span.firstPage };
-    if (header && entry === before) out.push(header);
-    if (!processItem(entry.type, entry.message?.phase)) out.push(entry);
-    else if (span.open) {
-      if (entry.type !== 'turnProcessRef') out.push(entry);
-      else {
-        // Keep one index per item while loading. A 400-row render window then
-        // hydrates only its own pages even for a very long open turn.
-        out.push({ ...entry, type: 'turnProcessPending', error: pages?.get(entry.pageKey)?.error });
-      }
+    const items = spans.get(entry.turn_id);
+    if (!items) { out.push(entry); continue; }
+    if (entry !== items[0]) continue;
+    const meta = turns.get(entry.turn_id), open = isOpen(entry.turn_id);
+    const opener = openingInput(items, meta);
+    const process = item => item !== opener && processItem(item.type, item.message?.phase, true);
+    const firstProcess = items.find(process);
+    if (opener) out.push(opener);
+    if (firstProcess || Number.isFinite(meta.duration_ms)) {
+      out.push({ type: 'turnSummary', id: '@turn-summary', turn_id: entry.turn_id, duration_ms: meta.duration_ms,
+        open, hasProcess: !!firstProcess,
+        firstPage: firstProcess?.locator && !pages?.get(firstProcess.pageKey)?.records ? firstProcess : undefined });
     }
-    if (header && !before && entry === span.last) out.push(header);
+    // Late native echoes can arrive after the final or even after the next
+    // turn starts. Keep their native order within this turn and its final last.
+    const finals = [];
+    for (const item of items) {
+      if (item === opener) continue;
+      if (item.message?.phase === 'final_answer' || item.message?.is_final) { finals.push(item); continue; }
+      if (!open && process(item)) continue;
+      out.push(item.type === 'turnProcessRef' ? { ...item, type: 'turnProcessPending', error: pages?.get(item.pageKey)?.error } : item);
+    }
+    for (const final of finals) out.push(final);
   }
   return out;
 }
