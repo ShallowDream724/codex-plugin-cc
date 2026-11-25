@@ -9,7 +9,7 @@ import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences } 
 import { renderDiff } from './diff-view.js';
 import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
 import { GROUP_RENDER_LIMIT, INPUT_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
-import { paneScroll } from './pane-scroll.js';
+import { paneMarkerOffset, paneScroll } from './pane-scroll.js';
 import { historyWindowCost, historyWindowFits, planHistoryWindow } from './history-window.js';
 import { renderAgentDirectory } from './agent-directory.js';
 import { fileViewEntries, appendFilePage } from './file-stream.js';
@@ -438,7 +438,7 @@ function scrollPane($, args, valid = () => true, controller = null, targetOffset
 function cancelNavigation(page) {
   page.navigationOwner = null; page.navigationRequest = null;
   page.navigationTimeline = null; page.adding = null; page.navigating = false;
-  page.layoutFloor = null;
+  page.layoutFloor = null; page.measureAnchor = null; page.historyPositionedAt = null;
   page.scroller?.cancel(); page.scroller = null; page.edgeGesture = null; page.readingAnchor = null;
   page.olderApproach = false; page.hardTopToken = null;
 }
@@ -457,6 +457,17 @@ function atPaneBottom(offset, contentRows, bodyRows, surface) {
 }
 const paneEnd = ({ contentRows, bodyRows }) => Math.max(0, contentRows - bodyRows);
 const samePaneGeometry = (a, b) => a && a.contentRows === b.contentRows && a.bodyRows === b.bodyRows;
+const desktopWheelQuietMs = 180;
+function desktopMovement(e, offset, oldGeometry) {
+  const from = e.offset - e.by;
+  const projected = Math.min(offset, paneEnd(e));
+  const current = Math.abs(from - offset) <= 2;
+  if (!e.by || !current && Math.abs(from - projected) > 2 || e.offset === projected) return 0;
+  // A changed bottom can move the native scrollbar without a wheel event.
+  if (atPaneBottom(e.offset, e.contentRows, e.bodyRows, 'desktop') && oldGeometry && !samePaneGeometry(oldGeometry, e) &&
+      (Math.abs(e.offset - projected) <= 2 || atPaneBottom(offset, oldGeometry.contentRows, oldGeometry.bodyRows, 'desktop'))) return 0;
+  return projected === offset || !current ? e.by : e.offset - projected;
+}
 function requestTail($, id, placement = null) {
   const page = pageFor(id);
   const pending = page.tailRequest;
@@ -545,6 +556,12 @@ async function revealTail($, id, token, painted = false) {
     }
   }
 }
+function retryNavigationPost($, request) {
+  if (!request?.ready || Date.now() < request.retryAt) return;
+  request.attempt++;
+  request.retryAt = Date.now() + 800;
+  void invalidate($);
+}
 async function requestHistoryNavigation($, id, direction, automatic = false) {
   const page = pageFor(id), generation = state.generation;
   if (page.navigating || state.imagePreview) return;
@@ -573,7 +590,14 @@ async function requestHistoryNavigation($, id, direction, automatic = false) {
       page.navigationRequest = null;
       if (page.edgeGesture) page.edgeGesture.settled = true;
       if (request.resumeTail && page.scrollGeneration === request.scrollGeneration) page.followTail = true;
-    } else request.ready = true;
+    } else {
+      request.ready = true;
+      request.attempt = 0;
+      request.retryAt = Date.now() + 350;
+      // Desktop may discard the one surface post during a remount. Redraw
+      // the same token; only its first registered dispatch can claim it.
+      $.clock.after(400, () => { if (current()) retryNavigationPost($, request); });
+    }
     await invalidate($);
   };
   await prepare();
@@ -598,8 +622,13 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   const scroller = scrollController($, id, page), gen = state.generation;
   const oldView = drawnWindow(page);
   const oldGroups = page.renderedGroups;
-  const anchorGroup = above ? page.renderedGroups?.find(group => group.start === Math.max(start, oldView.start)) : null;
+  // At the newer edge the reader is near the last retained item. Growth in
+  // that prefix also affects the viewport while newer items are appended.
+  const fromEnd = page.surface === 'desktop' && owner.direction > 0;
+  const anchorGroup = fromEnd ? oldGroups?.findLast(group => group.start >= start && group.end <= end)
+    : above ? oldGroups?.find(group => group.start === Math.max(start, oldView.start)) : null;
   const anchored = !!anchorGroup;
+  const block = fromEnd && anchored ? 'end' : 'start';
   if (anchored && page.measureAnchor !== anchorGroup.key) {
     page.measureAnchor = anchorGroup.key;
     // Desktop drops press keys longer than 256 characters. An item identity
@@ -608,7 +637,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
     await invalidate($);
   }
   const measurementKey = () => anchored ? page.measureKey : historyKey(id, page);
-  const before = await scroller.measure(measurementKey(), null, false, anchored);
+  const before = await scroller.measure(measurementKey(), null, false, anchored, block);
   if (!before || !state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
   // Native wheel frames can be ahead of the host's last accepted position.
   // Carry the actual boundary crossing through a slow fetch and both layouts.
@@ -620,16 +649,19 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   page.followTail = false; page.windowAnchor = null;
   page.windowStart = start; page.windowEnd = end; page.windowSize = Math.max(1, end - start);
   page.layoutRevision = (page.layoutRevision ?? 0) + 1;
+  page.readingAnchor = null;
   if (anchored) page.measureKey = `codex_read_anchor_${id}_${++navigationSequence}`;
   if (anchored || end > oldView.start + oldView.entries.length) page.layoutFloor = before.contentRows;
-  scroller.stage(before, above, anchored);
+  owner.staged = true; owner.movement = 0;
+  scroller.stage(before, above, anchored, () => owner.movement);
   await invalidate($);
-  const after = await scroller.measure(measurementKey(), before, above, anchored);
+  const after = await scroller.measure(measurementKey(), before, above, anchored, block);
   if (after && page.navigationOwner === owner) {
+    if (page.surface === 'desktop') page.historyPositionedAt = Date.now();
     if (page.edgeGesture) page.edgeGesture.offset = after.offset;
-    if (anchored && above && page.surface === 'desktop' && !page.synchronousFileLayout) {
-      page.readingAnchor = { key: measurementKey(), distance: before.offset - before.anchorOffset,
-        contentRows: after.contentRows, bodyRows: after.bodyRows, sizes: new Map() };
+    if (anchored && page.surface === 'desktop' && !page.synchronousFileLayout) {
+      page.readingAnchor = { key: measurementKey(), distance: after.offset - after.anchorOffset + owner.movement - (after.movement ?? 0),
+        block: after.block, anchorOffset: after.anchorOffset, movement: 0, contentRows: after.contentRows, bodyRows: after.bodyRows, sizes: new Map() };
     }
   }
   if (!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner) {
@@ -641,16 +673,22 @@ async function resizeWindow($, id, page, start, end, above, owner) {
     if (!state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
     await refreshPaneGeometry($, page);
     if (!state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
-    state.scroll.set(id, before.offset);
-    await scrollPane($, { to: 'start' }, () => page.navigationOwner === owner, null, () => before.offset);
+    const restoreOffset = () => Math.max(0, Math.min(paneEnd(before), before.offset + owner.movement));
+    state.scroll.set(id, restoreOffset());
+    await scrollPane($, { to: 'start' }, () => page.navigationOwner === owner, null, restoreOffset);
   }
-  if (page.navigationOwner === owner) page.layoutFloor = null;
+  owner.staged = false;
+  if (page.navigationOwner === owner) {
+    if (after && above && owner.direction > 0 && page.layoutFloor) owner.releasedTrim = after;
+    page.layoutFloor = null;
+  }
   return !!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner;
 }
 const historyCostFields = ['chars', 'wireChars', 'nodes'];
 async function reconcileReadingAnchor($, id, key, sensor, rows) {
   const page = pageFor(id), anchor = page.readingAnchor;
-  const current = () => page.readingAnchor === anchor && state.opened && state.selected === id && !page.navigating && !state.imagePreview;
+  const gesture = page.edgeGesture;
+  const current = () => page.readingAnchor === anchor && state.opened && state.selected === id && !page.navigating && !page.navigationRequest && !state.imagePreview;
   if (!anchor || anchor.key !== key || !Number.isSafeInteger(rows) || rows <= 0 || !current() || anchor.sizes.get(sensor) === rows) return;
   anchor.sizes.set(sensor, rows);
   anchor.dirty = true;
@@ -663,21 +701,43 @@ async function reconcileReadingAnchor($, id, key, sensor, rows) {
       await refreshPaneGeometry($, page);
       if (!current()) break;
       let sample;
-      const committed = await scrollPane($, { to: { key }, block: 'start' }, current, null, event => {
-        const offset = Math.max(0, Math.min(event.offset + anchor.distance, Math.max(0, event.contentRows - event.bodyRows)));
-        sample = { offset, contentRows: event.contentRows, bodyRows: event.bodyRows };
+      const block = anchor.block ?? 'start';
+      const committed = await scrollPane($, { to: { key }, block }, current, null, event => {
+        if (block === 'end' && event.offset === 0) {
+          sample = { clipped: true };
+          return Math.max(0, event.offset - event.by);
+        }
+        const marker = paneMarkerOffset(event, block);
+        // The host reports browser scroll anchoring and wheel displacement in
+        // the same way. An initial native move matching the marker's shift
+        // already includes the prefix growth, so account for it only once.
+        const shift = marker - anchor.anchorOffset, layout = anchor.layoutDisplacement;
+        const browserDisplacement = Number.isFinite(layout) && Math.sign(shift) === Math.sign(layout) && Math.abs(shift - layout) <= 1 ? layout : 0;
+        const movement = anchor.movement, readerDisplacement = movement - browserDisplacement;
+        const offset = Math.max(0, Math.min(marker + anchor.distance + readerDisplacement, paneEnd(event)));
+        sample = { offset, marker, movement, readerDisplacement, contentRows: event.contentRows, bodyRows: event.bodyRows };
         return offset;
       });
       if (current() && !committed?.deny && sample) {
-        Object.assign(anchor, sample);
-        if (page.edgeGesture) page.edgeGesture.offset = sample.offset;
+        if (sample.clipped) { anchor.block = 'start'; anchor.dirty = true; continue; }
+        anchor.anchorOffset = sample.marker;
+        anchor.distance += sample.readerDisplacement;
+        anchor.movement -= sample.movement;
+        anchor.layoutDisplacement = null;
+        anchor.release ||= sample.readerDisplacement !== 0;
+        anchor.contentRows = sample.contentRows; anchor.bodyRows = sample.bodyRows;
+        if (anchor.movement) anchor.dirty = true;
+        if (gesture && page.edgeGesture === gesture) gesture.offset = sample.offset;
         retries = 0;
       } else if (current() && retries++ < 2) {
         anchor.dirty = true;
         await new Promise(resolve => $.clock.after(32 * retries, resolve));
       }
     }
-  } finally { anchor.measuring = false; }
+  } finally {
+    anchor.measuring = false;
+    if (anchor.release && current()) { page.readingAnchor = null; page.measureAnchor = null; }
+  }
 }
 const availableHistoryCost = (page, field) => Math.max(0, RENDER_LIMIT[field] - (page.historyShellCost?.[field] ?? 0));
 function historyWindowNeedsTrim(page, count) {
@@ -687,10 +747,23 @@ function historyWindowNeedsTrim(page, count) {
     return used > Math.max(0, Math.min(room * 0.6, room - GROUP_RENDER_LIMIT[field]));
   });
 }
+function finishHistoryNavigation(page, owner) {
+  if (page.navigationOwner !== owner) return false;
+  const previous = drawnWindow(page), first = previous.entries[0], last = previous.entries.at(-1);
+  page.navigationTimeline = null; page.adding = null; page.navigating = false; page.navigationOwner = null;
+  page.layoutFloor = null;
+  if (!page.readingAnchor) page.measureAnchor = null;
+  if (page.edgeGesture) { page.edgeGesture.settled = true; page.edgeGesture.lastAt = Date.now(); }
+  if (!page.followTail && first && last) {
+    const all = page.timeline ??= conversationEntries(page.live, page), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
+    if (start >= 0 && end >= start) { page.windowStart = start; page.windowEnd = end + 1; page.windowSize = end - start + 1; }
+  }
+  return true;
+}
 async function browseHistory($, id, direction) {
   const page = pageFor(id), gen = state.generation;
   if (page.navigating || state.imagePreview) return;
-  const owner = {}; page.navigationOwner = owner;
+  const owner = { direction }; page.navigationOwner = owner;
   page.readingAnchor = null;
   page.navigating = true; holdWindow(page);
   try {
@@ -723,7 +796,7 @@ async function browseHistory($, id, direction) {
       keep = Math.max(1, Math.min(200, keep || Math.ceil(view.entries.length / 2)));
       if (keep < view.entries.length) {
         const start = direction < 0 ? view.start : view.start + view.entries.length - keep;
-        if (!await resizeWindow($, id, page, start, start + keep, direction > 0, owner)) return;
+        if (!await resizeWindow($, id, page, start, start + keep, direction > 0, owner) || owner.reversed) return;
         view = drawnWindow(page);
       }
     }
@@ -731,16 +804,7 @@ async function browseHistory($, id, direction) {
     page.adding = { direction, start: view.start, end };
     await resizeWindow($, id, page, direction < 0 ? Math.max(0, end - RAW_WINDOW_LIMIT) : view.start, direction > 0 ? Math.min(view.total, view.start + RAW_WINDOW_LIMIT) : end, direction < 0, owner);
   } finally {
-    if (page.navigationOwner !== owner) return;
-    const previous = drawnWindow(page), first = previous.entries[0], last = previous.entries.at(-1);
-    page.navigationTimeline = null; page.adding = null; page.navigating = false; page.navigationOwner = null;
-    page.layoutFloor = null;
-    if (page.edgeGesture) { page.edgeGesture.settled = true; page.edgeGesture.lastAt = Date.now(); }
-    if (!page.followTail && first && last) {
-      const all = page.timeline ??= conversationEntries(page.live, page), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
-      if (start >= 0 && end >= start) { page.windowStart = start; page.windowEnd = end + 1; page.windowSize = end - start + 1; }
-    }
-    if (state.opened && state.selected === id && gen === state.generation) void invalidate($);
+    if (finishHistoryNavigation(page, owner) && state.opened && state.selected === id && gen === state.generation) void invalidate($);
   }
 }
 let actionSequence = 0;
@@ -1366,34 +1430,73 @@ export function registerUI(on) {
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
     const now = Date.now(), direction = Math.sign(e.by);
+    const desktop = page?.surface === 'desktop', originOffset = e.offset - e.by;
+    const oldGeometry = page?.scrollGeometry, geometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
+    const viewportOffset = state.scroll.get(id) ?? Math.max(0, originOffset);
+    const owner = page?.navigationOwner;
+    const sampledOffset = owner?.staged ? page.scroller?.nativeOffset : undefined;
+    // Desktop can acknowledge a probe after a newer wheel report. A later
+    // wheel starts at that native write, while its delta still belongs to us.
+    const fromSample = Math.abs(originOffset - viewportOffset) > 2 && Math.abs(originOffset - sampledOffset) <= 2;
+    const movement = desktop ? desktopMovement(e, fromSample ? sampledOffset : viewportOffset, oldGeometry) : e.by;
+    if (desktop && owner) {
+      const releasedTrim = owner.releasedTrim;
+      // The append's first geometry probe can precede the floor-release
+      // report. Compare that packet with the trim frame that supplied its
+      // starting row, even after the current geometry has been refreshed.
+      if (releasedTrim && e.by < 0 && originOffset === releasedTrim.offset && paneEnd(e) < paneEnd(releasedTrim) &&
+          atPaneBottom(e.offset, e.contentRows, e.bodyRows, 'desktop')) {
+        owner.releasedTrim = null;
+        return next({ ...e, offset: viewportOffset });
+      }
+      // While a different tree is covered, its absolute row is provisional.
+      // Keep the movement separately and add it to the retained marker once
+      // that frame can be committed. Before staging, the old frame can stay.
+      if (!movement || !owner.reversed && Math.sign(movement) === owner.direction) return next({ ...e, offset: viewportOffset });
+      page.edgeGesture = null;
+      page.shortFillDirection = Math.sign(movement);
+      if (owner.staged) {
+        owner.reversed = true; owner.movement += movement;
+        page.scrollGeneration++;
+        page.scrollGeometry = geometry;
+        state.scroll.set(id, e.offset);
+        return next(e);
+      }
+      page.scroller?.cancel(); page.scroller = null;
+      finishHistoryNavigation(page, owner);
+      void invalidate($);
+    }
     const gesture = page?.edgeGesture;
     const anchor = page?.readingAnchor;
-    if (anchor && (e.contentRows !== anchor.contentRows || e.bodyRows !== anchor.bodyRows)) {
-      // A native layout clamp can arrive ahead of the Client's size report.
-      // The keyed resize notification accounts for the actual prefix change.
-      anchor.contentRows = e.contentRows; anchor.bodyRows = e.bodyRows;
+    const sameGesture = desktop && gesture && direction === gesture.direction && (!gesture.settled || now - gesture.lastAt < desktopWheelQuietMs);
+    const stalePosition = desktop && direction && (anchor || now - (page.historyPositionedAt ?? -Infinity) < desktopWheelQuietMs) &&
+      Math.abs(originOffset - viewportOffset) > 2 && (!samePaneGeometry(oldGeometry, e) || !movement);
+    if (stalePosition) return next({ ...e, offset: viewportOffset });
+    const pendingDirection = page?.navigationRequest?.direction ?? (gesture && !gesture.settled ? gesture.direction : 0);
+    if (desktop && direction && direction === pendingDirection) retryNavigationPost($, page.navigationRequest);
+    if (desktop && pendingDirection && direction === -pendingDirection && !movement) return next({ ...e, offset: viewportOffset });
+    const anchorLayoutChanged = anchor && !samePaneGeometry(anchor, e);
+    if (anchorLayoutChanged && !movement) {
+      // The prefix's size report accounts for layout-driven movement. Keep
+      // the measured geometry so a wheel that arrives first can coexist with it.
       return next(e);
     }
     // Desktop sends RAF-coalesced movement, not wheel phases. Packets from
     // the same physical burst may reference either side of the prepend.
-    if (page?.surface === 'desktop' && (page.navigating ||
-        gesture && direction === gesture.direction && (!gesture.settled || now - gesture.lastAt < 180))) {
-      if (gesture && direction) gesture.lastAt = now;
-      if (gesture && !page.navigating && !gesture.settled) {
+    if (sameGesture && (!gesture.settled || !movement)) {
+      if (!gesture.settled) {
         // A slow cache read has not changed the drawn window. Let the reader
         // reach its real edge and carry that last position into the prepend.
+        gesture.lastAt = now;
         gesture.offset = e.offset; state.scroll.set(id, e.offset);
       }
       return next({ ...e, offset: gesture?.offset ?? state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
     }
-    if (direction && gesture) {
-      if (gesture.settled || direction !== gesture.direction || now - gesture.lastAt >= 180) page.edgeGesture = null;
+    if (direction && gesture && !sameGesture) {
+      if (gesture.settled || direction !== gesture.direction || now - gesture.lastAt >= desktopWheelQuietMs) page.edgeGesture = null;
     }
-    const oldGeometry = page?.scrollGeometry;
-    const geometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
     const atBottom = atPaneBottom(e.offset, e.contentRows, e.bodyRows, page?.surface);
     const tail = page?.tailRequest;
-    const desktop = page?.surface === 'desktop', originOffset = e.offset - e.by;
     if (desktop && page.nativeFollowing && !page.windowAnchor) {
       const end = paneEnd(e);
       if (direction >= 0) return next({ ...e, offset: end });
@@ -1427,14 +1530,29 @@ export function registerUI(on) {
     const controller = page && scrollController($, id, page);
     const intent = controller?.intent, observed = controller?.observe(e);
     if (controller && controller.intent === intent) return next(observed);
-    if (direction && page) { page.readingAnchor = null; page.olderApproach = direction < 0; page.hardTopToken = null; }
+    if (direction && page) {
+      if (anchor && movement && (anchorLayoutChanged || anchor.measuring || anchor.movement)) {
+        // The browser can report a wheel after the prefix grew, while the
+        // size observer is still in flight. Preserve the reader's motion as
+        // well as the growth, then release the reconciled marker.
+        if (anchorLayoutChanged) anchor.layoutDisplacement ??= movement;
+        anchor.movement += movement;
+        if (anchor.measuring) anchor.dirty = true;
+      } else if (anchor) { page.readingAnchor = null; page.measureAnchor = null; }
+      page.olderApproach = direction < 0; page.hardTopToken = null;
+    }
     if (e.origin.kind === 'person' && id) {
       const wasFollowing = page.followTail;
       page.nativeFollowing = false;
       page.tailRequest = null;
-      if (page.navigationRequest && e.by !== 0 && Math.sign(e.by) !== page.navigationRequest.direction) page.navigationRequest = null;
+      if (page.navigationRequest && movement && Math.sign(movement) !== page.navigationRequest.direction) {
+        page.navigationRequest = null;
+        page.shortFillDirection = Math.sign(movement);
+        void invalidate($);
+      }
       const previousOffset = state.scroll.get(id);
       state.scroll.set(id, e.offset); page.scrollGeneration++;
+      if (sameGesture && gesture.settled) gesture.offset = e.offset;
       const stableGeometry = !oldGeometry || samePaneGeometry(oldGeometry, e);
       // An actual upward move is observable even inside the rounding margin.
       if (e.by !== 0 || !stableGeometry) {
@@ -1461,6 +1579,7 @@ export function registerUI(on) {
       const later = direction > 0 && nearEnd && view.start + view.entries.length < view.total;
       if (earlier || later) {
         page.olderApproach = false;
+        page.readingAnchor = null; page.measureAnchor = null;
         const gesture = page.edgeGesture = { direction, lastAt: now, offset: e.offset, settled: false };
         $.clock.after(0, () => {
           if (state.opened && state.selected === id && gen === state.generation && page.edgeGesture === gesture) return requestHistoryNavigation($, id, direction);
@@ -1529,14 +1648,16 @@ export function registerUI(on) {
       if (!e.data.token || (e.data.token !== page.edgeKey && e.data.token !== page.hardTopToken) || page.lastEdgeRequest === e.data.token || page.navigating || page.navigationRequest || page.tailRequest || state.imagePreview) return {};
       page.lastEdgeRequest = e.data.token;
       const direction = e.data.direction === 1 ? 1 : -1;
-      if (page.olderApproach && direction < 0) {
+      const hardTop = page.olderApproach && direction < 0;
+      if (hardTop) {
         page.olderApproach = false;
         page.hardTopToken = null;
-        page.edgeGesture = { direction, lastAt: Date.now(), offset: 0, settled: false };
       }
       const scrollGeneration = page.scrollGeneration;
       $.clock.after(0, () => {
-        if (state.opened && state.selected === id && state.generation === generation && page.scrollGeneration === scrollGeneration) return requestHistoryNavigation($, id, direction, true);
+        if (!state.opened || state.selected !== id || state.generation !== generation || page.scrollGeneration !== scrollGeneration || page.navigationRequest || page.navigating || page.tailRequest || state.imagePreview) return;
+        if (hardTop) page.edgeGesture = { direction, lastAt: Date.now(), offset: 0, settled: false };
+        return requestHistoryNavigation($, id, direction, true);
       });
       return {};
     }
@@ -1640,7 +1761,7 @@ function renderPane($, e, next) {
     // No scroll timer, state write, Markdown parsing or list regrouping here.
     const currentPage = state.pages.get(state.selected);
     const now = new Date();
-    const frameKey = JSON.stringify([state.generation, paneRevision, now.toDateString(), e.surface, e.props?.bodyColumns, e.props?.scroll?.bodyRows, currentPage?.navigationRequest?.token, currentPage?.navigationRequest?.ready, currentPage?.tailRequest?.token]);
+    const frameKey = JSON.stringify([state.generation, paneRevision, now.toDateString(), e.surface, e.props?.bodyColumns, e.props?.scroll?.bodyRows, currentPage?.navigationRequest?.token, currentPage?.navigationRequest?.attempt, currentPage?.tailRequest?.token]);
     const cached = state.pages.get(state.selected)?.renderCache;
     const draft = state.controls.get(state.selected)?.draft;
     if (cached?.key === frameKey && cached.draft === draft) return cached.draw(e.props?.scroll);
@@ -1809,12 +1930,14 @@ function renderPane($, e, next) {
     };
     // The host owns scrolling. History controls stay in the transcript; the
     // single jump control is positioned by the cheap frame wrapper below.
+    const historyBusy = page.historyLoading || page.navigating || page.navigationRequest;
+    const historySpinner = e.surface === 'desktop' && typeof Svg === 'function'
+      ? Svg({ key: `codex_history_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 14, height: 14, isInteractive: true })
+      : caption(`codex_history_loading_label_${id}`, '…');
     navigation.push(Box({ key: `codex_history_bar_${id}`, height: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', children: [
       Box({ flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [
         Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: historyKey(id, page), plain: true, label: '·', onPress: () => {} })] }),
-        Box({ key: `codex_history_loading_${id}`, width: 2, height: 1, children: page.historyLoading || page.navigating || page.navigationRequest ? [e.surface === 'desktop' && typeof Svg === 'function'
-          ? Svg({ key: `codex_history_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: '正在加载历史消息', width: 14, height: 14, isInteractive: true })
-          : caption(`codex_history_loading_label_${id}`, '…')] : [] }),
+        Box({ key: `codex_history_loading_${id}`, width: 2, height: 1, children: historyBusy ? [historySpinner] : [] }),
       ] }),
     ] }));
     if (state.error) navigation.push(caption('codex_open_error', state.error));
@@ -1824,6 +1947,15 @@ function renderPane($, e, next) {
       navigation.push(disclosure('codex_retry_conversation', '重新读取', async () => { if (state.error) return openAgent($, id); if (page.cursor && page.historyError) return history($, id); page.historyChecked = false; await poll($); }));
     }
     const fileBuffer = (key, children) => Box({ key: `file_buffer_${key}`, flexDirection: 'column', gap: 0, minWidth: 0, children });
+    const markerGroup = (start, key, children) => Box({ key: `activity_read_anchor_${id}:${start}`, position: 'relative', flexDirection: 'column', minWidth: 0, children: [
+      Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key, plain: true, label: '·', onPress: () => {} })] }), ...children,
+    ] });
+    const groupCost = node => {
+      const cost = budget.cost(node);
+      // The reading marker wraps its group. Either prefix observer can wrap
+      // another group once, since the timeline prefix excludes the anchor file.
+      return { ...cost, depth: cost.depth + 1 };
+    };
     const renderGroup = record => {
       const group = record.group;
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
@@ -1831,27 +1963,24 @@ function renderPane($, e, next) {
       const groupBox = (children) => {
         const key = entryKey(first), props = { key: `activity_group_${id}:${key}`, flexDirection: 'column', rowGap, minWidth: 0 };
         const groupTree = Box({ ...props, children });
-        const anchored = node => record.key === page.measureAnchor ? Box({ key: `activity_read_anchor_${id}:${key}`, position: 'relative', flexDirection: 'column', minWidth: 0, children: [
-          Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: page.measureKey, plain: true, label: '·', onPress: () => {} })] }), node,
-        ] }) : node;
         // Leave room for both neighbours. A single nearly-full tree otherwise
         // rejects every prepend/append and traps navigation on the same item.
         const paginate = (limit = GROUP_RENDER_LIMIT) => {
-          if (budget.fits(groupTree, limit)) return anchored(groupTree);
+          if (budget.fits(groupTree, limit)) return groupTree;
           const parts = budget.pages(groupTree, limit);
           page.contentPages ??= new Map();
           const current = Math.max(0, Math.min(page.contentPages.get(key) ?? 0, parts.length - 1));
           const turn = value => { page.contentPages.set(key, value); return invalidate($); };
-          return anchored(Box({ ...props, key: `activity_paged_${id}:${key}`, children: [parts[current], Box({ key: `content_pages_${id}:${key}`, flexDirection: 'row', gap: 'sm', children: [
+          return Box({ ...props, key: `activity_paged_${id}:${key}`, children: [parts[current], Box({ key: `content_pages_${id}:${key}`, flexDirection: 'row', gap: 'sm', children: [
             ...(current > 0 ? [Button({ key: `content_prev_${id}:${key}`, plain: true, label: '上一页内容', onPress: () => turn(current - 1) })] : []),
             caption(`content_page_${id}:${key}`, `内容 ${current + 1} / ${parts.length}`),
             ...(current + 1 < parts.length ? [Button({ key: `content_next_${id}:${key}`, plain: true, label: '下一页内容', onPress: () => turn(current + 1) })] : []),
-          ] })] }));
+          ] })] });
         };
         const node = paginate();
         // Adjacent file chunks share one wrapper in the final tree. Counting
         // it with each chunk keeps the planner safe even for scattered files.
-        const cost = budget.cost(first.fileView?.kind === 'chunk' ? fileBuffer(first.fileView.key, [node]) : node);
+        const cost = groupCost(first.fileView?.kind === 'chunk' ? fileBuffer(first.fileView.key, [node]) : node);
         return { node, cost, ...(first.fileView ? {} : { paginate }) };
       };
       if (first.type === 'turnProcessPending') {
@@ -2106,12 +2235,18 @@ function renderPane($, e, next) {
     let hasLater = view.start + entries.length < view.total;
     const historyEnd = Box({ key: `codex_history_end_${id}`, height: 1, children: [] });
     const timeline = rows => Box({ key: `codex_timeline_${id}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 1 : 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows });
-    const navigationProps = { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, tailToken: page.tailRequest?.token || 0 };
+    const navigationProps = { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, attempt: page.navigationRequest?.attempt || 0, tailToken: page.tailRequest?.token || 0 };
     const tailMarker = Box({ position: 'absolute', bottom: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: tailKey(id, page.tailMarkerToken), plain: true, label: '·', onPress: () => {} })] });
     const jumpNode = jumpControl('viewport');
     const jumping = e.surface === 'desktop' && page.tailRequest?.placement === 'jump';
     const settling = e.surface === 'desktop' && (page.navigating || jumping);
     const settlingLabel = jumping ? '正在定位最新消息' : '正在加载历史消息';
+    const canWatchSize = e.surface === 'desktop' && typeof Client === 'function';
+    const prefixBox = (scope, gap, rows, key, contentRows) => Box({ key: `codex_prefix_${id}_${scope}`, position: 'relative', flexDirection: 'column', rowGap: gap, minWidth: 0, children: [
+      ...rows,
+      ...(key ? [Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden',
+        children: [Client({ key: `codex_prefix_size_${id}_${scope}`, module: './history-size.js', width: 1, height: '100%', props: { key, contentRows } })] })] : []),
+    ] });
     const overlay = scroll => {
       const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
       const contentRows = scroll?.contentRows ?? page.scrollGeometry?.contentRows;
@@ -2126,7 +2261,7 @@ function renderPane($, e, next) {
     const draftReserve = Math.max(0, INPUT_RENDER_LIMIT - control.draft.length);
     const composerNode = budget.reserveChars(Box({ key: `codex_composer_${id}`, flexDirection: 'column', flexShrink: 0, ...(e.surface === 'desktop' ? { gap: 0 } : { gap: 'sm', borderStyle: 'round', borderDimColor: true, padding: 1 }), children: composer }), 0, draftReserve);
     let renderedContent;
-    const root = (content, scroll = e.props?.scroll) => {
+    const root = (content, scroll = e.props?.scroll, reserving = false) => {
       renderedContent = content;
       // Keep the message port in the viewport: desktop surfaces may suspend
       // off-screen Client regions. Its empty node never handles pointer input.
@@ -2140,17 +2275,19 @@ function renderPane($, e, next) {
       // approach once the restored frame or newly available cursor is drawn.
       const hardTop = e.surface === 'desktop' && page.olderApproach && !page.edgeGesture && scroll?.offset === 0 && hasEarlier;
       const edgeDirection = !canRequest ? 0 : hardTop ? -1 : short && (fillDirection < 0 ? hasEarlier : hasLater) ? fillDirection : 0;
-      const edgeToken = edgeDirection ? JSON.stringify([state.generation, id, page.scrollGeneration, edgeDirection, view.start, entries.length, view.total, page.historyPage ?? 0]) : '';
-      if (hardTop && edgeDirection) page.hardTopToken = edgeToken;
-      page.edgeKey = edgeToken;
-      const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
-      const loadingLayer = settling ? [Box({ key: `codex_history_settling_${id}`, position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'background', children: [
+      const edgeToken = !reserving && edgeDirection ? JSON.stringify([state.generation, id, page.scrollGeneration, edgeDirection, view.start, entries.length, view.total, page.historyPage ?? 0]) : '';
+      if (!reserving) {
+        if (hardTop && edgeDirection) page.hardTopToken = edgeToken;
+        page.edgeKey = edgeToken;
+      }
+      const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: reserving ? { token: 0, tailToken: 0, edgeToken: '', edgeDirection: 0 } : { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
+      const loadingLayer = settling || reserving && e.surface === 'desktop' ? [Box({ key: `codex_history_settling_${id}`, position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'background', children: [
         Box({ key: `codex_history_settling_indicator_${id}`, position: 'absolute', top: offset + 2, left: 0, right: 0, height: 2, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', children: [
           typeof Svg === 'function' ? Svg({ key: `codex_history_settling_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: settlingLabel, width: 18, height: 18, isInteractive: true }) : caption(`codex_history_settling_label_${id}`, settlingLabel),
         ] }),
       ] })] : [];
       const frame = Box({ key: 'codex_conversation', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: Math.max(bodyRows, page.layoutFloor || 0) } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...loadingLayer, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
-      page.renderCost = budget.cost(frame);
+      if (!reserving) page.renderCost = budget.cost(frame);
       return frame;
     };
     // Preserve the partitions already on screen. Joining newly prepended tool
@@ -2172,15 +2309,22 @@ function renderPane($, e, next) {
         groups.push({ start, end, key: entryKey(group.items[0]), group }); start = end;
       }
     }
-    // Measure all fixed furniture, including the sync port, pager marker and
-    // jump overlay. A small token allowance covers changed edge JSON digits.
+    // A measurement paint must retain the exact groups it measures. Reserve
+    // the marker, both possible prefix observers and the loading controls in
+    // every frame; add them to the selected groups only after budget planning.
     hasEarlier = true; hasLater = true;
-    const measuredShell = budget.cost(root([timeline([])]));
-    const watchSize = e.surface === 'desktop' && typeof Client === 'function' && !!page.measureAnchor && !page.followTail;
-    const shellCost = { ...measuredShell, nodes: measuredShell.nodes + (watchSize ? 6 : 0),
-      chars: measuredShell.chars + 512, wireChars: measuredShell.wireChars + (watchSize ? 1800 : 512) };
+    const maxToken = Number.MAX_SAFE_INTEGER, markerBudgetKey = `codex_read_anchor_${id}_${maxToken}`;
+    const decorations = [markerGroup(maxToken, markerBudgetKey, []), ...(canWatchSize ? [
+      prefixBox('timeline', 1, [], markerBudgetKey, maxToken), prefixBox('file', 0, [], markerBudgetKey, maxToken),
+    ] : [])];
+    const measuredShell = budget.cost(root([timeline(decorations)], e.props?.scroll, true));
+    const spinnerCost = budget.cost(historySpinner);
+    const shellCost = { nodes: measuredShell.nodes + (historyBusy ? 0 : spinnerCost.nodes),
+      depth: Math.max(measuredShell.depth, spinnerCost.depth + 5),
+      chars: measuredShell.chars + (historyBusy ? 0 : spinnerCost.chars) + 512,
+      wireChars: measuredShell.wireChars + (historyBusy ? 0 : spinnerCost.wireChars) + 512 };
     page.historyShellCost = shellCost;
-    const paneLimit = watchSize ? { ...RENDER_LIMIT, depth: RENDER_LIMIT.depth - 2 } : RENDER_LIMIT;
+    const paneLimit = RENDER_LIMIT;
     const retained = page.adding;
     const anchor = page.windowAnchor ? (page.navigationTimeline ?? page.timeline).findIndex(entry => entryKey(entry) === page.windowAnchor) : undefined;
     const plan = planHistoryWindow({ groups, renderGroup, retained, direction: page.adding?.direction ?? -1, anchor: anchor >= 0 ? anchor : undefined, shellCost, limit: paneLimit, maxEntries: 400 });
@@ -2198,7 +2342,7 @@ function renderPane($, e, next) {
       const group = candidates[0];
       if (!group) break;
       const node = group.paginate({ chars: Math.max(256, Math.floor(group.cost.chars * 0.55)), wireChars: Math.max(512, Math.floor(group.cost.wireChars * 0.55)), nodes: Math.max(16, Math.floor(group.cost.nodes * 0.55)), depth: GROUP_RENDER_LIMIT.depth });
-      const nextCost = budget.cost(node);
+      const nextCost = groupCost(node);
       if (nextCost.chars >= group.cost.chars && nextCost.wireChars >= group.cost.wireChars && nextCost.nodes >= group.cost.nodes && nextCost.depth >= group.cost.depth) { group.paginate = null; continue; }
       group.node = node; group.cost = nextCost;
     }
@@ -2223,24 +2367,23 @@ function renderPane($, e, next) {
     let cluster = null, timelineAnchor = -1, fileAnchor = -1;
     for (const group of selectedGroups) {
       const file = group.group.items[0]?.fileView;
+      const anchored = group.key === page.measureAnchor;
+      const node = anchored ? markerGroup(group.start, page.measureKey, [group.node]) : group.node;
       if (file?.kind === 'chunk') {
         if (!cluster || cluster.key !== file.key) {
           cluster = { key: file.key, nodes: [] }; visualGroups.push(cluster);
         }
-        if (group.key === page.measureAnchor) fileAnchor = cluster.nodes.length;
-        cluster.nodes.push(group.node);
-      } else { cluster = null; visualGroups.push({ node: group.node }); }
-      if (group.key === page.measureAnchor) timelineAnchor = visualGroups.length - 1;
+        if (anchored) fileAnchor = cluster.nodes.length;
+        cluster.nodes.push(node);
+      } else { cluster = null; visualGroups.push({ node }); }
+      if (anchored) timelineAnchor = visualGroups.length - 1;
     }
     // Observe only the material before the original reading marker. A file
     // can straddle it, so its zero-gap chunk stack has its own prefix.
     const watchPrefix = (rows, index, scope, gap) => {
-      if (index < 1 || !watchSize || page.synchronousFileLayout) return rows;
+      if (index < 1 || !canWatchSize || page.followTail || page.synchronousFileLayout) return rows;
       const key = page.readingAnchor?.key;
-      const sensor = key ? [Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden',
-        children: [Client({ key: `codex_prefix_size_${id}_${scope}`, module: './history-size.js', width: 1, height: '100%', props: { key, contentRows: page.readingAnchor.contentRows } })] })] : [];
-      return [Box({ key: `codex_prefix_${id}_${scope}`, position: 'relative', flexDirection: 'column', rowGap: gap, minWidth: 0,
-        children: [...rows.slice(0, index), ...sensor] }), ...rows.slice(index)];
+      return [prefixBox(scope, gap, rows.slice(0, index), key, page.readingAnchor?.contentRows), ...rows.slice(index)];
     };
     const rows = visualGroups.map((group, index) => group.node ?? fileBuffer(group.key,
       index === timelineAnchor ? watchPrefix(group.nodes, fileAnchor, 'file', 0) : group.nodes));

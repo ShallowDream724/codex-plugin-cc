@@ -2,10 +2,11 @@
 // No polling, DOM access or scroll handling runs on the surface.
 export default function navigationSync(props, surface) {
   const token = Number.isSafeInteger(props?.token) ? props.token : 0;
+  const attempt = Number.isSafeInteger(props?.attempt) ? props.attempt : 0;
   const tail = Number.isSafeInteger(props?.tailToken) ? props.tailToken : 0;
   const edge = typeof props?.edgeToken === 'string' ? props.edgeToken : '';
-  if (token > 0 && token !== surface.state?.navigation) {
-    surface.setState({ ...surface.state, navigation: token });
+  if (token > 0 && (token !== surface.state?.navigation || attempt !== (surface.state?.attempt || 0))) {
+    surface.setState({ ...surface.state, navigation: token, attempt });
     surface.post({ action: 'navigate', token });
   } else if (tail > 0 && tail !== surface.state?.tail) {
     surface.setState({ ...surface.state, tail });

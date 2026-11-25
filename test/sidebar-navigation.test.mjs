@@ -8,12 +8,13 @@ const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.
 const entry = i => ({ id: `m${i}`, turn_id: 't', type: 'agentMessage', data: { text: `message-${i}` } });
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, shortViewport = false, nativeContentRows, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
+async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, dropPost = () => false, shortViewport = false, nativeContentRows, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
   closeUI();
   const hooks = [], scrolls = [], calls = [], timers = [];
   let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0;
   const surfacePending = new Set();
   const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
+    if (dropPost(data)) return;
     const task = new Promise(resolve => setImmediate(resolve)).then(() => { if (!closed) return host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data })); });
     surfacePending.add(task); task.finally(() => surfacePending.delete(task));
   } };
@@ -301,7 +302,9 @@ test('live updates during a navigation measurement retain the range and appear a
   const anchor = messages(h)[0], index = Number(anchor.split('-')[1]);
   h.wheel(-1);
   await Promise.race([measuring, pause(3000).then(() => { throw Error('navigation measurement did not start'); })]);
-  h.wheel(1, 5); h.wheel(-1, 0);
+  // Keep reading at this edge. A real reversal before staging intentionally
+  // releases the frozen snapshot and is exercised in history-edge-intent.
+  await h.wheel(-1, 0);
   live = [{ ...entry(index), data: { text: `${anchor} updated with extra height\n`.repeat(30) } }, entry(500)]; revision++;
   await h.tick(); await h.draw();
   assert.ok(messages(h).includes(anchor), 'the measured frame remains stable during the update');
@@ -334,6 +337,29 @@ test('wheel navigation uses a fresh surface message frame for measurements', asy
   assert.equal(h.offset, 3, 'without an observer the native scroll reaches the target');
   await pause(200); h.wheel(-1, 0); await h.waitNavigation();
   assert.ok(Number(messages(h)[0].split('-')[1]) < Number(first.split('-')[1]), 'another edge visit continues navigation');
+});
+
+test('a dropped surface handoff retries the original edge once without another wheel', async t => {
+  const tokens = [];
+  const h = await setup({
+    live: Array.from({ length: 500 }, (_, i) => entry(i)),
+    dropPost(data) {
+      if (data.action !== 'navigate') return false;
+      tokens.push(data.token);
+      return tokens.length === 1;
+    },
+  });
+  t.after(h.close);
+  const before = messages(h)[0];
+  await h.wheel(-1, 0);
+  for (let i = 0; i < 6 && messages(h)[0] === before; i++) await h.waitNavigation();
+  assert.notEqual(messages(h)[0], before);
+  assert.equal(tokens.length, 2);
+  assert.equal(tokens[0], tokens[1]);
+  const after = messages(h)[0];
+  await h.host.surface(() => h.host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data: { action: 'navigate', token: tokens[0] } }));
+  await h.waitNavigation();
+  assert.equal(messages(h)[0], after);
 });
 
 test('a stale surface navigation token cannot move the window', async t => {

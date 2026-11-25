@@ -200,3 +200,43 @@ test('a denied settled commit cannot report success or confirm position', async 
   assert.equal(calls, 4);
   assert.deepEqual(positions, []);
 });
+
+test('settled commits resample wheel motion that arrives while native acknowledges positioning', async () => {
+  const before = { offset: 10, anchorOffset: 8, contentRows: 100, bodyRows: 10 };
+  let controller, calls = 0, movement = 4;
+  const targets = [], positions = [];
+  controller = paneScroll({ settleBeforeCommit: true, synchronousLayout: () => true, valid: () => true,
+    later: (_ms, run) => run(), position: n => positions.push(n), scroll: async () => {
+      const sample = controller.observe(event('plugin', 38, 38 - before.offset, 130));
+      assert.equal(controller.nativeOffset, sample.offset);
+      if (++calls > 2) targets.push(sample.offset);
+      if (calls === 3 || calls === 4) movement += 3;
+      return {};
+    },
+  });
+  controller.stage(before, true, true, () => movement);
+  const result = await controller.measure('marker', before, true, true);
+  assert.deepEqual(targets, [44, 47, 50]);
+  assert.equal(result.offset, 50);
+  assert.equal(result.movement, 10);
+  assert.deepEqual(positions, [50]);
+});
+
+test('a newer trim measures the same marker after an end-aligned sample clamps at the top', async () => {
+  const before = { offset: 30, anchorOffset: 20, contentRows: 130, bodyRows: 10 };
+  let controller;
+  const blocks = [];
+  controller = paneScroll({ settleBeforeCommit: true, synchronousLayout: () => true, valid: () => true,
+    later: (_ms, run) => run(), position: () => {}, scroll: async ({ block }) => {
+      blocks.push(block);
+      const target = block === 'end' ? 0 : 4;
+      controller.observe(event('plugin', target, target - 30, 100));
+      return {};
+    },
+  });
+  controller.stage(before, true, true);
+  const committed = await controller.measure('marker', before, true, true, 'end');
+  assert.deepEqual(blocks, ['end', 'start', 'start', 'start']);
+  assert.equal(committed.anchorOffset, 4);
+  assert.equal(committed.offset, 14);
+});
