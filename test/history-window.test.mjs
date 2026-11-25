@@ -47,6 +47,27 @@ test('prepend and append preserve every retained boundary and never skip a full 
   assert.ok(after.groups.some(group => group.end === 4));
 });
 
+test('sliding a full native window replaces one third and keeps a contiguous overlap', () => {
+  const groups = descriptors(Array.from({ length: 36 }, () => simpleCost(100)));
+  const limit = { chars: 1200, wireChars: 1200, nodes: 1000, depth: 28 };
+  const old = { start: 12, end: 24 };
+  for (const [direction, expected] of [[-1, [8, 20]], [1, [16, 28]]]) {
+    const result = planHistoryWindow({ groups, retained: old, direction, limit, renderGroup: render, shift: true });
+    assert.deepEqual([result.start, result.end], expected);
+    assert.deepEqual(result.groups.map(group => group.start), Array.from({ length: 12 }, (_, index) => expected[0] + index));
+    assert.ok(historyWindowFits(result.cost, limit));
+  }
+});
+
+test('sliding keeps the entire previous range when its immediate neighbour would exceed the native budget', () => {
+  const groups = descriptors([simpleCost(100), simpleCost(200), simpleCost(200), simpleCost(900), simpleCost(100)]);
+  const limit = { chars: 1000, wireChars: 1000, nodes: 1000, depth: 28 };
+  const old = { start: 0, end: 3 };
+  const result = planHistoryWindow({ groups, retained: old, direction: 1, limit, renderGroup: render, shift: true });
+  assert.deepEqual([result.start, result.end], [old.start, old.end]);
+  assert.deepEqual(result.groups.map(group => group.start), [0, 1, 2]);
+});
+
 test('native node and depth costs constrain selection independently of text length', () => {
   const groups = descriptors(Array.from({ length: 100 }, () => ({ chars: 10, nodes: 1000, depth: 4 })));
   const result = planHistoryWindow({ groups, shellCost, renderGroup: render });

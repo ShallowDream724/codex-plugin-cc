@@ -84,6 +84,7 @@ function harness(t, { viewportGeometry } = {}) {
         const event = viewport ? viewport.pluginEvent(args) : { origin: { kind: 'plugin' }, by: -100, offset: 0, contentRows: 500, bodyRows: 24 };
         if (!event) return { deny: 'no element of its own is drawn under that key' };
         const e = await host.dispatch('ui.scroll', event, e => e);
+        if (e.deny) return e;
         viewport?.commit(e.offset, args.to === 'end' && e.offset === event.offset);
         scrolls.push(e.offset); return {};
       },
@@ -146,6 +147,28 @@ test('desktop entry composes SessionMode without an icon, while AbovePrompt pass
   // A retained native pane after module reload must still close on the first click.
   h.panes.set(PANE, { id: PANE, isShown: false, isPlaced: false });
   await h.press('codex_directory_toggle'); assert.equal(h.panes.has(PANE), false);
+});
+
+test('recovering an untargeted conversation opens recent activity and the directory opens the selected agent', async t => {
+  const h = harness(t);
+  h.fixture.agents = [
+    { agent_id: 'recent', status: 'completed', created_at_ms: 1, last_activity_at_ms: 40 },
+    { agent_id: 'creation-time', status: 'completed', created_at_ms: 30 },
+    { agent_id: 'running', status: 'running', created_at_ms: 20, last_activity_at_ms: 25 },
+    { agent_id: 'unknown-time', status: 'running' },
+  ];
+  h.panes.set(PANE, { id: PANE, isShown: true, isPlaced: true });
+  await h.press('codex_retry');
+  assert.ok(nodes(await h.draw()).some(node => node.props.key === 'codex_composer_recent'));
+
+  await openDirectory(h.$); await settle();
+  await h.press('directory_open_running');
+  assert.ok(nodes(await h.draw()).some(node => node.props.key === 'codex_composer_running'));
+
+  h.fixture.agents[0].last_activity_at_ms = null;
+  closeUI();
+  await h.press('codex_retry');
+  assert.ok(nodes(await h.draw()).some(node => node.props.key === 'codex_composer_creation-time'));
 });
 
 test('rapid repeated toggles remain ordered and closing ignores a late directory response', async t => {

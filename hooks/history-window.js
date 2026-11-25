@@ -1,6 +1,7 @@
 import { appendRenderCost, renderCostFits, RENDER_LIMIT } from './render-budget.js';
 
 const ZERO = Object.freeze({ chars: 0, nodes: 0, depth: 0 });
+const RESOURCES = ['chars', 'wireChars', 'nodes'];
 export const HISTORY_RENDER_LIMIT = RENDER_LIMIT;
 
 export function historyWindowCost(shellCost = ZERO, groups = []) {
@@ -14,7 +15,7 @@ export function historyWindowFits(cost, limit = HISTORY_RENDER_LIMIT) {
 // Descriptors are cheap contiguous groups; renderGroup constructs their native
 // representation lazily. A failed boundary ends that side's search: skipping it
 // would create a hole in the transcript. The cache also covers retained groups.
-export function planHistoryWindow({ groups, renderGroup, retained, direction = -1, anchor, shellCost = ZERO, limit = HISTORY_RENDER_LIMIT, maxEntries = 400 }) {
+export function planHistoryWindow({ groups, renderGroup, retained, direction = -1, anchor, shellCost = ZERO, limit = HISTORY_RENDER_LIMIT, maxEntries = 400, shift = false }) {
   const cache = new Map();
   const materialize = index => {
     if (!cache.has(index)) cache.set(index, { ...groups[index], ...renderGroup(groups[index]) });
@@ -37,6 +38,46 @@ export function planHistoryWindow({ groups, renderGroup, retained, direction = -
   const selected = [];
   for (let index = first; index <= last; index++) selected.push(materialize(index));
   let cost = historyWindowCost(shellCost, selected);
+  if (shift && retained) {
+    const fixed = direction < 0 ? first : last;
+    const targetEntries = Math.max(1, Math.round(maxEntries / 3));
+    const targetCost = field => ((limit[field] ?? Infinity) - (shellCost[field] ?? 0)) / 3;
+    let added = 0, addedCost = ZERO;
+    // Spend about one third of the pane on fresh history. Keep the overlap
+    // as large as possible, and commit opposite-side evictions only when
+    // the immediate neighbour actually fits.
+    while (added < targetEntries && !RESOURCES.some(field => (addedCost[field] ?? 0) >= targetCost(field))) {
+      const index = direction < 0 ? first - 1 : last + 1;
+      if (index < 0 || index >= groups.length) break;
+      const group = materialize(index);
+      let trim = 0, next = appendRenderCost(cost, group.cost, 2);
+      while (true) {
+        const start = direction < 0 ? group.start : selected[trim].start;
+        const end = direction < 0 ? selected.at(-1 - trim).end : group.end;
+        if (end - start <= maxEntries && historyWindowFits(next, limit)) {
+          if (direction < 0) {
+            selected.length -= trim;
+            selected.unshift(group);
+            first = index; last -= trim;
+          } else {
+            selected.splice(0, trim);
+            selected.push(group);
+            first += trim; last = index;
+          }
+          cost = next;
+          added += group.end - group.start;
+          addedCost = appendRenderCost(addedCost, group.cost);
+          break;
+        }
+        if ((direction < 0 ? last - trim : first + trim) === fixed) break;
+        trim++;
+        const overlap = direction < 0 ? selected.slice(0, -trim) : selected.slice(trim);
+        next = appendRenderCost(historyWindowCost(shellCost, overlap), group.cost, 2);
+      }
+      if (direction < 0 ? first !== index : last !== index) break;
+    }
+    return { start: groups[first].start, end: groups[last].end, groups: selected, cost, overflow: !historyWindowFits(cost, limit), evaluated: cache.size };
+  }
   const add = side => {
     const index = side < 0 ? first - 1 : last + 1;
     if (index < 0 || index >= groups.length) return false;

@@ -17,7 +17,7 @@ const waitFor = async predicate => {
   assert.fail('the expected native frame did not appear');
 };
 
-async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, commitScroll = () => ({}), prefixGrowth = () => 0, autoPost = true, shortViewport = false, nativeContentRows, messageRows = () => 1, vectorControls = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
+async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, onProbeReply = () => {}, onRender = () => {}, commitScroll = () => ({}), prefixGrowth = () => 0, autoPost = true, shortViewport = false, nativeContentRows, messageRows = () => 1, vectorControls = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
   closeUI();
   const hooks = [], scrolls = [], samples = [], calls = [], timers = [];
   let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0, invalidations = 0;
@@ -46,6 +46,11 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
             : args.to === 'end' || args.block === 'end' ? contentRows - 10 : 3;
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
           const result = await host.dispatch('ui.scroll', e);
+          if (result.deny) {
+            await onProbeReply(args);
+            samples.push({ args, before: offset, after: offset, deny: result.deny });
+            return result;
+          }
           const commit = await commitScroll(args, e, result);
           samples.push({ args, before: offset, after: commit.deny ? offset : result.offset });
           if (commit.deny) return commit;
@@ -71,6 +76,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   const draw = async (restoredScroll = {}) => {
     constructed = 0;
     painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}), ...restoredScroll } } }, () => null));
+    onRender(painted);
     maxConstructed = Math.max(maxConstructed, constructed);
     const sync = painted.find(n => n.type === 'Client' && n.props.module === './navigation-sync.js');
     if ((typeof autoPost === 'function' ? autoPost() : autoPost) && sync) navigationSync(sync.props.props, surface);
@@ -109,6 +115,23 @@ const readyToken = h => h.painted.find(n => n.props.module === './navigation-syn
 const settling = h => h.painted.some(n => n.props.key === 'codex_history_settling_a');
 
 const longEntries = () => Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
+
+test('a full history window fetches older and newer records at one fifth of scrollbar travel', async t => {
+  const h = await setup({ live: longEntries(), nativeContentRows: 1010 }); t.after(h.close);
+  const tail = messages(h).at(-1), first = messages(h)[0];
+  await h.nativeMove(201 - h.offset);
+  assert.equal(navigations(h), 0);
+  await h.nativeMove(-1);
+  await waitFor(() => messages(h)[0] !== first && !settling(h));
+  const middle = messages(h).at(-1);
+  assert.notEqual(middle, tail);
+  const count = navigations(h);
+  await h.nativeMove(799 - h.offset);
+  assert.equal(navigations(h), count);
+  await h.nativeMove(1);
+  await waitFor(() => messages(h).at(-1) !== middle && !settling(h));
+  assert.equal(navigations(h), count + 1);
+});
 
 test('a restored hard top spends a prior upward approach once without another wheel event', async t => {
   const h = await setup({ live: longEntries(), nativeContentRows: 400 }); t.after(h.close);
@@ -250,7 +273,8 @@ test('installing a reading marker at the render budget keeps tall history at the
   await waitFor(() => markerFrames.length && !settling(h) && ids().at(-1) > end);
   assert.deepEqual(markerFrames[0], old, 'painting the baseline marker retains all the original groups');
   const newer = ids();
-  assert.deepEqual(newer, Array.from({ length: 10 }, (_, i) => 21 + i));
+  assert.ok(newer[0] > old[0] && newer.includes(end) && newer.at(-1) > end);
+  assert.deepEqual(newer, Array.from({ length: newer.length }, (_, i) => newer[0] + i));
   const newEndRow = precedingRows(newer.indexOf(end));
   assert.equal(h.offset - newEndRow, tail - oldEndRow, 'the first exposed frame keeps the last old message at its previous viewport row');
 
@@ -299,6 +323,36 @@ test('reversing during the old-window probe moves immediately and releases the l
   assert.equal(messages(h)[0], oldFirst);
 });
 
+test('a delayed geometry probe preserves successive equal native moves across a history shift', async t => {
+  let h, oldFirst, releaseOld, releaseNew, growth = 0;
+  h = await setup({ live: longEntries(), nativeContentRows: () => 600 + growth, prefixGrowth: () => growth,
+    onProbeReply({ to }) {
+      if (oldFirst && to?.key?.startsWith('codex_read_anchor_') && messages(h)[0] === oldFirst && !releaseOld) {
+        return new Promise(resolve => { releaseOld = resolve; });
+      }
+    },
+    onMeasurement(key) {
+      if (oldFirst && key.startsWith('codex_read_anchor_') && messages(h)[0] !== oldFirst && !releaseNew) {
+        return new Promise(resolve => { releaseNew = resolve; });
+      }
+    },
+  }); t.after(() => { releaseOld?.(); releaseNew?.(); h.close(); });
+  oldFirst = messages(h)[0];
+  await h.nativeMove(110 - h.offset);
+  await waitFor(() => releaseOld);
+  await h.nativeMove(-6);
+  await h.nativeMove(-6);
+  releaseOld();
+  await waitFor(() => releaseNew);
+  assert.equal(h.offset, 98, 'the old-window reply cannot rewind the two native moves');
+  growth = 45;
+  await h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: -6, offset: 98, contentRows: 645, bodyRows: 10 });
+  await h.nativeMove(-6);
+  releaseNew();
+  await waitFor(() => !settling(h));
+  assert.equal(h.offset, messages(h).indexOf(oldFirst) + growth + 92);
+});
+
 test('reversed movement during a painted prepend survives slow geometry and old-frame packets', async t => {
   let h, oldFirst, release, growth = 0;
   h = await setup({ live: longEntries(), nativeContentRows: () => 600 + growth, prefixGrowth: () => growth,
@@ -328,33 +382,24 @@ test('reversed movement during a painted prepend survives slow geometry and old-
   assert.equal(navigations(h), 1);
 });
 
-test('growth below the first retained item keeps the newer edge stable through trim and append', async t => {
-  let h, boundary, grown, first, trimKey, trimOffset, floorReported = false;
+test('one append evicts the far side and preserves its reading anchor through prefix growth', async t => {
+  let h, boundary, grown, first;
+  const frames = [];
   const weight = text => 12 + (text === grown ? 21 : 0);
-  const isTrimmed = texts => boundary && texts[0] !== first && texts.at(-1) === boundary;
   const body = tree => {
     const texts = tree.filter(n => n.type === 'Markdown').map(n => n.props.text);
-    const floor = isTrimmed(texts) && trimOffset === undefined ? 200 : 0;
-    return 30 + floor + texts.reduce((sum, value) => sum + weight(value), 0);
+    return Math.max(tree[0]?.props.minHeight ?? 0, 30 + texts.reduce((sum, value) => sum + weight(value), 0));
   };
   const marker = () => 3 + messages(h).slice(0, messages(h).indexOf(boundary)).reduce((sum, text) => sum + weight(text), 0);
-  h = await setup({ live: longEntries(), nativeContentRows: body, messageRows: node => weight(node.props.text), onMeasurement(key) {
-    if (!grown && key.startsWith('codex_read_anchor_') && isTrimmed(messages(h))) {
-      trimKey = key;
-      grown = messages(h).at(-2);
+  h = await setup({ live: longEntries(), nativeContentRows: body, messageRows: node => weight(node.props.text), onRender() {
+    if (boundary) {
+      const current = messages(h);
+      frames.push([current[0], current.at(-1)]);
     }
-  }, async commitScroll({ to }, { contentRows, bodyRows }, result) {
-    if (!trimKey || to?.key !== trimKey) return {};
-    if (trimOffset === undefined && result.offset !== h.offset) {
-      trimOffset = result.offset;
-    } else if (!floorReported && contentRows - bodyRows === trimOffset) {
-      // The next probe already recorded the smaller frame when the native
-      // wheel channel delivers the preceding floor change's rounded clamp.
-      floorReported = true;
-      const clamped = await h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, offset: trimOffset - 1, by: -1, contentRows, bodyRows });
-      assert.equal(clamped.offset, trimOffset);
-    }
-    return {};
+  }, onMeasurement(key) {
+    if (!boundary || !key.startsWith('codex_read_anchor_')) return;
+    const current = messages(h);
+    if (!grown && current.at(-1) !== boundary) grown = current[current.indexOf(boundary) - 1];
   } }); t.after(() => h.close());
   await h.nativeMove(-1000); await h.waitNavigation();
   first = messages(h)[0]; boundary = messages(h).at(-1);
@@ -362,13 +407,48 @@ test('growth below the first retained item keeps the newer edge stable through t
   const distance = body(h.painted) - 10 - marker();
   await h.nativeMove(1000);
   await waitFor(() => !settling(h) && messages(h).at(-1) !== boundary);
-  assert.ok(grown, 'a retained item grew while the candidate trim was still covered');
-  assert.ok(floorReported, 'the rounded floor-release report arrived after the append probe');
+  assert.ok(grown, 'a retained item grew while the replacement was still covered');
+  assert.notEqual(messages(h)[0], first, 'the same replacement released the far side');
+  assert.ok(frames.length > 1 && frames.every(([start, end]) => start === first || end !== boundary), 'every render shows the original window or an advanced window');
   assert.equal(h.offset, marker() + distance);
   const placed = h.offset;
   for (let i = 0; i < 3; i++) await h.nativeMove(4);
   assert.equal(h.offset, placed + 12, 'genuine scrolling resumes before the settled gesture expires');
   assert.equal(navigations(h), 2);
+});
+
+test('a near-end shift keeps a tall message under the viewport and retries at the physical edge', async t => {
+  const entries = longEntries();
+  let giant, revision = 1, live = entries.slice(0, 25);
+  const messageRows = node => node.props.text === giant ? 1000 : 1;
+  const nativeContentRows = tree => {
+    const messages = tree.filter(n => n.type === 'Markdown');
+    giant ??= messages[0]?.props.text;
+    const rows = 10 + messages.reduce((sum, node) => sum + messageRows(node), 0);
+    return Math.max(tree[0]?.props.minHeight ?? 0, rows);
+  };
+  const h = await setup({ revision: () => ({ revision, entries: live }), messageRows, nativeContentRows });
+  t.after(h.close);
+  const original = messages(h), end = original.at(-1);
+  assert.equal(original[0], giant);
+  await h.nativeMove(-300);
+  live = entries.slice(0, 31); revision++;
+  await h.tick(); await h.draw();
+  const max = nativeContentRows(h.painted) - 10;
+  const near = max - Math.ceil(max / 5);
+  await h.nativeMove(near - h.offset);
+  await h.waitNavigation();
+  assert.equal(navigations(h), 1);
+  assert.deepEqual(messages(h), original);
+  assert.equal(h.offset, near, 'the reader stays at the same row in the tall message');
+  await pause(200);
+  await h.nativeMove(35);
+  await h.waitNavigation();
+  assert.equal(navigations(h), 1, 'movement within the tall message does not repeat the unsafe shift');
+  await h.nativeMove(max - h.offset);
+  await waitFor(() => messages(h).at(-1) !== end && !settling(h));
+  assert.equal(navigations(h), 2);
+  assert.notEqual(messages(h)[0], giant, 'the old prefix can leave once it is above the viewport');
 });
 
 test('continuous wheel inertia crossing a prepend keeps the committed reading position', async t => {
@@ -454,6 +534,26 @@ test('one jump reaches native end after the latest frame paints without a tail m
   assert.deepEqual(samples.filter(sample => sample.before !== sample.after).map(sample => sample.after), [end]);
   assert.ok(hasMessage(h, 'message-99 '));
   assert.equal(h.offset, end);
+});
+
+test('a delayed read of the newest footer cannot undo the first upward wheel', async t => {
+  let armed = false, release;
+  const h = await setup({ live: longEntries(), nativeContentRows: 510, commitScroll({ to }) {
+    if (armed && !release && to?.key?.startsWith('codex_tail_')) return new Promise(resolve => { release = resolve; });
+    return {};
+  } });
+  t.after(() => { release?.({}); h.close(); });
+  await h.nativeMove(-15);
+  armed = true;
+  await h.nativeMove(15);
+  await waitFor(() => release);
+  const end = h.offset;
+  await h.nativeMove(-5);
+  release({});
+  await h.waitNavigation();
+  assert.equal(h.offset, end - 5);
+  assert.ok(h.samples.at(-1).args.to.key.startsWith('codex_tail_'));
+  assert.ok(h.samples.at(-1).deny, 'the footer measurement never writes an absolute position');
 });
 
 test('a later upward move releases native following even when the reported row geometry has changed', async t => {
@@ -562,11 +662,11 @@ test('rapid upward gestures during navigation do not queue another window', asyn
   let block = false;
   const live = Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
   const h = await setup({ live, onMeasurement: async key => {
-    if (block && key.startsWith('codex_history_')) { entered(); await new Promise(r => { release = r; }); }
+    if (block && key.startsWith('codex_read_anchor_')) { entered(); await new Promise(r => { release = r; }); }
   } }); t.after(h.close);
   block = true;
   h.wheel(-1, 0); await Promise.race([started, pause(2000).then(() => { throw Error('navigation did not start measurement'); })]);
-  assert.ok(h.painted.some(n => n.props.key === 'codex_history_settling_a'), 'intermediate layouts stay behind the loading layer');
+  assert.ok(!settling(h), 'the old history stays visible during its baseline measurement');
   const count = navigations(h);
   const held = h.offset;
   for (let repeat = 0; repeat < 3; repeat++) assert.equal((await upward(h, 110)).offset, held, 'loading gestures keep the current reading offset');

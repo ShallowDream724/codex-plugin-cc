@@ -1207,9 +1207,12 @@ test('1200-line file beyond 100k characters remains continuous in both direction
         const marker = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
         if (marker < 0) throw Error(`unpainted marker ${args.to.key}`);
         const preceding = nativePainted.slice(0, marker).filter(n => n.type === 'Text').length;
-        const destination = args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + preceding : 3;
+        const keyRow = args.to.key.startsWith('codex_read_anchor_') ? 3 + preceding : args.to.key.startsWith('codex_tail_') ? contentRows - 1 : 3;
+        const destination = Math.max(0, Math.min(contentRows - 10, keyRow - (args.block === 'end' ? 9 : 0)));
         const event = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
-        offset = (await host.dispatch('ui.scroll', event)).offset;
+        const result = await host.dispatch('ui.scroll', event);
+        if (result.deny) return result;
+        offset = result.offset;
       }
       return {};
     },

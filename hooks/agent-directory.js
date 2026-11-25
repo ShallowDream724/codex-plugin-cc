@@ -4,6 +4,20 @@ const finished = new Set(['completed', 'failed', 'interrupted']);
 const idOf = agent => String(agent?.agent_id || agent?.id || '');
 const timestamp = value => typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 const activityTime = agent => timestamp(agent?.last_activity_at_ms) ?? timestamp(agent?.created_at_ms);
+const compareActivity = (a, b) => (b.time ?? 0) - (a.time ?? 0)
+  || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+export function mostRecentAgent(agents) {
+  let latest;
+  for (const agent of agents) {
+    const id = idOf(agent);
+    if (!id) continue;
+    const candidate = { id, time: activityTime(agent), agent };
+    if (!latest || compareActivity(candidate, latest) < 0) latest = candidate;
+  }
+  return latest?.agent;
+}
+
 const statusLabel = agent => {
   const current = { stopping: '正在停止', unconfirmed: '停止未确认' }[agent.user_control_status];
   const task = { waiting: '等待中', unknown: '状态未知', failed: '失败', interrupted: '已停止' }[agent.status];
@@ -35,15 +49,7 @@ export function agentDirectoryModel(agents, { now = Date.now(), openOffset = 0, 
     const row = { id, name: safeName(agent), time, relativeTime: relativeAgentTime(time, now), agent };
     (finished.has(agent.status) ? completed : open).push(row);
   }
-  const compare = (a, b) => {
-    if (a.time !== b.time) {
-      if (a.time === null) return 1;
-      if (b.time === null) return -1;
-      return b.time - a.time;
-    }
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  };
-  open.sort(compare); completed.sort(compare);
+  open.sort(compareActivity); completed.sort(compareActivity);
   const page = (rows, requested) => {
     const last = Math.max(0, Math.floor((rows.length - 1) / 50) * 50);
     const offset = Math.min(last, Math.max(0, Number.isFinite(requested) ? Math.floor(requested / 50) * 50 : 0));

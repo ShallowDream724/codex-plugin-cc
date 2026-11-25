@@ -3,6 +3,8 @@
 // layout can settle after that marker, so changed frames get another sample.
 // Never await network/history work in the wheel handler.
 export const paneMarkerOffset = (e, block) => e.offset + (block === 'end' ? e.bodyRows - 1 : 0);
+export const probeDenial = 'codex-subagents: geometry probe';
+const positionDenial = 'codex-subagents: reading position changed';
 
 export function paneScroll({ scroll, later, valid, position, refresh, settleBeforeCommit = false, synchronousLayout = () => false }) {
   let pending = null, serial = 0, disposed = false;
@@ -12,11 +14,13 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
     get latest() { return latest; },
     get intent() { return intent; },
     get pending() { return !!pending; },
-    get nativeOffset() { return pending?.nativeOffset; },
+    get probing() { return pending?.probing === true; },
+    get nativeTarget() { return pending?.nativeTarget; },
+    consumeNativeTarget() { if (pending) pending.nativeTarget = null; },
     get disposed() { return disposed; },
     cancel() { disposed = true; serial++; pending = null; },
-    stage(before, above, anchor = false, movement) {
-      pending = { token: ++serial, intent, before, above, anchor, movement, staged: true, layoutChange: true, result: null };
+    stage(before, above, anchor = false, movement, options = {}) {
+      pending = { token: ++serial, intent, before, above, anchor, movement, ...options, staged: true, layoutChange: true, result: null };
     },
     observe(e) {
       if (e.origin.kind === 'person') {
@@ -50,19 +54,23 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
         ? measured.anchorOffset - reference.anchorOffset : measured.contentRows - reference.contentRows;
       request.sampledMovement = request.movement?.() ?? 0;
       const offset = reference.offset + request.sampledMovement + (request.before && (request.above || request.anchor) ? delta : 0);
+      if (request.accept && (!settleBeforeCommit || request.committing) && !request.accept(offset, measured)) {
+        request.result = null;
+        return request.committing ? { deny: positionDenial } : { ...e, offset: measured.offset };
+      }
       const result = { ...measured, offset: Math.max(0, Math.min(offset, Math.max(0, measured.contentRows - measured.bodyRows))) };
       request.result = result;
-      request.nativeOffset = settleBeforeCommit && request.before && !request.committing ? measured.offset : result.offset;
-      if (settleBeforeCommit && request.before) {
-        if (request.committing && !request.clipped) {
-          // The host can finish a rich leaf between the last probe and this
-          // dispatch. Commit the coordinate measured by the commit itself.
-          request.commitObserved = true;
-          return { ...e, offset: result.offset };
-        }
-        // The keyed scroll reveals the marker coordinate, but its native
-        // movement must not expose partially painted history to the reader.
-        return { ...e, offset: measured.offset };
+      if (request.probing) {
+        // The hook already has the geometry. Cancel the native write, which
+        // could arrive after another wheel move and restore a stale row.
+        return { deny: probeDenial };
+      }
+      if (request.committing) {
+        if (request.clipped) return { deny: positionDenial };
+        // A rich leaf may finish after the last probe. Commit the coordinate
+        // measured by this dispatch and track its actual native target.
+        request.nativeTarget = result;
+        return { ...e, offset: result.offset };
       }
       latest = result;
       if (e.origin.kind === 'person') position(result.offset);
@@ -79,7 +87,10 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
       const atomic = settleBeforeCommit && before != null;
       // A missing key means the host has not painted this revision yet. The
       // retries are bounded and run independently of native scrolling.
-      for (const delay of before ? anchor ? [0, 32, 64, 128, 256] : [0, 32, 64, 128] : [0, 16, 32, 64, 128]) {
+      const singleShift = atomic && anchor && request.singleShift;
+      const delays = singleShift ? [0, 16, 32, 64, 128, 256]
+        : before ? anchor ? [0, 32, 64, 128, 256] : [0, 32, 64, 128] : [0, 16, 32, 64, 128];
+      for (const delay of delays) {
         if (!current()) break;
         if (delay) await new Promise(resolve => later(delay, resolve));
         elapsed += delay;
@@ -88,17 +99,25 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
         if (!current()) break;
         request.result = null;
         request.block = block;
+        request.probing = settleBeforeCommit;
         let accepted = false;
-        try { accepted = !(await scroll({ to: { key }, block }))?.deny; } catch { /* Not drawn yet. */ }
+        try {
+          const response = await scroll({ to: { key }, block });
+          accepted = request.probing ? response?.deny === probeDenial : !response?.deny;
+        } catch { /* Not drawn yet. */ }
+        request.probing = false;
         if (!current()) break;
         if (accepted && request.result) {
           // An end-aligned marker can be in the first viewport after a trim.
           // The top alignment can measure that same marker after clamping.
           if (request.clipped) { block = 'start'; previous = null; continue; }
           result = request.result;
-          if (!atomic) position(result.offset);
+          if (!settleBeforeCommit) position(result.offset);
+          else if (!atomic) latest = result;
           const stable = anchor ? previous?.anchorOffset === result.anchorOffset : previous?.contentRows === result.contentRows;
-          const minimum = atomic && synchronousLayout() ? 32 : anchor ? 224 : 96;
+          // One overlapping replacement has a live prefix observer after
+          // reveal. Two painted samples can agree before the old fixed delay.
+          const minimum = singleShift ? 16 : atomic && synchronousLayout() ? 32 : anchor ? 224 : 96;
           if (!before || elapsed >= minimum && stable && previous.bodyRows === result.bodyRows) { settled = true; break; }
           previous = result;
         } else previous = null;
@@ -110,13 +129,15 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
         if ((settled || anchor || !above) && result) {
           for (let attempt = 0; attempt < 3 && current() && request.intent === intent; attempt++) {
             request.committing = true;
-            request.commitObserved = false;
             request.block = block;
+            request.result = null;
+            request.clipped = false;
             let accepted = false;
             try { accepted = !(await scroll({ to: { key }, block }))?.deny; } catch { /* Commit failed. */ }
-            if (accepted && request.commitObserved && !request.clipped) committed = { ...request.result, movement: request.sampledMovement, block };
+            request.nativeTarget = null;
             if (request.clipped) { block = 'start'; continue; }
-            if (!request.commitObserved || request.sampledMovement === (request.movement?.() ?? 0)) break;
+            if (accepted && request.result) committed = { ...request.result, movement: request.sampledMovement, block };
+            if (!request.result || request.sampledMovement === (request.movement?.() ?? 0)) break;
             // A wheel report arrived after dispatch sampled the commit target.
             // Resample before revealing the frame with that newer displacement.
           }

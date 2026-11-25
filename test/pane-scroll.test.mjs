@@ -106,14 +106,15 @@ for (const scenario of [
   assert.equal(positions.at(-1), scenario.expected);
 });
 
-test('settled measurement holds the viewport through changing geometry and commits once', async () => {
+test('desktop geometry probes make no native writes through changing geometry', async () => {
   let controller, calls = 0; const returned = [], positions = [];
   const frames = [[20, 130], [25, 150], [30, 180], [30, 190], [30, 190]];
   controller = paneScroll({ settleBeforeCommit: true, valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n),
     scroll: async () => {
       const [marker, rows] = frames[Math.min(calls++, frames.length - 1)];
-      returned.push(controller.observe(event('plugin', marker, marker - 35, rows)).offset);
-      return {};
+      const observed = controller.observe(event('plugin', marker, marker - 35, rows));
+      returned.push(observed.deny ? 'probe' : observed.offset);
+      return observed;
     },
   });
   const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
@@ -122,7 +123,7 @@ test('settled measurement holds the viewport through changing geometry and commi
   controller.observe(event('person', 35, 0, 100));
   const result = await controller.measure('marker', before, true, true);
   assert.equal(result.offset, 45);
-  assert.deepEqual(returned, [35, 35, 35, 35, 45]);
+  assert.deepEqual(returned, ['probe', 'probe', 'probe', 'probe', 45]);
   assert.deepEqual(positions, [45]);
 });
 
@@ -133,8 +134,7 @@ test('a continuously growing reading marker commits its actual coordinate in the
   controller = paneScroll({ settleBeforeCommit: true, valid: () => true, later: (_delay, run) => run(),
     position: offset => positions.push(offset), scroll: async () => {
       marker += 7;
-      controller.observe(event('plugin', marker, marker - 4, 100 + marker));
-      return {};
+      return controller.observe(event('plugin', marker, marker - 4, 100 + marker));
     },
   });
   controller.stage(before, true, true);
@@ -147,7 +147,7 @@ test('synchronous layout commits two stable anchor samples after 32ms', async ()
   let controller, calls = 0; const delays = [], positions = [];
   controller = paneScroll({ settleBeforeCommit: true, synchronousLayout: () => true, valid: () => true,
     later: (ms, fn) => { delays.push(ms); fn(); }, position: n => positions.push(n),
-    scroll: async () => { calls++; controller.observe(event('plugin', 30, -5, 140)); return {}; },
+    scroll: async () => { calls++; return controller.observe(event('plugin', 30, -5, 140)); },
   });
   const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
   controller.stage(before, true, true);
@@ -163,7 +163,7 @@ test('synchronous layout retries when geometry changes before committing', async
     later: (ms, fn) => { delays.push(ms); fn(); }, position: n => positions.push(n),
     scroll: async () => {
       const [marker, rows] = frames[Math.min(calls++, frames.length - 1)];
-      controller.observe(event('plugin', marker, marker - 35, rows)); return {};
+      return controller.observe(event('plugin', marker, marker - 35, rows));
     },
   });
   const before = { offset: 35, anchorOffset: 20, contentRows: 100, bodyRows: 10 };
@@ -177,7 +177,7 @@ test('cancelling settlement prevents a stale final commit', async () => {
   let controller, release, calls = 0;
   controller = paneScroll({ settleBeforeCommit: true, valid: () => true, position: () => assert.fail('cancelled position'),
     later: (_ms, fn) => { release = fn; },
-    scroll: async () => { calls++; controller.observe(event('plugin', 10, -10, 140)); return {}; },
+    scroll: async () => { calls++; return controller.observe(event('plugin', 10, -10, 140)); },
   });
   const measuring = controller.measure('marker', { offset: 20, contentRows: 100, bodyRows: 10 }, true);
   await Promise.resolve();
@@ -191,8 +191,8 @@ test('a denied settled commit cannot report success or confirm position', async 
   controller = paneScroll({ settleBeforeCommit: true, valid: () => true, later: (_ms, fn) => fn(), position: n => positions.push(n),
     scroll: async () => {
       calls++;
-      controller.observe(event('plugin', 10, -10, 140));
-      return calls === 4 ? { deny: 'commit rejected' } : {};
+      const observed = controller.observe(event('plugin', 10, -10, 140));
+      return calls === 4 ? { deny: 'commit rejected' } : observed;
     },
   });
   const result = await controller.measure('marker', { offset: 20, contentRows: 100, bodyRows: 10 }, true);
@@ -208,10 +208,14 @@ test('settled commits resample wheel motion that arrives while native acknowledg
   controller = paneScroll({ settleBeforeCommit: true, synchronousLayout: () => true, valid: () => true,
     later: (_ms, run) => run(), position: n => positions.push(n), scroll: async () => {
       const sample = controller.observe(event('plugin', 38, 38 - before.offset, 130));
-      assert.equal(controller.nativeOffset, sample.offset);
-      if (++calls > 2) targets.push(sample.offset);
+      if (++calls > 2) {
+        assert.equal(controller.nativeTarget.offset, sample.offset);
+        controller.consumeNativeTarget();
+        assert.equal(controller.nativeTarget, null);
+        targets.push(sample.offset);
+      } else assert.ok(sample.deny && !controller.nativeTarget);
       if (calls === 3 || calls === 4) movement += 3;
-      return {};
+      return sample;
     },
   });
   controller.stage(before, true, true, () => movement);
@@ -230,8 +234,7 @@ test('a newer trim measures the same marker after an end-aligned sample clamps a
     later: (_ms, run) => run(), position: () => {}, scroll: async ({ block }) => {
       blocks.push(block);
       const target = block === 'end' ? 0 : 4;
-      controller.observe(event('plugin', target, target - 30, 100));
-      return {};
+      return controller.observe(event('plugin', target, target - 30, 100));
     },
   });
   controller.stage(before, true, true);

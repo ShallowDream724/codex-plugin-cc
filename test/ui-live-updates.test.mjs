@@ -16,7 +16,11 @@ async function setup(handler, { acceptScroll = () => true, autoPaint = false } =
   const $ = {
     ui: {
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client', 'Image'].map((type) => [type, (props) => ({ type, props })])),
-      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => { if (args.to?.key && (!painted.some(node => node.type === 'Button' && node.props.key === args.to.key) || !acceptScroll(args))) throw Error('key not painted'); scrolls.push(args); if (args.to?.key) await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 }); },
+      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async (args) => {
+        if (args.to?.key && (!painted.some(node => node.type === 'Button' && node.props.key === args.to.key) || !acceptScroll(args))) throw Error('key not painted');
+        scrolls.push(args);
+        if (args.to?.key) return host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: 0, by: 0, contentRows: 100, bodyRows: 10 });
+      },
     },
     clock: { every(_ms, fn) { timers.push(() => autoPaint ? host.callback(fn) : fn()); return { cancel() {} }; }, after(_ms, fn) { const timer = { fn: () => host.callback(fn), cancelled: false, cancel() { this.cancelled = true; } }; afters.push(timer); return timer; } },
     state: { get: async key => { if (rendering) subscriptions.add(JSON.stringify(key)); return {}; }, set: async key => { if (autoPaint && subscriptions.has(JSON.stringify(key))) { await host.surface(() => draw()); if (afterPaint) { const callback = afterPaint; afterPaint = null; await host.surface(callback); } } return { isSet: true }; } },

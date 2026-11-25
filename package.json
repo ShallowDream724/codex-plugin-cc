@@ -1,6 +1,6 @@
 {
   "name": "codex-subagents",
-  "version": "0.2.0-rc.36",
+  "version": "0.2.0-rc.37",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",

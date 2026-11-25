@@ -12,6 +12,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   closeUI();
   const hooks = [], scrolls = [], calls = [], timers = [];
   let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0;
+  const rows = tree => nativeContentRows ?? Math.max(20, tree.filter(n => n.type === 'Markdown').length + 10);
   const surfacePending = new Set();
   const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
     if (dropPost(data)) return;
@@ -29,12 +30,14 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
             if (!nativePainted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted');
             await onMeasurement(args.to.key);
           }
-          const contentRows = nativeContentRows ?? Math.max(20, nativePainted.filter(n => n.type === 'Markdown').length + 10);
+          const contentRows = rows(nativePainted);
           const markerIndex = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
           const precedingRows = nativePainted.slice(0, markerIndex).filter(n => n.type === 'Markdown' || n.type === 'Text' && n.props.key?.startsWith('message_')).length;
           const destination = args.to === 'end' || args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
-          offset = (await host.dispatch('ui.scroll', e)).offset;
+          const result = await host.dispatch('ui.scroll', e);
+          if (result.deny) return result;
+          offset = result.offset;
         }
         return {};
       },
@@ -68,13 +71,14 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
     if (sync?.props.props.tailToken) await host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data: { action: 'tail', token: sync.props.props.tailToken } }));
   }
   await pause(80); while (surfacePending.size) await Promise.all([...surfacePending]);
-  const wheel = (direction, at = direction < 0 ? 0 : Math.max(20, painted.filter(n => n.type === 'Markdown').length + 10) - 10) => {
-    const by = at - offset; offset = at;
-    const e = { origin: { kind: 'person' }, by, offset: at, contentRows: Math.max(20, painted.filter(n => n.type === 'Markdown').length + 10), bodyRows: 10 };
-    return host.dispatch('ui.scroll', e);
+  const wheel = (direction, at = direction < 0 ? 0 : rows(painted) - 10) => {
+    const e = { origin: { kind: 'person' }, by: at - offset, offset: at, contentRows: rows(painted), bodyRows: 10 };
+    const result = host.dispatch('ui.scroll', e);
+    offset = result.offset;
+    return result;
   };
   const waitNavigation = async () => { await pause(300); while (surfacePending.size) await Promise.all([...surfacePending]); };
-  const visitEdge = async direction => { wheel(-direction, 5); await pause(200); wheel(direction); await waitNavigation(); };
+  const visitEdge = async direction => { wheel(-direction, Math.floor((rows(painted) - 10) / 2)); await pause(200); wheel(direction); await waitNavigation(); };
   return { $, draw, wheel, visitEdge, calls, scrolls, tick: () => timers[0](), waitNavigation, open: id => openAgent($, id), press: key => host.dispatch('ui.press', { requestId: 'codex_subagent_activity', element: key }), resetConstructed: () => { maxConstructed = 0; }, get maxConstructed() { return maxConstructed; }, host, get offset() { return offset; }, get painted() { return painted; }, close: () => { closed = true; closeUI(); } };
 }
 const messages = h => h.painted.filter(n => n.type === 'Markdown').map(n => n.props.text);
@@ -230,7 +234,7 @@ test('jump during a pending navigation measurement owns the final viewport', asy
   const measuring = new Promise(resolve => { started = resolve; });
   const h = await setup({
     live: Array.from({ length: 500 }, (_, i) => entry(i)),
-    onMeasurement: key => key.startsWith('codex_history_a_') && !release ? new Promise(resolve => { release = resolve; started(); }) : undefined,
+    onMeasurement: key => key.startsWith('codex_read_anchor_a_') && !release ? new Promise(resolve => { release = resolve; started(); }) : undefined,
   }); t.after(() => { release?.(); h.close(); });
   h.wheel(-1, 0);
   await Promise.race([measuring, pause(3000).then(() => { throw Error('navigation measurement did not start'); })]);
