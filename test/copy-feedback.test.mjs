@@ -36,6 +36,7 @@ test('desktop draws the copy graphic beneath the native press target, with a rea
   const [icon, hitArea] = graphic.props.children;
   assert.equal(icon.type, 'Svg');
   assert.equal(icon.props.source, copyIcon);
+  assert.equal(icon.props.alt, '复制回复'); // Desktop drops SVG nodes with blank alt text.
   assert.equal(graphic.props.overflow, 'hidden');
   assert.equal(hitArea.props.position, 'absolute');
   assert.equal(hitArea.props.children[0].type, 'Button');

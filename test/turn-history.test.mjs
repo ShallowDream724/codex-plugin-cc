@@ -60,13 +60,34 @@ test('over forty native process pages fit alongside older answers without transf
   assert.equal(opened.at(-1).id, 'answer');
 });
 
-test('historical timestamps use local Monday weeks across a year boundary and discard missing dates', () => {
-  const now = new Date(2026, 0, 5, 12), at = (year, month, day, hour, minute) => new Date(year, month - 1, day, hour, minute).getTime();
-  assert.equal(finalTimestamp(at(2026, 1, 5, 0, 4), now), '周一 00:04');
-  assert.equal(finalTimestamp(at(2026, 1, 4, 23, 59), now), '上周日 23:59');
-  assert.equal(finalTimestamp(at(2025, 12, 29, 6, 8), now), '上周一 06:08');
-  assert.equal(finalTimestamp(at(2025, 12, 28, 16, 0), now), '12月28日 16:00');
-  assert.equal(finalTimestamp(null, now), ''); assert.equal(durationLabel(null), '查看过程');
+test('historical timestamps prefer local today and yesterday across Monday and New Year', () => {
+  const monday = new Date(2026, 0, 5, 12), newYear = new Date(2026, 0, 1, 12);
+  const at = (year, month, day, hour, minute) => new Date(year, month - 1, day, hour, minute).getTime();
+  assert.equal(finalTimestamp(at(2026, 1, 5, 0, 4), monday), '今天 00:04');
+  assert.equal(finalTimestamp(at(2026, 1, 4, 23, 59), monday), '昨天 23:59');
+  assert.equal(finalTimestamp(at(2025, 12, 29, 6, 8), monday), '上周一 06:08');
+  assert.equal(finalTimestamp(at(2025, 12, 28, 16, 0), monday), '12月28日 16:00');
+  assert.equal(finalTimestamp(at(2026, 1, 1, 8, 30), newYear), '今天 08:30');
+  assert.equal(finalTimestamp(at(2025, 12, 31, 23, 59), newYear), '昨天 23:59');
+  assert.equal(finalTimestamp(at(2025, 12, 30, 16, 0), newYear), '周二 16:00');
+  assert.equal(finalTimestamp(null, monday), '');
+  assert.equal(durationLabel(null), '查看过程');
+});
+
+test('historical timestamps use local day boundaries when daylight saving starts or ends', t => {
+  const timezone = process.env.TZ;
+  process.env.TZ = 'America/New_York';
+  t.after(() => {
+    if (timezone === undefined) delete process.env.TZ;
+    else process.env.TZ = timezone;
+  });
+
+  const spring = new Date('2026-03-09T04:45:00Z');
+  assert.equal(finalTimestamp(Date.parse('2026-03-08T04:59:00Z'), spring), '上周六 23:59');
+  assert.equal(finalTimestamp(Date.parse('2026-03-08T05:00:00Z'), spring), '昨天 00:00');
+
+  const fall = new Date('2026-11-02T05:45:00Z');
+  assert.equal(finalTimestamp(Date.parse('2026-11-01T04:05:00Z'), fall), '昨天 00:05');
 });
 
 test('a history continuation can re-open its native turn metadata after cache eviction', async t => {
@@ -213,6 +234,11 @@ test('native pane folds intermediate guidance, keeps the prompt and final copy/t
   const title = byKey(desktop, 'turn_process_a:t_graphic');
   assert.equal(title.props.alignSelf, 'flex-start');
   assert.deepEqual(title.props.children.slice(0, 2).map(child => child.type), ['Text', 'Svg']);
+  assert.equal(title.props.children[1].props.alt, '收起过程');
   assert.equal(title.props.children[0].props.children[0], '用时 1分5秒');
   assert.equal(byKey(desktop, 'turn_process_a:t').type, 'Button');
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 6, 9, 23, 59) });
+  assert.equal(byKey(await draw('desktop'), 'message_time_a:t:done').props.children[0], '今天 15:42');
+  t.mock.timers.tick(60_000);
+  assert.equal(byKey(await draw('desktop'), 'message_time_a:t:done').props.children[0], '昨天 15:42');
 });

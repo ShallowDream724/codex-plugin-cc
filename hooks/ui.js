@@ -1473,7 +1473,8 @@ function renderPane($, e, next) {
     // and handler tree on those frames; only the small overlay wrapper moves.
     // No scroll timer, state write, Markdown parsing or list regrouping here.
     const currentPage = state.pages.get(state.selected);
-    const frameKey = JSON.stringify([state.generation, paneRevision, e.surface, e.props?.bodyColumns, e.props?.scroll?.bodyRows, currentPage?.navigationRequest?.token, currentPage?.navigationRequest?.ready, currentPage?.tailRequest?.token]);
+    const now = new Date();
+    const frameKey = JSON.stringify([state.generation, paneRevision, now.toDateString(), e.surface, e.props?.bodyColumns, e.props?.scroll?.bodyRows, currentPage?.navigationRequest?.token, currentPage?.navigationRequest?.ready, currentPage?.tailRequest?.token]);
     const cached = state.pages.get(state.selected)?.renderCache;
     const draft = state.controls.get(state.selected)?.draft;
     if (cached?.key === frameKey && cached.draft === draft) return cached.draw(e.props?.scroll);
@@ -1554,7 +1555,7 @@ function renderPane($, e, next) {
       const name = status || label;
       if (e.surface !== 'desktop' || typeof Svg !== 'function') return Button({ key, plain: true, label: name, onPress });
       const control = nativeGraphicButton({ Box, Button }, { key, label: name, onPress, width: 3, children: [
-        Svg({ key: `${key}_icon`, source: copyIcons[feedback?.phase] || copyIcon, alt: '', width: 15, height: 15 }),
+        Svg({ key: `${key}_icon`, source: copyIcons[feedback?.phase] || copyIcon, alt: name, width: 15, height: 15 }),
       ] });
       return hint(`${key}_hint`, control, name, 18, 0, !!status);
     };
@@ -1569,7 +1570,7 @@ function renderPane($, e, next) {
       if (entry?.type === 'turnSummary' && e.surface === 'desktop') {
         return nativeGraphicButton({ Box, Button }, { key, label, onPress: activate, gap: 0, dimColor: true, children: [
           Text({ key: `label_${key}`, dimColor: true, children: [label] }),
-          typeof Svg === 'function' ? Svg({ key: `icon_${key}`, source: disclosureIcon(expanded), alt: '', width: 12, height: 12 })
+          typeof Svg === 'function' ? Svg({ key: `icon_${key}`, source: disclosureIcon(expanded), alt: expanded ? '收起过程' : '展开过程', width: 12, height: 12 })
             : caption(`icon_${key}`, expanded ? '⌄' : '›'),
         ] });
       }
@@ -1711,7 +1712,7 @@ function renderPane($, e, next) {
           if (entry.type === 'agentMessage' && entry.message?.is_final) {
             const copy = (press = {}) => copyMessage($, id, entry, press.surface ?? e.surface);
             const action = copyButton(`message_copy_${key}`, entryKey(entry), '复制回复', copy);
-            const time = finalTimestamp(entry.completed_at_ms ?? page.turns?.get(entry.turn_id)?.completed_at_ms);
+            const time = finalTimestamp(entry.completed_at_ms ?? page.turns?.get(entry.turn_id)?.completed_at_ms, now);
             message.push(Box({ key: `message_actions_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', justifyContent: 'flex-start',
               children: [action, ...(time ? [caption(`message_time_${key}`, time)] : [])] }));
             const notice = copyNotice(`message_copy_error_${key}`, entryKey(entry), '打开完整回复');

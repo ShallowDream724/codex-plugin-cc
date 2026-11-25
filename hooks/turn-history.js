@@ -11,11 +11,19 @@ export function finalTimestamp(ms, now = new Date()) {
   if (!Number.isFinite(ms) || ms <= 0) return '';
   const date = new Date(ms);
   if (!Number.isFinite(date.getTime())) return '';
-  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (now.getDay() + 6) % 7);
-  const previous = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() - 7);
-  const next = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + 7);
-  const day = '日一二三四五六'[date.getDay()];
-  const calendar = date >= monday && date < next ? '周' + day : date >= previous && date < monday ? '上周' + day : `${date.getMonth() + 1}月${date.getDate()}日`;
+  const midnight = offset => new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset);
+  const today = midnight(0);
+  let calendar;
+  if (date >= today && date < midnight(1)) calendar = '今天';
+  else if (date < today && date >= midnight(-1)) calendar = '昨天';
+  else {
+    const mondayOffset = -((now.getDay() + 6) % 7);
+    const monday = midnight(mondayOffset);
+    const day = '日一二三四五六'[date.getDay()];
+    if (date >= monday && date < midnight(mondayOffset + 7)) calendar = '周' + day;
+    else if (date < monday && date >= midnight(mondayOffset - 7)) calendar = '上周' + day;
+    else calendar = `${date.getMonth() + 1}月${date.getDate()}日`;
+  }
   const pad = value => String(value).padStart(2, '0');
   return `${calendar} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
