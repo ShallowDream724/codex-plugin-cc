@@ -33,10 +33,10 @@ test('protects code, links, raw HTML and math across lines', () => {
   assert.equal(normalize(input), input);
 });
 
-test('display math conversion remains opt-in', () => {
-  const input = String.raw`Text \[a \[3pt] b\]`;
+test('native block and inline math normalization is limited to the desktop renderer', () => {
+  const input = String.raw`Text \(x\) before \[a \[3pt] b\]`;
   assert.equal(normalize(input), input);
-  assert.equal(normalize(input, { displayMath: true }), 'Text \n$$\na \\[3pt] b\n$$');
+  assert.equal(normalize(input, { nativeMath: true }), 'Text $x$ before \n$$\na \\[3pt] b\n$$');
 });
 
 test('handles many unmatched delimiters and long prose in linear work', () => {

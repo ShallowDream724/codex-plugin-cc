@@ -338,7 +338,7 @@ test('real Claude host runs native hook capture and local Codex question lifecyc
           assert.equal(saved.agents[0].model, replacementModel);
           assert.ok(!saved.agents[0].modelRecovery, 'a successful replacement must consume the recovery gate');
           assert.deepEqual(turns.map(frame => [frame.params.threadId, frame.params.model]), [[saved.agents[0].threadId, retiredModel], [saved.agents[0].threadId, replacementModel]]);
-          assert.deepEqual(turns[1].params.input.map(item => item.text), [continuationMessage]);
+          assert.deepEqual(turns[1].params.input.map(item => item.text), ['[Message from Claude]\n\n' + continuationMessage]);
           const turnStarts = turns.length;
           provider.beginHostResume();
           const resumed = await runChild([...args.slice(0, -3), '--resume', sessionId, 'OFFLINE_HOST_RECOVERY_REQUEST'], { cwd: directory, env }, 30000);

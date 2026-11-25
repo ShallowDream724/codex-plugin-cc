@@ -1,4 +1,6 @@
-# Claude 会收到什么 · rc.27 文案审阅
+# Claude 会收到什么
+
+rc.30 的代理摘要通过 `parent_notification.status` 区分主动汇报工具可用（`available`）、不可用（`unavailable`）和原线程登记信息尚未核实（`unknown`）。用户在侧栏为某一轮选中“把本轮最终回复发给 Claude”后，`final_report_pending` 表示该轮将在成功时交付最终回复。接管无此工具的原生线程时，限制说明为 `This Codex thread was created without the plugin’s notify_parent tool. Codex cannot add it when resuming a thread. Use the sidebar option to share the final reply with Claude.`，即“该线程创建时未登记此工具，恢复线程时无法补加，可在侧栏选择转交最终回复”。
 
 日常调用从[工具说明](#tools)和[调度 Skill](#skill)看起。模型或线程续接失败时，直接看[模型故障](#models)或[其他报错](#errors)。[工具结果与通知](#results)列出 Codex 在什么时候把什么内容交给 Claude。
 
@@ -300,7 +302,7 @@ Claude Code 可发现的技能名为 `codex-delegation`。使用 `/codex-subagen
 ```
 
 - 已核实确有动态工具时，固定提示意为“此处无法使用原客户端的动态工具。若需要这些工具，请在原 Codex 客户端继续。”工具名称来自原生会话元数据。
-- 已核实没有动态工具时，`client_tools_unavailable` 为 `{"status":"known","tools":[]}`，省略 `limitations`。
+- 已核实没有动态工具时，`client_tools_unavailable` 为 `{"status":"known","tools":[]}`，`limitations` 说明缺少主动汇报工具时可使用侧栏的最终回复转交选项。
 - 无法核实时，`client_tools_unavailable` 为 `{"status":"unknown","tools":[]}`，`limitations` 的原文是 `The original client’s dynamic tools could not be verified. If a needed tool is unavailable here, continue in the original Codex client.`，意为“未能核实原客户端的动态工具。如果此处缺少必要工具，请在原 Codex 客户端继续。”［`runtime/agents.mjs` · `followup`，`runtime/roles.mjs:53–74`］
 
 ### `list_agents`

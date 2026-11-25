@@ -30,17 +30,59 @@ const hasText = (all, value) => all.some(n => n.type === 'Text' && n.props.child
 test('copy feedback is immediate, reports actual success, and old timers do not erase newer feedback', async t => {
   let finish; const copied = [];
   const f = await fixture(t, [final('one'), final('two')], value => { copied.push(value.text); return new Promise(resolve => { finish = resolve; }); });
-  const first = f.press('message_copy_a:t:one'); await new Promise(setImmediate);
+  const control = (await f.draw()).find(n => n.props.key === 'message_copy_a:t:one');
+  assert.equal(control.type, 'Button');
+  assert.equal(control.props.onPress({ surface: 'desktop' }), undefined);
+  assert.deepEqual(copied, ['raw one']);
   assert.ok(hasText(await f.draw(), '正在复制…'));
-  finish({ isCopied: true }); await first;
+  await f.press('message_copy_a:t:one');
+  assert.deepEqual(copied, ['raw one']);
+  finish({ isCopied: true });
   assert.ok(hasText(await f.draw(), '已复制'));
-  const second = f.press('message_copy_a:t:two'); await new Promise(setImmediate);
-  finish({ isCopied: true }); await second;
+  await f.press('message_copy_a:t:two');
+  finish({ isCopied: true });
   await f.timers[0]();
   assert.ok(hasText(await f.draw(), '已复制'));
   await f.timers[1]();
   assert.ok(!hasText(await f.draw(), '已复制'));
   assert.deepEqual(copied, ['raw one', 'raw two']);
+});
+
+test('a clipped final reply reads once and copies the exact original from the desktop press', async t => {
+  const entry = { ...final('long'), data: { text: 'abc…' }, message: { is_final: true, truncated: true } };
+  const raw = '**markdown**\r\n' + '你好😀'.repeat(18000) + '\r\n';
+  let finish;
+  const copied = [];
+  const f = await fixture(t, [entry], async call => { copied.push(call); return { isCopied: true }; },
+    () => new Promise(resolve => { finish = resolve; }));
+  assert.equal(await f.press('message_copy_a:t:long'), undefined);
+  assert.ok(hasText(await f.draw(), '正在复制…'));
+  assert.deepEqual(copied, []);
+  finish({ text: raw });
+  await new Promise(setImmediate);
+  assert.deepEqual(copied, [{ text: raw, surface: 'desktop' }]);
+  assert.deepEqual(f.requests.filter(r => r.operation === 'ui_detail').map(r => r.args),
+    [{ target: 'a', turn_id: 't', item_id: 'long', view: 'message', copy: true }]);
+  assert.ok(hasText(await f.draw(), '已复制'));
+});
+
+test('long final and unavailable clipboard offer the full file and a missing helper never copies a preview', async t => {
+  const entry = { ...final('final'), message: { is_final: true, truncated: true } };
+  const file_url = 'file:///C:/Temp/complete.md';
+  let response = { file_url }, clipboardCalls = 0;
+  const f = await fixture(t, [entry], async () => { clipboardCalls++; return { isCopied: false, reason: 'no-clipboard' }; },
+    async ({ copy }) => copy === 'file' ? { file_url } : response);
+  const press = async () => { await f.press('message_copy_a:t:final'); await new Promise(setImmediate); return f.draw(); };
+  const link = all => all.some(n => n.type === 'Markdown' && n.props.text.includes(file_url));
+  assert.ok(link(await press()));
+  assert.equal(clipboardCalls, 0);
+  response = { text: 'exact source' };
+  assert.ok(link(await press()));
+  assert.equal(clipboardCalls, 1);
+  response = { error: { message: 'content unavailable' } };
+  assert.ok(hasText(await press(), '复制失败：content unavailable'));
+  assert.equal(clipboardCalls, 1);
+  assert.deepEqual(f.requests.filter(r => r.operation === 'ui_detail').map(r => r.args.copy), [true, true, 'file', true]);
 });
 
 test('diff copy preserves raw CRLF and surfaces refusal and thrown errors at the clicked record', async t => {
@@ -78,7 +120,10 @@ test('incoming author labels distinguish known user, parent and unknown historic
     { id: 'parent', turn_id: 't', type: 'parentMessage', data: { text: 'same' } },
     { id: 'old', turn_id: 'before', type: 'userMessage', data: { content: [{ type: 'text', text: 'old original message' }] } },
     { id: 'known', turn_id: 'later', type: 'userMessage', data: { message_origin: 'parent', content: [{ type: 'text', text: 'parent task' }] } },
+    { id: 'echo', turn_id: 'steer', type: 'userMessage', data: { content: [{ type: 'text', text: 'again' }] } },
+    { id: 'action:send:echo', turn_id: 'steer', type: 'parentMessage', data: { text: 'again' } },
+    { id: 'unmatched', turn_id: 'before', type: 'userMessage', data: { content: [{ type: 'text', text: 'again' }] } },
   ];
   const f = await fixture(t, entries, async () => ({ isCopied: true }));
-  assert.deepEqual((await f.draw()).filter(n => n.props.key?.startsWith('author_')).map(n => n.props.children[0]), ['User', 'Claude', '消息', 'Claude']);
+  assert.deepEqual((await f.draw()).filter(n => n.props.key?.startsWith('author_')).map(n => n.props.children[0]), ['User', 'Claude', '消息', 'Claude', 'Claude', '消息']);
 });

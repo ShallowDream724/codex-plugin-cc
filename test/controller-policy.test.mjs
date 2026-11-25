@@ -7,6 +7,7 @@ import path from 'node:path';
 import { AgentController } from '../runtime/agents.mjs';
 import { externalClientTools, loadGuidance, resolveNativeDefault } from '../runtime/roles.mjs';
 import { loadSettings } from '../runtime/settings.mjs';
+import { parentNotificationTool } from '../runtime/parent-notification.mjs';
 
 const UUID = '12345678-1234-1234-1234-123456789abc';
 test('unknown settings are rejected instead of silently applying defaults', () => {
@@ -89,7 +90,33 @@ test('adoption reports unavailable original-client tools only when present in kn
     const result = await c.dispatch('followup_task', { target: UUID, message: 'Continue' });
     assert.deepEqual(result.client_tools_unavailable, { status: 'known', tools: names });
     if (names.length) assert.match(result.limitations[0], /dynamic tools are unavailable here/);
-    else assert.equal(Object.hasOwn(result, 'limitations'), false);
+    assert.deepEqual(result.parent_notification, { status: 'unavailable', reason: 'native_tool_missing' });
+    assert.match(result.limitations.at(-1), /sidebar option to share the final reply/);
+  }
+});
+
+test('adoption restores the plugin notification tool and rejects foreign namesakes', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'adopt-notify-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'thread.jsonl');
+  const { type, ...legacyTool } = parentNotificationTool;
+  legacyTool.description = 'Send a necessary coordination message to Claude without waiting for a reply.';
+  for (const pluginTool of [parentNotificationTool, legacyTool, null]) {
+    const { client, c } = await setup(t);
+    const foreignTool = { ...parentNotificationTool, description: 'A different client’s operation' };
+    const group = { type: 'namespace', name: 'foreign', tools: [foreignTool] };
+    const meta = { type: 'session_meta', payload: { id: UUID, dynamic_tools: pluginTool ? [pluginTool, group] : [foreignTool, group] } };
+    await writeFile(file, JSON.stringify(meta) + '\n');
+    client.handler = method => method === 'thread/read' ? { thread: { id: UUID, cwd: '/native', path: file, status: { type: 'idle' } } } : undefined;
+    const agent = await c.dispatch('followup_task', { target: UUID, message: 'Continue' });
+    assert.equal(agent.parent_notification.status, pluginTool ? 'available' : 'unavailable');
+    assert.deepEqual(agent.client_tools_unavailable.tools, pluginTool ? ['foreign.notify_parent'] : ['notify_parent', 'foreign.notify_parent']);
+    const params = { threadId: UUID, turnId: agent.turn_id, tool: 'notify_parent' };
+    await c.serverRequest({ id: 1, method: 'item/tool/call', params: { ...params, namespace: 'foreign', arguments: { message: 'Foreign client text' } } });
+    assert.equal(client.lastReply.result.success, false);
+    await c.serverRequest({ id: 2, method: 'item/tool/call', params: { ...params, arguments: { message: 'Parent report' } } });
+    assert.equal(client.lastReply.result.success, !!pluginTool);
+    assert.deepEqual(c.eventsAfter(0).filter(event => event.message === 'Parent report').map(event => event.turn_id), pluginTool ? [agent.turn_id] : []);
+    assert.doesNotMatch(JSON.stringify(c.eventsAfter(0)), /Foreign client text/);
   }
 });
 

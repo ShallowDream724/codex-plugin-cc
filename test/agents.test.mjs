@@ -308,6 +308,52 @@ test('private turns retain explicit notify_parent and blocking collaboration req
   assert.equal(controller.eventsAfter()[0].message, 'Explicit coordination');
 });
 
+test('selecting parent reporting shares only the marked private turn’s final answer', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  const activity = ActivityStore.attach(client, controller); t.after(() => activity.close());
+  client.complete();
+  await controller.ackEvents(controller.nextSeq - 1);
+  const report = await controller.dispatch('ui_send', { target: agent.id, message: 'Private report prompt', report_to_parent: true });
+  assert.equal(report.turn_origin, 'user');
+  assert.equal(report.final_report_pending, true);
+  assert.equal(activity.list().agents[0].final_report_pending, true);
+  client.ask('duplicate', 'item/tool/call', { threadId: agent.thread_id, turnId: report.turn_id, tool: 'notify_parent', arguments: { message: 'Do not send twice' } });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: report.turn_id, item: { type: 'agentMessage', phase: 'commentary', text: 'Private commentary' } });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: report.turn_id, item: { type: 'agentMessage', phase: 'final_answer', text: 'Final report' } });
+  await tick();
+  assert.equal(client.replies.find(reply => reply.id === 'duplicate')?.result.success, false);
+  assert.deepEqual(controller.eventsAfter(), []);
+  client.complete(agent.thread_id, report.turn_id);
+  assert.equal(activity.list().agents[0].final_report_pending, false);
+  assert.deepEqual(controller.eventsAfter().map(e => [e.kind, e.turn_id, e.result]), [['completed', report.turn_id, 'Final report']]);
+  const privateTurn = await controller.dispatch('ui_send', { target: agent.id, message: 'Unmarked message' });
+  client.note('item/completed', { threadId: agent.thread_id, turnId: privateTurn.turn_id, item: { type: 'agentMessage', phase: 'final_answer', text: 'Unshared private final' } });
+  client.complete(agent.thread_id, privateTurn.turn_id);
+  assert.equal(controller.eventsAfter().length, 1);
+});
+
+test('steering a private turn with parent reporting requires acknowledgement for that turn', async t => {
+  for (const crossesCompletion of [false, true]) {
+    const { client, controller, spawn } = await setup(t); const agent = await spawn();
+    client.complete(); await controller.ackEvents(controller.nextSeq - 1);
+    const turn = await controller.dispatch('ui_send', { target: agent.id, message: 'Private turn' });
+    client.handler = (method, params) => {
+      if (method !== 'turn/steer') return;
+      assert.equal(params.expectedTurnId, turn.turn_id);
+      if (crossesCompletion) client.complete(agent.thread_id, turn.turn_id);
+      return { turnId: turn.turn_id };
+    };
+    const steer = await controller.dispatch('ui_send', { target: agent.id, message: 'Request the report', report_to_parent: true });
+    assert.equal(steer.final_report_pending, !crossesCompletion);
+    assert.equal(steer.delivery, crossesCompletion ? 'steer_unconfirmed' : 'steered');
+    if (!crossesCompletion) {
+      client.note('item/completed', { threadId: agent.thread_id, turnId: turn.turn_id, item: { type: 'agentMessage', phase: 'final_answer', text: 'Final report after steer' } });
+      client.complete(agent.thread_id, turn.turn_id);
+    }
+    assert.deepEqual(controller.eventsAfter().map(e => e.result), crossesCompletion ? [] : ['Final report after steer']);
+  }
+});
+
 test('private native failure details stay in the local snapshot rather than parent status', async t => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn(); client.complete();
   await controller.ackEvents(controller.nextSeq - 1);
@@ -357,7 +403,10 @@ test('private turn scope survives restart and legacy pending sends migrate by ex
   const restored = new AgentController({ client: nextClient, statePath, nativeRoleResolver: async () => undefined });
   await restored.init(); t.after(() => restored.close());
   assert.equal(restored.find(agent.id).turnOrigin, 'user'); assert.equal(restored.hasParentWork(), false);
-  nextClient.complete(agent.thread_id, 'turn-2');
+  nextClient.note('turn/completed', { threadId: agent.thread_id, turn: { id: 'turn-2', status: 'completed', items: [
+    { type: 'agentMessage', phase: 'final_answer', text: 'PRIVATE RESULT' }
+  ] } });
+  await restored.persist();
   assert.deepEqual(restored.eventsAfter().map(e => e.seq), [12, 13]);
   assert.doesNotMatch(JSON.stringify(restored.eventsAfter()), /PRIVATE/);
   const durable = JSON.parse(await readFile(statePath, 'utf8'));
@@ -948,7 +997,7 @@ test('spawn uses user sandbox defaults, injects snapshot once, queues mailbox, a
   assert.equal(client.calls.filter((c) => c.method === 'thread/start').length, 1);
   assert.equal(client.calls.filter((c) => c.method === 'thread/inject_items').length, 2);
   assert.equal(client.calls.filter((c) => c.method === 'thread/resume').length, 0);
-  assert.equal(client.calls.at(-1).params.input[0].text, 'second task');
+  assert.equal(client.calls.at(-1).params.input[0].text, '[Message from Claude]\n\nsecond task');
 });
 
 test('a restored old agent resumes once and runs repeated tasks on its existing native thread', async t => {
@@ -977,6 +1026,14 @@ test('a restored old agent resumes once and runs repeated tasks on its existing 
   for (const operation of ['followup_task', 'ui_send', 'followup_task']) {
     const current = await restored.dispatch(operation, { target: original.id, message: 'next task' });
     assert.equal(current.thread_id, original.thread_id);
+    if (operation === 'ui_send') {
+      assert.equal(current.parent_notification.status, 'available');
+      await restored.serverRequest({ id: 'resumed-notice', method: 'item/tool/call', params: {
+        threadId: current.thread_id, turnId: current.turn_id, tool: 'notify_parent', arguments: { message: 'Report from resumed private turn' },
+      } });
+      assert.equal(restoredClient.replies.at(-1).result.success, true);
+      assert.equal(restored.eventsAfter().find(event => event.turn_id === current.turn_id)?.message, 'Report from resumed private turn');
+    }
     restoredClient.complete(current.thread_id, current.turn_id);
   }
   assert.deepEqual(restoredClient.calls.map(call => call.method), ['thread/resume', 'thread/resume', 'turn/start', 'turn/start', 'turn/start']);
@@ -1104,6 +1161,139 @@ test('unclassified final fallback applies only on success and explicit final bea
   assert.equal(controller.snapshot().agents[0].result, null);
 });
 
+test('restart recovers exactly the owned native final across pages, ACK and another restart', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-owned-final-'));
+  const statePath = path.join(dir, 'state.json'), controllers = [];
+  t.after(async () => { for (const controller of controllers) await controller.close(); await rm(dir, { recursive: true, force: true }); });
+  await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: [
+    { id: 'a', threadId: 'thread', turnId: 'owned', status: 'running', turnOrigin: 'parent', result: 'Stale candidate without a turn ID' },
+  ] }));
+  const client = new MockClient();
+  client.handler = (method, p) => {
+    if (method === 'thread/read') return { thread: { status: { type: 'notLoaded' } } };
+    if (method === 'thread/turns/list') return p.cursor ? { data: [{ id: 'owned', status: 'completed' }] }
+      : { data: [{ id: 'unrelated', status: 'completed' }], nextCursor: 'more-turns' };
+    if (method === 'thread/items/list') {
+      assert.equal(p.turnId, 'owned');
+      return p.cursor ? { data: [{ turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', text: 'Owned answer' } }] }
+        : { data: [
+          { turnId: 'unrelated', item: { type: 'agentMessage', phase: 'final_answer', text: 'Wrong answer' } },
+          { turnId: 'owned', item: { type: 'agentMessage', text: 'Legacy text' } },
+        ], nextCursor: 'more-items' };
+    }
+  };
+  const restart = async () => {
+    const controller = new AgentController({ client, statePath }); controllers.push(controller);
+    await controller.init(); return controller;
+  };
+  const first = await restart();
+  client.complete('thread', 'owned');
+  assert.deepEqual(first.eventsAfter().map(e => [e.kind, e.turn_id, e.result]), [['completed', 'owned', 'Owned answer']]);
+  assert.equal(first.snapshot().agents[0].result, 'Owned answer');
+  await first.close();
+  const second = await restart();
+  assert.deepEqual(second.eventsAfter(), first.eventsAfter());
+  await second.ackSequences([second.eventsAfter()[0].seq]); await second.close();
+  const third = await restart(); client.complete('thread', 'owned');
+  assert.deepEqual(third.eventsAfter(), []);
+  assert.equal(client.calls.filter(c => c.method === 'thread/items/list').length, 2);
+  assert.ok(client.calls.every(c => !['thread/resume', 'turn/start', 'turn/steer'].includes(c.method)));
+});
+
+test('a completion crossing subscription restoration retries its own history after a transient read failure', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-resume-race-')), statePath = path.join(dir, 'state.json');
+  await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: [
+    { id: 'a', threadId: 'thread', turnId: 'owned', status: 'running', turnOrigin: 'parent' },
+  ] }));
+  const client = new MockClient(); let finished = false, attempts = 0;
+  client.handler = method => {
+    if (method === 'thread/read') return { thread: { status: { type: finished ? 'idle' : 'active' } } };
+    if (method === 'thread/turns/list') return { data: [{ id: 'owned', status: finished ? 'completed' : 'inProgress' }] };
+    if (method === 'thread/resume') {
+      finished = true; client.complete('thread', 'owned');
+      return { thread: { status: { type: 'idle' } } };
+    }
+    if (method === 'thread/items/list') {
+      if (!attempts++) throw new Error('Temporarily unavailable');
+      return { data: [{ turnId: 'owned', item: { type: 'agentMessage', phase: 'final_answer', text: 'Recovered while reattaching' } }] };
+    }
+  };
+  const controller = new AgentController({ client, statePath }); await controller.init();
+  t.after(async () => { await controller.close(); await rm(dir, { recursive: true, force: true }); });
+  if (controller.find('a').status === 'unknown') await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Missing recovered final')), 4500);
+    controller.on('event', event => { if (event.kind === 'completed') { clearTimeout(timer); resolve(); } });
+  });
+  assert.equal(attempts, 2);
+  assert.deepEqual(controller.eventsAfter().filter(e => e.kind === 'completed').map(e => e.result), ['Recovered while reattaching']);
+  assert.equal(controller.eventsAfter().some(e => e.kind === 'interrupted'), false);
+});
+
+test('restart shares only an opted-in private final from the exact accepted turn', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-parent-report-'));
+  const statePath = path.join(dir, 'state.json');
+  const client = new MockClient(), controller = new AgentController({ client, statePath });
+  t.after(async () => { await controller.close(); await rm(dir, { recursive: true, force: true }); });
+  await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: [
+    { id: 'report', threadId: 'report', turnId: 'report-turn', status: 'running', turnOrigin: 'user', parentReportTurnId: 'report-turn' },
+    { id: 'private', threadId: 'private', turnId: 'private-turn', status: 'running', turnOrigin: 'user', parentReportTurnId: 'older-turn' },
+    { id: 'failed', threadId: 'failed', turnId: 'failed-turn', status: 'running', turnOrigin: 'user', parentReportTurnId: 'failed-turn' },
+  ] }));
+  client.handler = (method, params) => {
+    if (method === 'thread/read') return { thread: { status: { type: 'notLoaded' } } };
+    if (method === 'thread/turns/list') return { data: [{
+      id: `${params.threadId}-turn`, status: params.threadId === 'failed' ? 'failed' : 'completed', error: { message: 'Private error' },
+      items: [{ type: 'agentMessage', phase: 'final_answer', text: `${params.threadId} final` }],
+    }] };
+  };
+  await controller.init();
+  assert.deepEqual(controller.eventsAfter().map(event => [event.kind, event.turn_id, event.result]), [['completed', 'report-turn', 'report final']]);
+  assert.ok(controller.snapshot().agents.every(agent => !agent.final_report_pending));
+});
+
+test('private side questions preserve the interrupted Claude assignment through explicit UI continuation', async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-resume-assignment-'));
+  const statePath = path.join(dir, 'state.json'), client = new MockClient();
+  await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents: [
+    { id: 'a', threadId: 'thread', turnId: 'cut-off', status: 'running', turnOrigin: 'parent', result: 'Uncommitted result' },
+  ] }));
+  client.handler = method => {
+    if (method === 'thread/read' || method === 'thread/resume') return { thread: { status: { type: 'idle' } } };
+    if (method === 'thread/turns/list') return { data: [{ id: 'cut-off', status: 'interrupted' }] };
+  };
+  const controller = new AgentController({ client, statePath }); await controller.init();
+  t.after(async () => { await controller.close(); await rm(dir, { recursive: true, force: true }); });
+  assert.deepEqual(controller.eventsAfter().map(e => e.kind), ['interrupted']);
+  assert.equal(controller.snapshot().agents[0].result, null);
+  assert.equal(controller.find('a').parentContinuationPending, true);
+  for (const [privateTask, message, owner] of [[true, 'Side question', 'user'], [false, '继续', 'parent'], [false, 'Independent question', 'user']]) {
+    const response = await controller.dispatch('ui_send', { target: 'a', message, ...(privateTask ? { private_task: true } : {}) });
+    assert.equal(response.turn_origin, owner);
+    client.note('turn/completed', { threadId: 'thread', turn: { id: response.turn_id, status: 'completed', items: [
+      { type: 'agentMessage', phase: 'final_answer', text: message === '继续' ? 'Claude final' : 'Private response' }
+    ] } });
+  }
+  assert.deepEqual(controller.eventsAfter().map(e => [e.kind, e.result]), [['interrupted', undefined], ['completed', 'Claude final']]);
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /Side question|Private response|继续|Uncommitted/);
+  assert.equal(controller.find('a').parentContinuationPending, false);
+});
+
+test('interrupt suppresses both stale items from the previous turn and the interrupted turn’s candidate final', async t => {
+  const { client, controller, spawn } = await setup(t);
+  const agent = await spawn();
+  const item = (turnId, text) => client.note('item/completed', { threadId: agent.thread_id, turnId, item: { type: 'agentMessage', phase: 'final_answer', text } });
+  item(agent.turn_id, 'Previous final'); client.complete();
+  await controller.ackSequences([controller.eventsAfter()[0].seq]);
+  const followup = await controller.dispatch('followup_task', { target: agent.id, message: 'Another task' });
+  item(followup.turn_id, 'Uncommitted final');
+  assert.equal(controller.snapshot().agents[0].result, null);
+  await controller.dispatch('interrupt_agent', { target: agent.id });
+  item(agent.turn_id, 'Previous final'); client.complete(agent.thread_id, followup.turn_id, 'interrupted');
+  assert.equal(controller.snapshot().agents[0].result, null);
+  assert.deepEqual(controller.eventsAfter().map(e => [e.kind, e.turn_id]), [['interrupted', followup.turn_id]]);
+  assert.doesNotMatch(JSON.stringify(controller.eventsAfter()), /Previous final|Uncommitted final/);
+});
+
 test('verified descendants forward only questions and approvals to root and retain wire routing', async (t) => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn();
   client.note('thread/started', { thread: { id: 'child', parentThreadId: 'thread-1' } });
@@ -1199,11 +1389,26 @@ test('descendant pending requests clear only on their own lifecycle or controlle
 test('notify_parent returns dynamic tool response and unknown requests are rejected', async (t) => {
   const { client, controller, spawn } = await setup(t); await spawn();
   client.ask('notice', 'item/tool/call', { threadId: 'thread-1', turnId: 'turn-1', tool: 'notify_parent', arguments: { message: 'Need a decision' } });
-  client.ask('invalid', 'item/tool/call', { threadId: 'thread-1', tool: 'notify_parent', arguments: {} });
+  client.ask('invalid', 'item/tool/call', { threadId: 'thread-1', turnId: 'turn-1', tool: 'notify_parent', arguments: {} });
   client.ask('unknown', 'something/new', { threadId: 'thread-1' }); await tick();
-  assert.deepEqual(client.replies[0].result, { contentItems: [{ type: 'inputText', text: 'Delivered to parent.' }], success: true });
-  assert.equal(client.replies[1].result.success, false); assert.equal(client.rejected[0].code, -32601);
+  assert.deepEqual(client.replies.find(reply => reply.id === 'notice')?.result, { contentItems: [{ type: 'inputText', text: 'Queued for delivery to Claude.' }], success: true });
+  assert.equal(client.replies.find(reply => reply.id === 'invalid')?.result.success, false); assert.equal(client.rejected[0].code, -32601);
   assert.equal(controller.eventsAfter(0)[0].message, 'Need a decision');
+});
+
+test('nested and namespaced notification calls cannot report to Claude', async t => {
+  const { client, controller, spawn } = await setup(t); const agent = await spawn();
+  client.note('thread/started', { thread: { id: 'child', source: { subAgent: { thread_spawn: { parent_thread_id: agent.thread_id } } } } });
+  client.note('turn/started', { threadId: 'child', turn: { id: 'child-turn' } });
+  const args = { tool: 'notify_parent', arguments: { message: 'Do not disclose' } };
+  client.ask('child-notice', 'item/tool/call', { ...args, threadId: 'child', turnId: 'child-turn' });
+  client.ask('foreign-notice', 'item/tool/call', { ...args, threadId: agent.thread_id, turnId: agent.turn_id, namespace: 'foreign' });
+  await tick();
+  const nested = client.replies.find(reply => reply.id === 'child-notice')?.result;
+  assert.equal(nested?.success, false);
+  assert.match(nested.contentItems[0].text, /Codex parent agent/);
+  assert.equal(client.rejected.find(reply => reply.id === 'foreign-notice')?.code, -32601);
+  assert.deepEqual(controller.eventsAfter(), []);
 });
 
 test('send and followup steer running turn; interrupt never starts a new turn', async (t) => {
@@ -1505,13 +1710,15 @@ test('durable journal preserves cached usage and result, ack retains sequence, r
   await assert.rejects(restarted.dispatch('answer_agent', { target: agent.id, request_id: 'q', answer: {} }));
 });
 
-test('client close rejects outstanding calls and close marks active agents interrupted', async (t) => {
+test('transport loss and an unconfirmed shutdown interrupt leave the exact turn recoverable', async (t) => {
   const { client, controller, spawn } = await setup(t); const agent = await spawn();
   client.handler = (method) => { if (method === 'turn/steer') return new Promise(() => {}); };
   const sending = controller.dispatch('send_message', { target: agent.id, message: 'pending' });
-  client.emit('closed'); await assert.rejects(sending, /closed/); assert.equal(controller.snapshot().agents[0].status, 'failed');
+  client.emit('closed'); await assert.rejects(sending, /closed/); assert.equal(controller.snapshot().agents[0].status, 'unknown');
+  assert.equal(controller.find(agent.id).reconcileTurnId, agent.turn_id);
   const second = await setup(t); await second.spawn(); await second.controller.close();
-  assert.equal(second.controller.snapshot().agents[0].status, 'interrupted');
+  assert.equal(second.controller.snapshot().agents[0].status, 'unknown');
+  assert.equal(second.controller.find('thread-1').reconcileTurnId, 'turn-1');
 });
 
 test('close interrupts known root and descendant turns once and prevents new work or overflow recovery', async (t) => {
@@ -1552,7 +1759,7 @@ test('native interruption failures do not prevent shutdown and already closed tr
   await controller.close();
   assert.equal(client.calls.filter((call) => call.method === 'turn/interrupt').length, 2);
   assert.equal(controller.closed, true);
-  assert.equal(controller.snapshot().agents[0].status, 'interrupted');
+  assert.equal(controller.snapshot().agents[0].status, 'unknown');
   assert.deepEqual(controller.snapshot().agents[0].pending_requests, []);
   const other = await setup(t); await other.spawn(); other.client.emit('closed');
   await other.controller.close();
@@ -1570,7 +1777,10 @@ test('followup start rejection is terminal while ambiguous starts require reconc
     assert.equal(current.status, rpcRejected ? 'failed' : 'unknown');
     assert.equal(current.turn_id, null);
     assert.equal(current.error.reason, rpcRejected ? 'turn_start_rejected' : 'turn_start_outcome_unknown');
+    assert.equal(controller.eventsAfter().at(-1).turn_id, null, 'an unbound followup cannot be attributed to the previous turn');
     if (!rpcRejected) {
+      client.note('turn/started', { threadId: 'thread-1', turn: { id: agent.turn_id } });
+      assert.equal(controller.find(agent.id).status, 'unknown');
       assert.match(current.error.recovery, /native Codex thread thread-1/);
       const count = client.calls.filter((call) => call.method === 'turn/start').length;
       await assert.rejects(controller.dispatch('followup_task', { target: agent.id, message: 'duplicate' }), /outcome is unknown/);
@@ -1759,7 +1969,7 @@ test('persisted unknown starts reconcile idle metadata before an explicit new fo
     assert.deepEqual(restartedClient.calls[0], { method: 'thread/read', params: { threadId: 'thread-1', includeTurns: false } });
     assert.equal(restartedClient.calls.filter((call) => call.method === 'thread/turns/list').length, 0);
     const starts = restartedClient.calls.filter((call) => call.method === 'turn/start');
-    assert.equal(starts.length, 1); assert.equal(starts[0].params.input[0].text, 'EXPLICIT NEW TASK');
+    assert.equal(starts.length, 1); assert.equal(starts[0].params.input[0].text, '[Message from Claude]\n\nEXPLICIT NEW TASK');
     assert.equal(restarted.eventsAfter(0).filter((event) => event.reason === 'outcome_reconciled').length, 1);
   }
 });
@@ -1826,7 +2036,9 @@ test('persisted unknown active work restores subscription and steers without sta
   assert.deepEqual(restartedClient.calls.map((call) => call.method), ['thread/read', 'thread/resume', 'thread/turns/list', 'turn/steer']);
   assert.deepEqual(restartedClient.calls[1].params, { threadId: 'thread-1', excludeTurns: true, approvalPolicy: 'never', sandbox: 'danger-full-access' });
   assert.equal(restarted.find(agent.id).loaded, true);
-  restartedClient.complete('thread-1', 'native-running');
+  restartedClient.note('turn/completed', { threadId: 'thread-1', turn: { id: 'native-running', status: 'completed', items: [
+    { type: 'agentMessage', phase: 'final_answer', text: 'Recovered response' }
+  ] } });
   assert.equal(restarted.snapshot().agents[0].status, 'completed');
 });
 

@@ -8,7 +8,7 @@ const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.
 const entry = i => ({ id: `m${i}`, turn_id: 't', type: 'agentMessage', data: { text: `message-${i}` } });
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, shortViewport = false, nativeContentRows, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
+async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, shortViewport = false, nativeContentRows, vectorControls = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
   closeUI();
   const hooks = [], scrolls = [], calls = [], timers = [];
   let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0;
@@ -19,17 +19,17 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   } };
   const $ = {
     ui: {
-      resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Client'].map(type => [type, props => { constructed++; return { type, props }; }])),
+      resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Client', ...(vectorControls ? ['Svg'] : [])].map(type => [type, props => { constructed++; return { type, props }; }])),
       open: async () => { nativePainted = painted; return { isPlaced: true }; }, invalidate() {},
       scroll: async args => {
         scrolls.push(args);
-        if (args.to?.key) {
-          if (!nativePainted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted');
-          await onMeasurement(args.to.key);
+        if (args.to?.key || args.to === 'end') {
+          if (args.to.key && (args.to.key.length > 256 || !nativePainted.some(n => n.type === 'Button' && n.props.key === args.to.key))) throw Error('key not painted');
+          if (args.to.key) await onMeasurement(args.to.key);
           const contentRows = nativeContentRows ?? Math.max(20, nativePainted.filter(n => n.type === 'Markdown').length + 10);
           const markerIndex = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
           const precedingRows = nativePainted.slice(0, markerIndex).filter(n => n.type === 'Markdown' || n.type === 'Text' && n.props.key?.startsWith('message_')).length;
-          const destination = args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
+          const destination = args.to === 'end' || args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
           offset = (await host.dispatch('ui.scroll', e)).offset;
         }
@@ -54,7 +54,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
     painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}) } } }, () => null));
     maxConstructed = Math.max(maxConstructed, constructed);
     const sync = painted.find(n => n.type === 'Client' && n.props.module === './navigation-sync.js');
-    if (autoPost && sync) navigationSync(sync.props.props, surface);
+    if ((typeof autoPost === 'function' ? autoPost() : autoPost) && sync) navigationSync(sync.props.props, surface);
     return painted;
   };
   await openAgent($, 'a'); await draw();
@@ -80,6 +80,58 @@ const older = h => h.painted.find(n => n.type === 'Button' && n.props.key?.start
 
 const upward = (h, contentRows = 10, by = -1) => h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, by, offset: 0, contentRows, bodyRows: 10 });
 const navigations = h => h.host.calls.filter(call => call.event === 'ui.message' && call.input.data?.action === 'navigate').length;
+
+const longEntries = () => Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
+
+test('one prepend keeps its native reading marker even with long source item IDs', async t => {
+  const h = await setup({ live: longEntries().map(e => ({ ...e, id: 'x'.repeat(270) + e.id })) }); t.after(h.close);
+  const first = messages(h)[0];
+  h.wheel(-1); await h.waitNavigation();
+  assert.notEqual(messages(h)[0], first);
+  assert.ok(messages(h).includes(first));
+  assert.ok(h.scrolls.every(call => (call.to?.key?.length ?? 0) <= 256));
+});
+
+test('one downward movement reaching the rounded desktop end loads the next window', async t => {
+  const h = await setup({ live: longEntries() }); t.after(h.close);
+  h.wheel(-1); await h.waitNavigation();
+  const last = messages(h).at(-1), rows = messages(h).length + 10;
+  assert.ok(!last.startsWith('message-99 '));
+  await h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: 4, offset: rows - 10 - 2, contentRows: rows, bodyRows: 10 });
+  await h.waitNavigation();
+  assert.notEqual(messages(h).at(-1), last);
+});
+
+test('continuous wheel inertia crossing a prepend keeps the committed reading position', async t => {
+  const h = await setup({ live: longEntries() }); t.after(h.close);
+  h.wheel(-1);
+  const wheel = setInterval(() => upward(h, messages(h).length + 10, -3), 24);
+  t.after(() => clearInterval(wheel));
+  await h.waitNavigation();
+  const held = h.offset;
+  assert.ok(held > 0, 'the previous top record has been positioned after the prepend');
+  await pause(300);
+  assert.equal((await upward(h, messages(h).length + 10, -3)).offset, held);
+  assert.equal(navigations(h), 1, 'events continuing after settlement belong to the same gesture');
+  clearInterval(wheel);
+  await pause(210);
+  await upward(h, messages(h).length + 10); await h.waitNavigation();
+  assert.equal(navigations(h), 2, 'the next upward gesture can load on its first movement');
+});
+
+test('jump from older history reaches the true end even while the new sync client is suspended', async t => {
+  let mounted = true;
+  const h = await setup({ live: longEntries(), vectorControls: true, autoPost: () => mounted }); t.after(h.close);
+  h.wheel(-1); await h.waitNavigation();
+  assert.ok(!hasMessage(h, 'message-99 '));
+  mounted = false;
+  const prior = h.scrolls.length;
+  await h.host.surface(() => h.host.dispatch('ui.message', { element: 'codex_jump_a_viewport', data: { action: 'activate', expanded: false } }));
+  await h.draw();
+  assert.ok(hasMessage(h, 'message-99 '));
+  assert.ok(h.scrolls.slice(prior).some(call => call.to === 'end'), 'the click commits native end in its own registered frame');
+  assert.equal(h.offset, Math.max(10, messages(h).length));
+});
 
 test('short viewport accepts each new upward gesture without an impossible offset', async t => {
   const h = await setup({ nativeContentRows: 10, history: args => {

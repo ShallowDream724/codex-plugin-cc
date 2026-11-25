@@ -1,4 +1,4 @@
-import { normalizeDisplayMath } from './math-markdown.js';
+import { normalizeMath } from './math-markdown.js';
 
 const punctuation = /[\p{P}\p{S}]/u;
 const letterOrNumber = /[\p{L}\p{N}]/u;
@@ -171,7 +171,7 @@ function repairStrong(text) {
 }
 
 // This function is for a rendering copy only; persisted messages stay intact.
-export function normalizeMessageMarkdown(text, { displayMath = false } = {}) {
+export function normalizeMessageMarkdown(text, { nativeMath = false } = {}) {
   const repaired = repairStrong(text);
-  return displayMath ? normalizeDisplayMath(repaired) : repaired;
+  return nativeMath ? normalizeMath(repaired, { inline: true }) : repaired;
 }

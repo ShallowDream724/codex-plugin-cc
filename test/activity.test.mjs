@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ActivityStore } from '../runtime/activity.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { toolSections, communicationFailure } from '../hooks/tool-presentation.js';
@@ -124,6 +126,38 @@ test('bulk message and communication pages preserve long text within the process
   await assert.rejects(() => store.detail({ target: 'a', turn_id: 'turn', item_id: 'body', view: 'communication', bulk: true, export: true }), /Invalid bulk/);
   assert.equal(calls, before);
   await store.close();
+});
+
+test('copy reads one exact item and exports content outside either host limit', async t => {
+  const { client, store } = fixture();
+  t.after(() => store.close());
+  let text = '😀'.repeat(499999) + '\r\n', calls = 0;
+  client.request = async (method, args) => {
+    calls++;
+    assert.equal(method, 'thread/items/read');
+    const item = args.itemIds[0] === 'diff'
+      ? { id: 'diff', type: 'fileChange', changes: [{ path: 'x.py', kind: 'update', diff: text }] }
+      : { id: 'reply', type: 'agentMessage', text };
+    return { data: [{ turnId: 'turn', item }] };
+  };
+  const args = { target: 'a', turn_id: 'turn', item_id: 'reply', view: 'message', copy: true };
+  assert.deepEqual(await store.detail(args), { text });
+  assert.equal(calls, 1);
+  for (const outside of [text + 'x', '\u0000'.repeat(750000)]) {
+    text = outside;
+    const result = await store.detail(args);
+    assert.equal(result.text, undefined);
+    assert.equal(fileURLToPath(result.file_url), result.file_path);
+    assert.equal(readFileSync(result.file_path, 'utf8'), text);
+  }
+  text = '@@ -1 +1 @@\r\n-old\r\n+new\r\n';
+  const diff = { target: 'a', turn_id: 'turn', item_id: 'diff', file_path: 'x.py', copy: true };
+  assert.deepEqual(await store.detail(diff), { text });
+  const exported = await store.detail({ ...diff, copy: 'file' });
+  assert.equal(readFileSync(exported.file_path, 'utf8'), text);
+  assert.equal(calls, 5);
+  await assert.rejects(() => store.detail({ ...args, offset: 1 }), /Invalid copy/);
+  assert.equal(calls, 5);
 });
 
 test('communication export creates a reusable complete owned Markdown snapshot', async () => {
@@ -322,6 +356,17 @@ test('previews bound deep data and image payloads while details format native it
   client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'later-turn', item: { id: 'quoted-guidance', type: 'userMessage', content: [{ text: quoted }] } } });
   assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').preview, quoted);
   assert.equal(store.revision({ target: 'a' }).entries.find(entry => entry.id === 'quoted-guidance').data.message_origin, undefined);
+});
+
+test('labels a native Claude follow-up after reopening and exposes its exact body', async () => {
+  const { client, store } = fixture();
+  const text = '  Keep the first two spaces.\r\n[Message from Claude]';
+  const item = { id: 'followup', type: 'userMessage', content: [{ type: 'text', text: `[Message from Claude]\n\n${text}` }] };
+  client.request = async (method) => method === 'thread/turns/list' ? { data: [{ id: 'turn' }] } : { data: [{ turnId: 'turn', item }] };
+  const { entries: [entry] } = await store.history({ target: 'a' });
+  assert.equal(entry.data.message_origin, 'parent');
+  assert.equal((await store.detail({ target: 'a', turn_id: 'turn', item_id: 'followup', view: 'message' })).text, text);
+  assert.equal(item.content[0].text, `[Message from Claude]\n\n${text}`);
 });
 
 test('tool call titles survive live and deferred history projection without reading output titles', async () => {
@@ -721,8 +766,9 @@ test('media detail lazily decodes mixed protocol images, pages them, and cleans 
 test('media rejects invalid data, preserves original paths and enforces record ownership', async () => {
   const { client, store } = fixture();
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=';
-  const file = fileURLToPath(new URL('./media-original.png', import.meta.url));
-  const { writeFile, unlink } = await import('node:fs/promises');
+  const { mkdtemp, writeFile, unlink, rmdir } = await import('node:fs/promises');
+  const directory = await mkdtemp(join(tmpdir(), 'codex-original-image-'));
+  const file = join(directory, 'media-original.png');
   await writeFile(file, Buffer.from(png, 'base64'));
   try {
     const item = { id: 'media', type: 'dynamicToolCall', result: { contentItems: [
@@ -743,7 +789,7 @@ test('media rejects invalid data, preserves original paths and enforces record o
     client.request = async () => ({ data: [{ turnId: 'turn', item: { id: 'media', type: 'imageView', path: file } }] });
     const local = (await store.detail(args)).images[0]; assert.equal(local.path, file); assert.equal(local.previewable, true);
     await store.close(); assert.equal(readFileSync(file).toString('base64'), png);
-  } finally { await unlink(file); }
+  } finally { await unlink(file); await rmdir(directory); }
 });
 
 test('non-PNG image bytes stay intact and unrelated business data stays text', async () => {

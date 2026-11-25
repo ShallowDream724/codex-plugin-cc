@@ -13,7 +13,7 @@ const cellHeight = 24;
 
 function desktopViewport({ clientHeight = 216, paddingY = 0, chromeHeight = 196 } = {}) {
   const bodyRows = Math.floor((clientHeight - paddingY) / cellHeight);
-  let painted = [], scrollTop = 0, delayedHeight = 0;
+  let painted = [], scrollTop = 0, delayedHeight = 0, following = false;
   const scrollHeight = () => {
     const answer = painted.find(node => node.type === 'Markdown' && node.props.text.startsWith('Answer line'));
     return paddingY + (answer ? chromeHeight + answer.props.text.split('\n\n').length * cellHeight + delayedHeight : 1500);
@@ -25,20 +25,22 @@ function desktopViewport({ clientHeight = 216, paddingY = 0, chromeHeight = 196 
   const event = (kind, offset) => ({ origin: { kind }, offset, by: offset - offsetAt(scrollTop), contentRows: contentRows(), bodyRows });
   const personScroll = async (top, emit) => {
     const target = clamp(top, maxScrollTop());
+    if (target !== scrollTop) following = false;
     const sample = event('person', offsetAt(target));
     const result = await emit(sample);
     scrollTop = result.offset === sample.offset ? target : clamp(result.offset * cellHeight, maxScrollTop());
   };
   return {
-    paint(tree) { painted = nodes(tree); },
+    paint(tree) { painted = nodes(tree); if (following) scrollTop = maxScrollTop(); },
     get renderScroll() { return { offset: offsetAt(scrollTop), bodyRows }; },
     get atBottom() { return scrollTop === maxScrollTop(); },
     get personBottom() { return offsetAt(maxScrollTop()); },
     get reportedEnd() { return contentRows() - bodyRows; },
-    commit(offset) { scrollTop = clamp(offset * cellHeight, maxScrollTop()); },
+    commit(offset, followEnd) { following = followEnd; scrollTop = followEnd ? maxScrollTop() : clamp(offset * cellHeight, maxScrollTop()); },
     personScroll,
     reflow(height, emit) {
       delayedHeight += height;
+      if (following) { scrollTop = maxScrollTop(); return; }
       return personScroll(scrollTop, emit);
     },
     pluginEvent({ to, block }) {
@@ -82,7 +84,7 @@ function harness(t, { viewportGeometry } = {}) {
         const event = viewport ? viewport.pluginEvent(args) : { origin: { kind: 'plugin' }, by: -100, offset: 0, contentRows: 500, bodyRows: 24 };
         if (!event) return { deny: 'no element of its own is drawn under that key' };
         const e = await host.dispatch('ui.scroll', event, e => e);
-        viewport?.commit(e.offset);
+        viewport?.commit(e.offset, args.to === 'end' && e.offset === event.offset);
         scrolls.push(e.offset); return {};
       },
     },
@@ -312,9 +314,9 @@ test('late Markdown layout follows the bottom only while the reader is at the en
   const bridgeCalls = h.calls.length;
 
   await h.reflow(18 * cellHeight);
-  assert.equal(h.viewport.atBottom, false, 'the newly laid-out answer extends beyond the old bottom');
-  await settle(); await h.syncTail();
-  assert.ok(h.viewport.atBottom, 'late growth reveals the new end without another backend revision');
+  await h.reflow(27 * cellHeight);
+  assert.ok(h.viewport.atBottom, 'native end tracks successive layout passes even without any scroll or revision notification');
+  assert.equal((await h.tailSyncNode()).props.props.tailToken, 0);
   assert.equal(h.calls.length, bridgeCalls);
 
   await h.scrollTo((h.viewport.personBottom - 5) * cellHeight);
@@ -322,6 +324,9 @@ test('late Markdown layout follows the bottom only while the reader is at the en
   await h.reflow(12 * cellHeight); await settle();
   assert.equal((await h.tailSyncNode()).props.props.tailToken, 0, 'layout growth must not queue a jump while reading');
   assert.equal(h.viewport.renderScroll.offset, readingOffset);
+  await h.scrollTo(Infinity); await h.syncTail();
+  await h.reflow(22 * cellHeight);
+  assert.ok(h.viewport.atBottom, 'returning to the physical bottom resumes native following before another revision');
 });
 
 test('selected agent ignores a late list response and remains reachable from directory after completion', async t => {

@@ -587,7 +587,7 @@ test('a cross-series choice pins the model and recovery replay identifies its or
   assert.deepEqual(reopened.client.writes().map(call => [call.method, call.params.threadId, call.params.model]), [
     ['thread/resume', THREAD, SOL], ['turn/start', THREAD, SOL],
   ]);
-  assert.deepEqual(reopened.client.writes().at(-1).params.input.map(item => item.text), ['Continue the same task']);
+  assert.deepEqual(reopened.client.writes().at(-1).params.input.map(item => item.text), ['[Message from Claude]\n\nContinue the same task']);
   reopened.client.complete(recovered.turn_id);
 
   reopened.client.catalog.unshift({ model: OLD });

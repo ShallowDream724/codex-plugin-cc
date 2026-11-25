@@ -1,3 +1,5 @@
+export const claudeMessagePrefix = '[Message from Claude]\n\n';
+
 // Extract only messages sent by this agent, never nested agent state or tool output.
 export function communication(item, threadId) {
   if (!item || typeof item !== 'object') return null;

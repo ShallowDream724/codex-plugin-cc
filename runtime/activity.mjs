@@ -4,9 +4,12 @@ import { toolOutputText } from '../shared/tool-output.mjs';
 import { collectImages, sanitizeMedia } from '../shared/tool-media.mjs';
 import { materializeImage, pngDimensions } from './tool-media-files.mjs';
 import { RolloutMedia } from './rollout-media.mjs';
+import { parentNotificationCapability, parentReportPending } from './parent-notification.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
-import { communication, safeBoundary } from '../shared/communication.mjs';
-import { fileChanges, fileChangeSummary, fileChangePage } from '../shared/file-changes.mjs';
+import { finishedTurn, processItem } from '../shared/turn-history.mjs';
+import { claudeMessagePrefix, communication, safeBoundary } from '../shared/communication.mjs';
+import { fileChanges, fileChangeSummary, fileChangePage, fileChangeSource } from '../shared/file-changes.mjs';
+import { MAX_CLIPBOARD_LENGTH } from '../shared/clipboard.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, writeFile, rename, unlink, rmdir, access, open, stat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
@@ -25,6 +28,7 @@ const METADATA_CONCURRENCY = 4;
 const METADATA_TIMEOUT_MS = 800;
 const METADATA_RETRY_MS = 30000;
 const nativeTimeMs = value => Number.isFinite(value) && value > 0 && Number.isSafeInteger(value * 1000) ? value * 1000 : null;
+const timestamp = value => Number.isSafeInteger(value) && value > 0 ? value : undefined;
 const BINARY = /^(?:base64|imageData|image_data|b64_json)$/i;
 // This is a presentation projection only: it never changes the model's input or
 // native history. Account for keys, values, depth and element count together.
@@ -156,6 +160,10 @@ function removeGuidance(item, guidance) {
       } catch { /* Ordinary user text remains visible. */ }
     }
     return { ...item, type: 'directUserMessage', text, ...(attachments.length ? { attachments } : {}) };
+  }
+  if (item.content[0]?.text?.startsWith(claudeMessagePrefix)) {
+    const [first, ...rest] = item.content;
+    return { ...item, message_origin: 'parent', content: [{ ...first, text: first.text.slice(claudeMessagePrefix.length) }, ...rest] };
   }
   const legacyCollaboration = 'Claude is your parent agent. When important design questions, disagreements or better approaches arise, discuss them before substantial implementation, briefly giving evidence, a recommendation and tradeoffs. Use request_user_input when an answer is needed before continuing; use notify_parent for consequential coordination, not routine progress. Your own subagents remain available.';
   const parentPrefixes = [guidance?.collaboration?.trim(), legacyCollaboration, 'Claude is your parent agent.'].filter(Boolean);
@@ -353,9 +361,11 @@ export class ActivityStore {
   summary(a) { return { id: a.id, agent_id: a.id, name: (typeof a.name === 'string' && a.name.trim() ? a.name : a.threadName), status: a.status, activity: a.activity,
     created_at_ms: a.createdAtMs ?? null, last_activity_at_ms: a.lastActivityAtMs ?? null,
     model: a.model, reasoning_effort: a.effort, context_source: a.contextSource ?? 'unknown',
+    turn_origin: a.turnOrigin ?? 'parent', parent_notification: parentNotificationCapability(a), final_report_pending: parentReportPending(a),
     permissions_mode: this.controller.settings?.permissionsMode ?? null,
     context_used_tokens: Number.isSafeInteger(a.tokenUsage?.last?.totalTokens) && a.tokenUsage.last.totalTokens >= 0 ? a.tokenUsage.last.totalTokens : null,
     context_limit_tokens: Number.isSafeInteger(a.tokenUsage?.modelContextWindow) && a.tokenUsage.modelContextWindow > 0 ? a.tokenUsage.modelContextWindow : null,
+    parent_continuation_pending: a.parentContinuationPending === true && finishedTurn(a),
     user_paused: a.userPaused === true, user_control_status: a.userControlStatus ?? null }; }
   list() {
     const agents = [...this.controller.agents.values()];
@@ -435,8 +445,20 @@ export class ActivityStore {
     return item;
   }
   remember(map, key, value) { map.delete(key); map.set(key, value); if (map.size > 256) map.delete(map.keys().next().value); }
+  rememberTurn(threadId, turn) {
+    const key = `${threadId}:${turn.id}`, previous = this.turnStates.get(key);
+    const started = nativeTimeMs(turn.startedAt) ?? previous?.started_at_ms;
+    const ended = nativeTimeMs(turn.completedAt) ?? previous?.completed_at_ms;
+    const duration = Number.isSafeInteger(turn.durationMs) && turn.durationMs >= 0 ? turn.durationMs
+      : previous?.duration_ms ?? (ended >= started ? ended - started : undefined);
+    const meta = { id: turn.id, status: finishedTurn(previous) ? previous.status : turn.status ?? previous?.status,
+      ...(started != null ? { started_at_ms: started } : {}), ...(ended != null ? { completed_at_ms: ended } : {}),
+      ...(Number.isFinite(duration) ? { duration_ms: duration } : {}) };
+    this.remember(this.turnStates, key, meta);
+    return meta;
+  }
   stage(item, threadId, turnId, entry = item) {
-    if (entry.completedAtMs != null || item.completedAtMs != null || this.turnStates.get(`${threadId}:${turnId}`) === 'completed') return 'completed';
+    if (entry.completedAtMs != null || item.completedAtMs != null || this.turnStates.get(`${threadId}:${turnId}`)?.status === 'completed') return 'completed';
     return entry.startedAtMs != null || item.startedAtMs != null ? 'started' : undefined;
   }
   observe(message) {
@@ -452,14 +474,26 @@ export class ActivityStore {
       if (visible(p.item)) {
         const previous = this.bucket(agent.id).entries.find(entry => entry.turn_id === p.turnId && entry.id === p.item.id);
         const startedAtMs = p.item.startedAtMs ?? (message.method === 'item/started' ? p.startedAtMs : undefined) ?? previous?.started_at_ms;
-        this.put(agent, simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started', startedAtMs, agent.threadId));
+        const entry = simplify(this.decorate(removeGuidance(p.item, this.controller.guidance)), p.turnId, false, message.method === 'item/completed' ? 'completed' : 'started', startedAtMs, agent.threadId);
+        const ended = timestamp(p.completedAtMs ?? p.item.completedAtMs);
+        if (entry.message && ended) entry.completed_at_ms = ended;
+        this.put(agent, entry);
       }
       return;
     }
-    if (message.method === 'turn/completed' && p.turn?.id) {
-      this.remember(this.turnStates, `${p.threadId}:${p.turn.id}`, p.turn.status);
-      if (p.turn.status === 'completed') {
-        const bucket = this.bucket(agent.id);
+    if (['turn/started', 'turn/completed'].includes(message.method) && p.turn?.id) {
+      this.rememberTurn(p.threadId, p.turn);
+      const bucket = this.bucket(agent.id);
+      bucket.revision = this.nextRevision++;
+      if (message.method === 'turn/completed' && p.turn.status === 'completed') {
+        for (const item of p.turn.items ?? []) {
+          if (item.type !== 'agentMessage' || item.phase !== 'final_answer' || !item.id || typeof item.text !== 'string') continue;
+          const old = bucket.entries.find(entry => entry.turn_id === p.turn.id && entry.id === item.id);
+          const final = simplify(item, p.turn.id, false, 'completed', item.startedAtMs ?? old?.started_at_ms, agent.threadId);
+          const ended = timestamp(item.completedAtMs) ?? old?.completed_at_ms;
+          if (ended) final.completed_at_ms = ended;
+          this.put(agent, final);
+        }
         for (const entry of [...bucket.entries]) {
           if (entry.turn_id === p.turn.id && entry.message?.phase === 'final_answer') this.put(agent, { ...entry, message: { ...entry.message, complete: true, is_final: true } });
         }
@@ -483,22 +517,50 @@ export class ActivityStore {
   }
   revision({ target, revision } = {}) {
     const agent = this.find(target), bucket = this.bucket(agent.id);
-    return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: orderWaits(bucket.entries) }) };
+    const turns = [...new Set(bucket.entries.map(entry => entry.turn_id))].map(id => this.turnStates.get(`${agent.threadId}:${id}`)).filter(Boolean);
+    return { agent: this.summary(agent), revision: bucket.revision, ...(revision === bucket.revision ? {} : { entries: orderWaits(bucket.entries), ...(turns.length ? { turns } : {}) }) };
   }
-  async history({ target, cursor, limit = 30, character_budget: characterBudget } = {}) {
+  projectRecord(record, agent, turnId) {
+    const item = record.item;
+    const entry = simplify(this.decorate(removeGuidance(item, this.controller.guidance)), turnId, record.outputDeferred === true,
+      this.stage(item, agent.threadId, turnId, record), record.startedAtMs ?? item.startedAtMs, agent.threadId);
+    const ended = timestamp(record.completedAtMs ?? item.completedAtMs);
+    if (entry.message && ended) entry.completed_at_ms = ended;
+    return entry;
+  }
+  itemPage(agent, turnId, cursor, limit) {
+    return this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit, sortDirection: 'desc',
+      deferOutput: { commandExecution: true, mcpToolCall: true }, ...(cursor ? { cursor } : {}) });
+  }
+  async history({ target, cursor, limit = 30, character_budget: characterBudget, fold_turns: foldTurns = false, process_page: processPage } = {}) {
     const agent = this.find(target);
+    if (processPage !== undefined) {
+      if (!processPage || typeof processPage.turn_id !== 'string' || !processPage.turn_id || !Number.isInteger(processPage.limit) || processPage.limit < 1 || processPage.limit > 50 ||
+          (processPage.cursor != null && (typeof processPage.cursor !== 'string' || !processPage.cursor))) throw new TypeError('Invalid turn process page.');
+      const result = await this.itemPage(agent, processPage.turn_id, processPage.cursor, processPage.limit);
+      if ((result.data?.length ?? 0) > processPage.limit) throw new Error('Native history page exceeded its requested limit.');
+      const entries = (result.data ?? []).filter(record => (!record.turnId || record.turnId === processPage.turn_id) && visible(record.item)).map(record => this.projectRecord(record, agent, processPage.turn_id));
+      return { entries: orderWaits(entries.reverse()) };
+    }
     if (characterBudget !== undefined && (!Number.isInteger(characterBudget) || characterBudget < 16000 || characterBudget > 100000)) throw new TypeError('character_budget must be between 16000 and 100000.');
     const maxLimit = characterBudget === undefined ? 50 : 400;
     if (!Number.isInteger(limit) || limit < 1 || limit > maxLimit) throw new TypeError(`limit must be between 1 and ${maxLimit}.`);
     if (cursor != null && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor))) throw new TypeError('Invalid history cursor.');
-    let { turn_id: turnId, turns_cursor: turnsCursor, items_cursor: itemsCursor, seen_turn_cursors: seenTurns = [], seen_item_cursors: seenItems = [] } = cursor ?? {};
+    let { turn_id: turnId, turns_cursor: turnsCursor, turn_page_cursor: turnPageCursor, items_cursor: itemsCursor, seen_turn_cursors: seenTurns = [], seen_item_cursors: seenItems = [] } = cursor ?? {};
     const validToken = (v) => v == null || (typeof v === 'string' && v.length > 0);
     const validSeen = (v) => Array.isArray(v) && v.length <= 64 && v.every((s) => typeof s === 'string' && s.length > 0) && new Set(v).size === v.length;
-    if (![turnId, turnsCursor, itemsCursor].every(validToken) || !validSeen(seenTurns) || !validSeen(seenItems) || (!turnId && (itemsCursor || seenItems.length))) throw new TypeError('Invalid history cursor.');
+    if (![turnId, turnsCursor, turnPageCursor, itemsCursor].every(validToken) || !validSeen(seenTurns) || !validSeen(seenItems) || (!turnId && (itemsCursor || seenItems.length))) throw new TypeError('Invalid history cursor.');
     seenTurns = new Set(seenTurns); seenItems = new Set(seenItems);
-    const entries = [];
+    const entries = [], turns = new Map();
     // Bound work even when native pages contain only hidden or empty items.
     let requests = 0, done = false, projectedChars = 2;
+    // A resumed cursor may outlive the small metadata cache or the helper.
+    if (turnId && cursor && Object.hasOwn(cursor, 'turn_page_cursor') && !this.turnStates.has(`${agent.threadId}:${turnId}`)) {
+      const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc',
+        itemsView: 'notLoaded', ...(turnPageCursor ? { cursor: turnPageCursor } : {}) });
+      requests++;
+      if (page.data?.[0]?.id === turnId) turns.set(turnId, this.rememberTurn(agent.threadId, page.data[0]));
+    }
     const advance = (current, next, seen) => {
       if (!validToken(next)) throw new Error('Invalid native history cursor.');
       if (current) {
@@ -510,25 +572,41 @@ export class ActivityStore {
     };
     while (entries.length < limit && requests < 80 && !done && (characterBudget === undefined || projectedChars < characterBudget)) {
       if (!turnId) {
+        turnPageCursor = turnsCursor ?? null;
         const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded', ...(turnsCursor ? { cursor: turnsCursor } : {}) });
         requests++;
         turnsCursor = advance(turnsCursor, page.nextCursor, seenTurns);
         turnId = page.data?.[0]?.id;
         if (turnId && !validToken(turnId)) throw new Error('Invalid native turn ID.');
-        if (turnId) this.remember(this.turnStates, `${agent.threadId}:${turnId}`, page.data[0].status);
+        if (turnId) turns.set(turnId, this.rememberTurn(agent.threadId, page.data[0]));
         else if (!turnsCursor) done = true;
         continue;
       }
       const pageLimit = Math.min(50, limit - entries.length);
-      const page = await this.client.request('thread/items/list', { threadId: agent.threadId, turnId, limit: pageLimit, sortDirection: 'desc', deferOutput: { commandExecution: true, mcpToolCall: true }, ...(itemsCursor ? { cursor: itemsCursor } : {}) });
+      const pageCursor = itemsCursor ?? null;
+      const page = await this.itemPage(agent, turnId, pageCursor, pageLimit);
       requests++;
       if ((page.data?.length ?? 0) > pageLimit) throw new Error('Native history page exceeded its requested limit.');
       itemsCursor = advance(itemsCursor, page.nextCursor, seenItems);
-      const projected = (page.data ?? []).filter((entry) => visible(entry.item)).map((entry) => {
-        const actualTurn = entry.turnId ?? turnId;
-        const result = simplify(this.decorate(removeGuidance(entry.item, this.controller.guidance)), actualTurn, entry.outputDeferred === true, this.stage(entry.item, agent.threadId, actualTurn, entry), entry.startedAtMs ?? entry.item.startedAtMs, agent.threadId);
-        return result;
-      });
+      const meta = this.turnStates.get(`${agent.threadId}:${turnId}`);
+      if (meta) turns.set(turnId, meta);
+      const projected = [];
+      let run;
+      for (const record of page.data ?? []) {
+        const item = record.item, actualTurn = record.turnId ?? turnId;
+        if (!visible(item)) continue;
+        if (foldTurns && actualTurn === turnId && finishedTurn(meta) && item.id && processItem(item.type, item.phase)) {
+          if (!run) {
+            run = { type: 'turnProcessPage', turn_id: turnId, cursor: pageCursor, limit: pageLimit, ids: [] };
+            projected.push(run);
+          }
+          run.ids.push(item.id);
+        } else {
+          run = null;
+          projected.push(this.projectRecord(record, agent, actualTurn));
+        }
+      }
+      for (const entry of projected) if (entry.type === 'turnProcessPage') entry.ids.reverse();
       projectedChars += projected.reduce((total, entry) => total + JSON.stringify(entry).length + 1, 0);
       if (!entries.length && projected.length) projectedChars--;
       entries.push(...projected);
@@ -537,12 +615,12 @@ export class ActivityStore {
         if (!turnsCursor) done = true;
       }
     }
-    const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
-    const result = { agent: this.summary(agent), entries: orderWaits(entries.reverse()), next_cursor };
+    const next_cursor = done ? null : { ...(turnId ? { turn_id: turnId, items_cursor: itemsCursor ?? null, ...(foldTurns ? { turn_page_cursor: turnPageCursor ?? null } : {}) } : {}), ...(turnsCursor ? { turns_cursor: turnsCursor } : {}), ...(seenTurns.size ? { seen_turn_cursors: [...seenTurns].slice(-64) } : {}), ...(seenItems.size ? { seen_item_cursors: [...seenItems].slice(-64) } : {}) };
+    const result = { agent: this.summary(agent), entries: orderWaits(entries.reverse()), ...(turns.size ? { turns: [...turns.values()] } : {}), next_cursor };
     if (Buffer.byteLength(JSON.stringify(result), 'utf8') >= 4 * 1024 * 1024) throw new Error('Projected history exceeds the 4 MiB bridge limit.');
     return result;
   }
-  async detail({ target, turn_id, item_id, offset = 0, file_path, view, export: exportMessage, bulk, expand } = {}) {
+  async detail({ target, turn_id, item_id, offset = 0, file_path, view, export: exportMessage, bulk, expand, copy } = {}) {
     const agent = this.find(target);
     if (typeof turn_id !== 'string' || !turn_id || typeof item_id !== 'string' || !item_id) throw new TypeError('turn_id and item_id are required.');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Invalid detail offset.');
@@ -553,6 +631,7 @@ export class ActivityStore {
     if (bulk !== undefined && (bulk !== true || !['message', 'communication'].includes(view) || exportMessage)) throw new TypeError('Invalid bulk request.');
     if (exportMessage && (file_path !== undefined || offset !== 0)) throw new TypeError('Invalid export request.');
     if (expand !== undefined && (expand !== true || !['message', 'communication'].includes(view) || offset !== 0 || file_path !== undefined || bulk !== undefined || exportMessage !== undefined)) throw new TypeError('Invalid expand request.');
+    if (copy !== undefined && (copy !== true && copy !== 'file' || offset !== 0 || bulk !== undefined || expand !== undefined || exportMessage !== undefined || !(file_path === undefined ? view === 'message' : view === undefined))) throw new TypeError('Invalid copy request.');
     const pageSize = bulk ? 524288 : 16000;
     const page = await this.client.request('thread/items/read', { threadId: agent.threadId, turnId: turn_id, itemIds: [item_id] });
     const record = page.data?.[0];
@@ -586,18 +665,31 @@ export class ActivityStore {
     if (view === 'message') {
       if (file_path !== undefined || item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id) || !['agentMessage', 'parentMessage', 'directUserMessage', 'userMessage'].includes(item.type)) throw new Error('Message item is unavailable.');
       const text = formatItem(removeGuidance(item, this.controller.guidance));
+      if (copy !== undefined) {
+        if (item.type !== 'agentMessage' || typeof item.text !== 'string') throw new Error('Reply is unavailable.');
+        return this.prepareCopy(text, copy);
+      }
       if (expand) return this.expandText(text);
       const next_offset = offset + pageSize < text.length ? offset + pageSize : null;
       return { text: text.slice(safeBoundary(text, offset), safeBoundary(text, offset + pageSize)), next_offset, format: offset === 0 && next_offset === null ? 'markdown' : 'text', total_length: text.length };
     }
+    if (copy !== undefined && (item?.id !== item_id || (record?.turnId != null && record.turnId !== turn_id))) throw new Error('File change is unavailable.');
     if (!visible(item)) return { text: '', next_offset: null };
     const change = file_path !== undefined && item.type === 'fileChange' ? fileChanges(item).find(change => change.path === file_path) : null;
     if (file_path !== undefined && !change) throw new Error('File is not part of this recorded change.');
+    if (copy !== undefined) return this.prepareCopy(fileChangeSource(change).text, copy);
     if (change) return { ...fileChangePage(change, offset), file_path };
     const outputOnly = view === 'output' && OUTPUT_TYPES.has(item.type);
     const text = (outputOnly ? formatItemOutput : formatItem)(removeGuidance(item, this.controller.guidance));
     const next_offset = offset + 16000 < text.length ? offset + 16000 : null;
     return { text: text.slice(offset, offset + 16000), next_offset, ...(outputOnly ? { format: 'source' } : {}) };
+  }
+  prepareCopy(text, copy) {
+    // process.run captures 4 MiB of stdout. Account for JSON escaping and the
+    // newline appended by the bridge before returning even an in-limit reply.
+    const result = { text };
+    if (copy === true && text.length <= MAX_CLIPBOARD_LENGTH && Buffer.byteLength(JSON.stringify(result), 'utf8') < 4 * 1024 * 1024) return result;
+    return this.exportCommunication(text);
   }
   async expandText(text) {
     const total_length = text.length;

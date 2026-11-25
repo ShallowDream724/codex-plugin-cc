@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeDisplayMath, parseMathSpans } from '../hooks/math-markdown.js';
+import { normalizeDisplayMath, normalizeMath, parseMathSpans } from '../hooks/math-markdown.js';
 
 test('converts paired display formulas to separate Markdown math blocks', () => {
   const input = 'First:\n\\[\nE=mc^2\n\\]\nSecond: \\[a + b = c\\] done';
@@ -72,4 +72,23 @@ test('leaves escaped or incomplete delimiters and unclosed fences unchanged', ()
   }
   assert.equal(normalizeDisplayMath('\\\\\\[x\\]'), '\\\\\n$$\nx\n$$');
   assert.equal(normalizeDisplayMath('\\[x `code` y\\]'), '$$\nx `code` y\n$$');
+});
+
+test('normalizes simple inline formulas alongside prose and currency', () => {
+  const input = String.raw`成本是 $5，若\(P_s>P_v\)则用\(x\)，成本上升到 $10。`;
+  assert.equal(normalizeMath(input, { inline: true }), '成本是 $5，若$P_s>P_v$则用$x$，成本上升到 $10。');
+  assert.equal(normalizeMath(String.raw`Use \( x \) or \(f(x) = x_i^2\).`, { inline: true }), String.raw`Use $x$ or \(f(x) = x_i^2\).`);
+  assert.equal(normalizeMath(String.raw`公式如下。\(x\)`, { inline: true }), '公式如下。$x$');
+});
+
+test('keeps Markdown code and destinations and retains complex inline TeX', () => {
+  const protectedText = [
+    '> ```latex', String.raw`> \(x\) and \[x\]`, '> ```',
+    '- ~~~tex', String.raw`  \(x\)`, '  ~~~', '',
+    String.raw`    \(x\) and \[x\]`, '',
+    String.raw`[link](https://example.test/a\(x\))`,
+    String.raw`Math \(\begin{matrix}a \\[3pt] b\end{matrix} + \$5\).`,
+    '`' + String.raw`\(x\)` + '` or ' + String.raw`\\(x\) and $a + \(x\)$`,
+  ].join('\n');
+  assert.equal(normalizeMath(protectedText + '\n' + String.raw`Use \(x\)`, { inline: true }), protectedText + '\nUse $x$');
 });

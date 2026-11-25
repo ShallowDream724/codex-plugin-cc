@@ -418,12 +418,15 @@ test('private-turn followup rejection is a retryable-on-new-call preflight failu
 });
 
 test('simultaneous copies of one tool call never dispatch twice', async t => {
-  const { post, controller } = await setup(t, { saveReceipts: () => new Promise(done => setTimeout(done, 15)) });
+  const saving = Promise.withResolvers(), hold = Promise.withResolvers();
+  const { post, controller } = await setup(t, { saveReceipts: () => { saving.resolve(); return hold.promise; } });
   const request = { operation: 'spawn_agent', requestId: 'same-call', args: { context_mode: 'none' } };
-  const results = await Promise.all([post(request), post(request)]);
+  const first = post(request);
+  await saving.promise;
+  try { assert.equal((await post(request)).body.error?.code, 'ambiguous_action'); }
+  finally { hold.resolve(); }
+  assert.equal((await first).body.accepted, true);
   assert.equal(controller.calls.filter(c => c.op === 'spawn_agent').length, 1);
-  assert.equal(results.filter(r => r.body.accepted).length, 1);
-  assert.equal(results.filter(r => r.body.error?.code === 'ambiguous_action').length, 1);
 });
 
 test('parallel distinct actions persist receipts in order without losing newer state', async t => {

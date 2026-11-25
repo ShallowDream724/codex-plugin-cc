@@ -255,6 +255,9 @@ export async function main(argv = process.argv.slice(2)) {
     return { offline: true, results: [] };
   }
   let endpoint = body.operation === 'shutdown' ? existing?.endpoint : compatible(existing, await runtimeSignature());
+  if (body.operation === 'ui_detail' && body.args?.copy !== undefined && !endpoint) {
+    return { error: { code: 'copy_source_unavailable', message: 'The session helper is unavailable for reading the full content.' } };
+  }
   if (body.operation === 'ui_interrupt_all' && !endpoint) return { error: { code: 'helper_restart_required', message: 'The running session helper is incompatible; agent status is unconfirmed.' } };
   if (!existing && ['observe', 'ack', 'confirm', 'release', 'shutdown'].includes(body.operation)) return { offline: true, agents: [], events: [] };
   endpoint ||= await ensureBroker(body.owner, body.cwd || process.cwd());

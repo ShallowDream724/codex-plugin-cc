@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { groupEntries, registerUI, openAgent, observeUI, closeUI } from '../hooks/ui.js';
-import { fileChangePage } from '../shared/file-changes.mjs';
+import { fileChangePage, fileChangeSource } from '../shared/file-changes.mjs';
+import { MAX_CLIPBOARD_LENGTH } from '../shared/clipboard.mjs';
 import { nativeHooks } from './native-hooks.mjs';
 import navigationSync from '../hooks/navigation-sync.js';
 const nodes = (tree) => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
@@ -58,6 +59,39 @@ test('desktop Enter submits without a native button and the footer control route
   await message($, { element: 'codex_action_a', data: { action: 'activate' } }, () => { throw new Error('matched action'); });
   assert.equal(calls[1].op, 'ui_interrupt'); assert.equal(calls[1].args.target, 'a');
   closeUI();
+});
+
+test('composer routes an interrupted Claude task and an explicit final report independently', async t => {
+  const hooks = [], sends = [];
+  const agent = { agent_id: 'a', status: 'interrupted', parent_continuation_pending: true, parent_notification: { status: 'unavailable' } };
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  connect($, async (_$, op, args) => {
+    if (op === 'ui_list') return { agents: [agent] };
+    if (op === 'ui_revision') return { revision: 1, agent, entries: [] };
+    if (op === 'ui_history') return { entries: [], next_cursor: null };
+    if (op === 'ui_send') { sends.push(args); return { agent_id: 'a', status: 'completed' }; }
+    return {};
+  });
+  closeUI(); t.after(closeUI);
+  registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) }));
+  await openAgent($, 'a');
+  const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
+  const option = async () => (await draw()).find(node => node.props.key === 'codex_delivery_choice_a');
+  const send = async text => (await draw()).find(node => node.type === 'Input').props.onSubmit(text);
+  assert.match((await option()).props.label, /^继续 Claude/);
+  await send('继续');
+  assert.deepEqual(sends.pop(), { target: 'a', message: '继续' });
+  await (await option()).props.onPress();
+  await send('另外问一句');
+  assert.deepEqual(sends.pop(), { target: 'a', message: '另外问一句', private_task: true });
+  agent.parent_continuation_pending = false;
+  await observeUI($, { agents: [agent] });
+  await send('仅给我看');
+  assert.deepEqual(sends.pop(), { target: 'a', message: '仅给我看' });
+  await (await option()).props.onPress();
+  await send('整理后汇报');
+  assert.deepEqual(sends.pop(), { target: 'a', message: '整理后汇报', report_to_parent: true });
+  assert.match((await option()).props.label, /^☐/);
 });
 
 test('mixed rich text keeps native Markdown structure and fenced language labels intact', async (t) => {
@@ -289,7 +323,7 @@ test('conversation shows prose and expandable file changes with authoritative co
   closeUI();
 });
 
-test('desktop file changes show a basename and diff rows with one icon copy action', async (t) => {
+test('desktop file changes show a basename and diff rows with one native copy action', async (t) => {
   const hooks = [], copied = [], calls = [];
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, copy: async value => { copied.push(value); return { isCopied: true }; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   const source = '@@ -4,2 +4,3 @@\n one\n+<literal html>\n two\n';
@@ -307,8 +341,9 @@ test('desktop file changes show a basename and diff rows with one icon copy acti
   assert.ok(all.some(node => node.props.backgroundColor === 'rgba(46,160,67,0.16)'));
   assert.ok(!JSON.stringify(tree).includes('复制文件路径'));
   assert.ok(!JSON.stringify(tree).includes('复制当前差异'));
-  assert.equal(all.filter(node => node.type === 'Client' && node.props.key === 'diff_copy_a:t:file:file:0').length, 1);
-  await hooks.find(h => h.event === 'ui.message').fn($, { surface: 'desktop', element: 'diff_copy_a:t:file:file:0', data: { action: 'activate', expanded: false } }, () => { throw new Error('unmatched copy'); });
+  const actions = all.filter(node => node.props.key === 'diff_copy_a:t:file:file:0');
+  assert.deepEqual(actions.map(node => node.type), ['Button']);
+  actions[0].props.onPress({ surface: 'desktop' });
   assert.deepEqual(copied, [{ text: source, surface: 'desktop' }]);
   assert.ok(!calls.includes('ui_detail'), 'complete local diff needs no extra read');
 });
@@ -430,7 +465,7 @@ test('desktop tool expansion keeps the pane valid through output and raw-call di
   assert.ok(!nodes(await draw()).some(node => node.props.key === 'item_a:t:run'));
 });
 
-test('final response copy retrieves raw pages and ignores commentary and stale requests', async (t) => {
+test('final response copy retrieves exact raw text and ignores commentary and stale requests', async (t) => {
   const hooks = [], copied = [], calls = []; let deferred;
   const entries = [
     { id: 'comment', turn_id: 't', type: 'agentMessage', data: { text: 'thinking' }, message: { is_final: false } },
@@ -441,22 +476,23 @@ test('final response copy retrieves raw pages and ignores commentary and stale r
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }] };
     if (op === 'ui_revision') return { revision: 1, entries: args.target === 'a' ? entries : [] };
-    if (op === 'ui_detail') { calls.push(args); if (deferred) return new Promise(resolve => { deferred.resolve = resolve; }); return args.offset ? { text: '\\[raw\\]', next_offset: null } : { text: '**full**\r\n', next_offset: 524288 }; }
+    if (op === 'ui_detail') { calls.push(args); if (deferred) return new Promise(resolve => { deferred.resolve = resolve; }); return { text: '**full**\r\n\\[raw\\]' }; }
     return { entries: [], next_cursor: null };
   });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null);
   let tree = nodes(await draw());
   assert.deepEqual(tree.filter(n => n.props.key?.startsWith('message_copy_')).map(n => n.props.key), ['message_copy_a:t:final']);
-  await tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  await new Promise(setImmediate);
   assert.deepEqual(copied, ['**full**\r\n\\[raw\\]']);
-  assert.deepEqual(calls.map(c => [c.view, c.offset, c.bulk]), [['message', 0, true], ['message', 524288, true]]);
-  deferred = {}; const pending = tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
-  await new Promise(setImmediate); await openAgent($, 'b'); deferred.resolve({ text: 'stale', next_offset: null }); await pending;
+  assert.deepEqual(calls, [{ target: 'a', item_id: 'final', turn_id: 't', view: 'message', copy: true }]);
+  deferred = {}; tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  await new Promise(setImmediate); await openAgent($, 'b'); deferred.resolve({ text: 'stale' }); await new Promise(setImmediate);
   assert.equal(copied.length, 1);
 });
 
-test('copy reports stalled cursors without writing to clipboard', async (t) => {
+test('copy rejects incomplete results without writing to clipboard', async (t) => {
   const hooks = [], copied = [];
   const entry = { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } };
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => copied.push(value), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
@@ -466,7 +502,7 @@ test('copy reports stalled cursors without writing to clipboard', async (t) => {
   (await draw()).find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
   await new Promise(setImmediate);
   assert.equal(copied.length, 0);
-  assert.match((await draw()).find(n => n.props.key === 'message_copy_error_a:t:final').props.children[0], /复制失败.*未推进/);
+  assert.match((await draw()).find(n => n.props.key === 'message_copy_error_a:t:final').props.children[0], /复制失败.*未能读取完整内容/);
 });
 
 test('copy reports a rejected clipboard result', async (t) => {
@@ -480,19 +516,20 @@ test('copy reports a rejected clipboard result', async (t) => {
   assert.match((await draw()).find(n => n.props.key === 'message_copy_error_a:t:final').props.children[0], /复制失败.*clipboard unavailable/);
 });
 
-test('copy immediately preserves short raw text and stops an unending sequence', async (t) => {
+test('copy preserves short raw text and rejects oversized clipboard payloads', async (t) => {
   const hooks = [], copied = []; let reads = 0;
   const entries = [{ id: 'short', turn_id: 't', type: 'agentMessage', data: { text: '**raw**\r\n\\[x\\]' }, message: { is_final: true, truncated: false } }, { id: 'long', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } }];
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => { copied.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
-  connect($, async (_$, op, args) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries } : op === 'ui_detail' ? (reads++, { text: 'x', next_offset: args.offset + 1 }) : { entries: [], next_cursor: null });
+  connect($, async (_$, op) => op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries } : op === 'ui_detail' ? (reads++, { text: 'x'.repeat(MAX_CLIPBOARD_LENGTH + 1) }) : { entries: [], next_cursor: null });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null));
   let tree = await draw(); await tree.find(n => n.props.key === 'message_copy_a:t:short').props.onPress();
   assert.deepEqual(copied, ['**raw**\r\n\\[x\\]']); assert.equal(reads, 0);
   assert.equal(tree.find(n => n.props.key === 'message_actions_a:t:short').props.justifyContent, 'flex-start');
-  await tree.find(n => n.props.key === 'message_copy_a:t:long').props.onPress();
-  tree = await draw(); assert.equal(reads, 1100); assert.equal(copied.length, 1);
-  assert.match(tree.find(n => n.props.key === 'message_copy_error_a:t:long').props.children[0], /复制大小限制/);
+  tree.find(n => n.props.key === 'message_copy_a:t:long').props.onPress();
+  await new Promise(setImmediate);
+  tree = await draw(); assert.equal(reads, 1); assert.equal(copied.length, 1);
+  assert.match(tree.find(n => n.props.key === 'message_copy_error_a:t:long').props.children[0], /剪贴板大小限制/);
 });
 
 test('communication cancels late reads and external files arrive in one request', async (t) => {
@@ -727,7 +764,8 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
   const hooks = [], writes = [], requests = [];
   const on = (...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) });
   const $ = { state: { get: async () => ({ value: 0, version: 0 }), set: async (ref, value) => { writes.push({ ref, value }); return { isSet: true }; } }, ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'].map((type) => [type, (props) => ({ type, props })])), invalidate() { throw new Error('global invalidation'); }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every() { return { cancel() {} }; } } };
-  const entries = [{ id: 'parent', type: 'parentMessage', turn_id: 't', data: { text: 'line one\r\nline two' } }, { id: 'direct', type: 'directUserMessage', turn_id: 't', data: { text: 'user\nmessage' } }, { id: 'reply', type: 'agentMessage', turn_id: 't', data: { text: '**reply**' } }, { id: 'tool', type: 'mcpToolCall', turn_id: 't', data: { server: 'fastctx', tool: 'run', arguments: { command: 'test' }, result: { content: [{ type: 'text', text: 'complete short output' }] } } }];
+  const link = `https://example.test/${'abcdefghijk'.repeat(35)}?q=alpha&key=beta`;
+  const entries = [{ id: 'parent', type: 'parentMessage', turn_id: 't', data: { text: 'line one\r\nline two' } }, { id: 'direct', type: 'directUserMessage', turn_id: 't', data: { text: `user\n${link}` } }, { id: 'reply', type: 'agentMessage', turn_id: 't', data: { text: '**reply**' } }, { id: 'tool', type: 'mcpToolCall', turn_id: 't', data: { server: 'fastctx', tool: 'run', arguments: { command: 'test' }, result: { content: [{ type: 'text', text: 'complete short output' }] } } }];
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'running' }] };
     if (op === 'ui_revision') return { revision: 1, entries };
@@ -743,12 +781,16 @@ test('conversation keeps incoming line breaks in right bubbles and composer refr
     const row = nodes(tree).find((node) => node.props.key === `message_container_a:t:${id}`);
     assert.equal(row.props.justifyContent, 'flex-end');
     assert.equal(row.props.children[0].props.width, '85%');
+    assert.equal(row.props.children[0].props.flexDirection, 'row');
+    assert.equal(row.props.children[0].props.justifyContent, 'flex-end');
     const bubble = nodes(row).find(node => node.props.key === `message_content_a:t:${id}`);
     assert.equal(bubble.props.width, undefined, 'short messages size to content');
-    assert.equal(bubble.props.alignSelf, 'flex-end');
+    assert.equal(bubble.props.flexShrink, 1);
+    assert.equal(bubble.props.minWidth, 0);
     assert.equal(nodes(row).find((node) => node.props.key === `message_a:t:${id}`).type, 'Markdown');
   }
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:parent').props.text, 'line one\nline two');
+  assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:direct').props.text, `user\n${link}`);
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_container_a:t:reply').props.justifyContent, 'flex-start');
   assert.equal(nodes(tree).find((node) => node.props.key === 'message_a:t:reply').type, 'Markdown');
   assert.deepEqual(nodes(tree).filter((node) => node.props.key?.startsWith('author_')).map(node => node.props.children[0]), ['Claude', 'User']);
@@ -1051,7 +1093,7 @@ test('file changes present native kinds, source additions, moves and continuous 
   ];
   const entries = changes.map((change, i) => ({ id: `file${i}`, turn_id: 't', type: 'fileChange', ...(i === 3 ? { deferred: true } : {}), data: { changes: [change] } }));
   const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])), copy: async value => { copies.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
-  connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries }; if (op === 'ui_detail') { requests.push(args); return fileChangePage(changes[3], args.offset); } return { entries: [], next_cursor: null }; });
+  connect($, async (_$, op, args) => { if (op === 'ui_list') return { agents: [{ agent_id: 'a' }] }; if (op === 'ui_revision') return { revision: 1, entries }; if (op === 'ui_detail') { requests.push(args); return args.copy ? { text: fileChangeSource(changes[3]).text } : fileChangePage(changes[3], args.offset); } return { entries: [], next_cursor: null }; });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
   const click = async key => (await draw()).find(n => n.props.key === key).props.onPress();
@@ -1061,7 +1103,8 @@ test('file changes present native kinds, source additions, moves and continuous 
   await click('file_a:t:file4:file:0'); assert.ok((await draw()).some(n => n.props.key === 'file_code_a:t:file4:file:0:0' && n.props.format === 'source'));
   await click('file_a:t:file3:file:0'); await new Promise(setImmediate); tree = await draw(); assert.ok(tree.some(n => n.props.key === 'file_diff_a:t:file3:file:0:0'));
   assert.ok(!tree.some(n => ['下一页输出', '上一页输出', '复制当前页差异'].includes(n.props.label)));
-  await tree.find(n => n.props.key === 'diff_copy_a:t:file3:file:0').props.onPress();
+  tree.find(n => n.props.key === 'diff_copy_a:t:file3:file:0').props.onPress();
+  await new Promise(setImmediate);
   let full = '', offset = 0;
   do { const page = fileChangePage(changes[3], offset); full += page.text; offset = page.next_offset; } while (offset != null);
   assert.equal(copies[0], full);

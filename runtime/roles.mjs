@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { open, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isParentNotificationSpec } from './parent-notification.mjs';
 
 export function loadGuidance(file = new URL('../config/guidance.json', import.meta.url)) {
   const guidance = JSON.parse(readFileSync(file, 'utf8'));
@@ -61,15 +62,24 @@ export async function externalClientTools(thread) {
     const text = buffer.subarray(0, bytesRead).toString('utf8'); const newline = text.indexOf('\n');
     if (newline < 0) return unknown;
     const record = JSON.parse(text.slice(0, newline));
-    if (record.type !== 'session_meta' || record.payload?.id !== thread.id || !Array.isArray(record.payload.dynamic_tools)) return unknown;
+    if (record.type !== 'session_meta' || record.payload?.id !== thread.id) return unknown;
+    const specs = record.payload.dynamic_tools ?? [];
+    if (!Array.isArray(specs)) return unknown;
     const names = [];
-    for (const tool of record.payload.dynamic_tools) {
+    let parentNotification = false;
+    for (const tool of specs) {
       if (typeof tool?.name !== 'string') return unknown;
-      if (tool.type === 'namespace' && Array.isArray(tool.tools)) {
+      if (isParentNotificationSpec(tool)) {
+        parentNotification = true;
+      } else if (tool.type === 'namespace') {
+        if (!Array.isArray(tool.tools)) return unknown;
         for (const nested of tool.tools) { if (typeof nested?.name !== 'string') return unknown; names.push(`${tool.name}.${nested.name}`); }
-      } else names.push(tool.name);
+      } else {
+        if (tool.namespace != null && typeof tool.namespace !== 'string') return unknown;
+        names.push(tool.namespace == null ? tool.name : `${tool.namespace}.${tool.name}`);
+      }
     }
-    return { status: 'known', tools: names };
+    return { status: 'known', tools: names, ...(parentNotification ? { parentNotification } : {}) };
   } catch { return unknown; }
   finally { await file?.close().catch(() => {}); }
 }

@@ -1,9 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { configureBridge, requestBridge } from '../hooks/bridge.js';
-import { call } from '../runtime/bridge.mjs';
+import { call, runtimeSignature } from '../runtime/bridge.mjs';
 import { createBroker } from '../runtime/broker.mjs';
+import { ownerDirectory } from '../runtime/storage.mjs';
 
 const names = ['id', 'cwd', 'CODEX_SUBAGENTS_NODE_COMMAND', 'CODEX_SUBAGENTS_STATE_DIR', 'CODEX_SUBAGENTS_CODEX_COMMAND', 'CODEX_SUBAGENTS_SETTINGS'];
 const deferred = () => {
@@ -83,4 +90,47 @@ test('the runtime bridge preserves broker errors on a port blocked by fetch', as
   }
   await assert.rejects(fetch(`http://127.0.0.1:${port}/`), err => err.cause?.message === 'bad port');
   assert.deepEqual(await call({ port, token }, { operation: 'list_models' }), { error });
+});
+
+test('reading a copy uses a compatible live helper and never starts or replaces it', async t => {
+  const folder = await mkdtemp(join(tmpdir(), 'subagents-copy-bridge-'));
+  t.after(() => rm(folder, { recursive: true, force: true }));
+  const owner = 'copy-test', dir = ownerDirectory(owner, folder);
+  const args = { target: 'agent', turn_id: 'turn', item_id: 'reply', view: 'message', copy: true };
+  const run = async () => {
+    const script = fileURLToPath(new URL('../runtime/bridge.mjs', import.meta.url));
+    const child = spawn(process.execPath, [script], {
+      env: { ...process.env, CODEX_SUBAGENTS_STATE_DIR: folder, CODEX_SUBAGENTS_CODEX_COMMAND: join(folder, 'missing-codex') },
+      windowsHide: true,
+    });
+    const chunks = [];
+    child.stdout.on('data', chunk => chunks.push(chunk));
+    child.stdin.end(JSON.stringify({ owner, cwd: folder, operation: 'ui_detail', args }));
+    const [code] = await once(child, 'close');
+    assert.equal(code, 0);
+    return JSON.parse(Buffer.concat(chunks).toString());
+  };
+  assert.equal((await run()).error?.code, 'copy_source_unavailable');
+  assert.deepEqual(await readdir(folder), []);
+
+  const signature = await runtimeSignature(), calls = [];
+  let build = 'incompatible';
+  const server = createServer(async (req, res) => {
+    let payload = '';
+    for await (const chunk of req) payload += chunk;
+    const body = JSON.parse(payload);
+    calls.push(body.operation);
+    const value = body.operation === 'health' ? { ...signature, build, ready: true, capabilities: ['idle_shutdown'] }
+      : body.operation === 'ui_detail' ? { text: 'raw response' } : { stopped: false, reason: 'active' };
+    res.end(JSON.stringify(value));
+  });
+  t.after(() => server.close());
+  await once(server.listen(0, '127.0.0.1'), 'listening');
+  await mkdir(dir);
+  await writeFile(join(dir, 'endpoint.json'), JSON.stringify({ port: server.address().port, token: 'test-auth' }));
+  assert.equal((await run()).error?.code, 'copy_source_unavailable');
+  assert.deepEqual(calls, ['health']);
+  build = signature.build;
+  assert.deepEqual(await run(), { text: 'raw response' });
+  assert.deepEqual(calls, ['health', 'health', 'ui_detail']);
 });

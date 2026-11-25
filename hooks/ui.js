@@ -1,9 +1,10 @@
 import { requestBridge as bridge, pickFiles, pasteAttachments } from './bridge.js';
 import { agentIcon, agentVisual, displayLabel, agentDisplayName } from './presentation.js';
 import { toolSections, communicationFailure } from './tool-presentation.js';
-import { activityIcon, contextIndicator, disclosureIcon, copyIcon, copiedIcon, copyFailedIcon, jumpIcon } from './tool-icons.js';
+import { activityIcon, contextIndicator, disclosureIcon, jumpIcon } from './tool-icons.js';
 import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
+import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences } from './turn-history.js';
 import { renderDiff } from './diff-view.js';
 import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
 import { nativeRenderBudget } from './render-budget.js';
@@ -12,6 +13,7 @@ import { planHistoryWindow } from './history-window.js';
 import { renderAgentDirectory } from './agent-directory.js';
 import { fileViewEntries, appendFilePage } from './file-stream.js';
 import { parseUnifiedDiffDetailed } from '../shared/unified-diff.mjs';
+import { MAX_CLIPBOARD_LENGTH } from '../shared/clipboard.mjs';
 
 const PANE = 'codex_subagent_activity';
 const PANE_REVISION = { plugin: 'codex-subagents', key: 'paneRevision' };
@@ -23,13 +25,12 @@ const MAX_DETAILS = 16;
 // Candidate safety cap only; actual visible content is chosen by render cost.
 const VISIBLE_ENTRIES = 400;
 const RAW_WINDOW_LIMIT = 400;
-const MAX_COPY_LENGTH = 16 * 1024 * 1024;
-const MAX_COPY_PAGES = 1100;
 let copyIntent = 0;
-const copyLabels = { pending: '正在复制…', copied: '已复制', failed: '复制失败，请重试' };
+const copyLabels = { pending: '正在复制…', copied: '已复制', failed: '复制失败，请重试', file: '已保存完整内容' };
+const clipboardUnavailable = new Set(['no-clipboard', 'no-surface', 'unanswered']);
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
-const summaryFields = ['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status', 'created_at_ms', 'last_activity_at_ms'];
+const summaryFields = ['name', 'model', 'reasoning_effort', 'context_source', 'permissions_mode', 'context_used_tokens', 'context_limit_tokens', 'status', 'user_paused', 'user_control_status', 'created_at_ms', 'last_activity_at_ms', 'parent_continuation_pending', 'turn_origin', 'parent_notification', 'final_report_pending'];
 const summaries = (agents) => agents.map((agent) => ({ agent_id: idOf(agent), ...Object.fromEntries(summaryFields.filter((key) => Object.hasOwn(agent, key)).map((key) => [key, agent[key]])) }));
 const entryKey = (entry) => `${entry.turn_id || ''}:${entry.id}`;
 const detailKey = (entry, filePath, view) => JSON.stringify([entryKey(entry), filePath ?? null, ...(view ? [view] : [])]);
@@ -112,12 +113,19 @@ function changeLabel(change) {
   const verb = { add: '已创建', delete: '已删除', update: '已编辑' }[change.kind] || '已更改';
   return `${verb} ${name}${move}${hasCounts ? ` +${change.added} -${change.removed}` : ''}`;
 }
+function messageOrigin(entry) {
+  if (entry.type === 'parentMessage') return 'parent';
+  if (entry.type === 'directUserMessage') return 'user';
+  const origin = entry.data?.message_origin;
+  if (entry.type === 'userMessage' && (origin === 'parent' || origin === 'user')) return origin;
+}
 const description = (entry) => {
   const d = entry.data || {};
   if (typeof entry.communication?.title === 'string' && entry.communication.title.trim()) return entry.communication.title;
-  if (entry.type === 'parentMessage') return 'Claude';
-  if (entry.type === 'directUserMessage') return 'User';
-  if (entry.type === 'userMessage') return d.message_origin === 'parent' ? 'Claude' : '消息';
+  const origin = messageOrigin(entry);
+  if (origin === 'parent') return 'Claude';
+  if (origin === 'user') return 'User';
+  if (entry.type === 'userMessage') return '消息';
   if (entry.type === 'agentMessage') return 'Codex';
   if (entry.type === 'commandExecution') return `运行命令 ${d.command || ''}`;
   if (entry.type === 'mcpToolCall' || entry.type === 'dynamicToolCall') return toolTitle(d);
@@ -159,6 +167,9 @@ export function groupEntries(entries) {
   const groups = [];
   for (const entry of entries) {
     const last = groups.at(-1);
+    if (entry.type === 'turnProcessPending' && last?.type === entry.type && last.items[0].pageKey === entry.pageKey) {
+      last.items.push(entry); continue;
+    }
     const sameTool = !['mcpToolCall', 'dynamicToolCall'].includes(entry.type) || (integrationOf(entry) ? integrationOf(last?.items[0] || {}) === integrationOf(entry) : last?.items[0]?.data?.tool === entry.data?.tool);
     if (groupable.has(entry.type) && last && last.type === entry.type && last.turn_id === entry.turn_id && sameTool) last.items.push(entry);
     else groups.push({ type: entry.type, turn_id: entry.turn_id, integration: integrationOf(entry), items: [entry] });
@@ -176,24 +187,62 @@ const mergeSummaries = (agents) => {
   return summaries(agents).map(agent => ({ ...previous.get(idOf(agent)), ...agent }));
 };
 const failureText = (error) => safe(error?.message || error?.error?.message || error?.error || (typeof error === 'string' ? error : JSON.stringify(error)) || '连接未返回有效响应').slice(0, 400);
-function mergeLive(page, entries, prepend = false) {
+function mergeLive(page, entries, prepend = false, turns = []) {
+  let changed = false;
+  page.turns ??= new Map();
+  for (const turn of turns) {
+    const old = page.turns.get(turn.id);
+    const next = prepend ? { ...turn, ...old } : { ...old, ...turn };
+    // History may return after a final stream notification, or be the first
+    // source to learn that a formerly active turn has finished.
+    if (['completed', 'failed', 'interrupted'].includes(turn.status)) next.status = turn.status;
+    if (JSON.stringify(next) !== JSON.stringify(old)) { page.turns.set(turn.id, next); changed = true; }
+  }
   const positions = new Map(page.live.map((entry, index) => [entryKey(entry), index]));
   if (prepend) {
-    // Loaded history extends the same transcript. It cannot replace newer live
-    // versions or evict messages the person already has on screen.
-    const older = [];
-    for (const entry of entries) if (!positions.has(entryKey(entry))) {
-      positions.set(entryKey(entry), -1); older.push(entry);
+    // Insert gaps at the matching native record. The live cache can contain a
+    // prompt and answer while some intervening process records are absent.
+    const insertions = new Map(), seen = new Set();
+    let pending = [], last = -1;
+    const insert = index => {
+      if (!pending.length) return;
+      insertions.set(index, (insertions.get(index) ?? []).concat(pending)); pending = [];
+    };
+    for (const entry of expandProcessReferences(entries)) {
+      const key = entryKey(entry);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const index = positions.get(key);
+      if (index === undefined) pending.push(entry);
+      else {
+        insert(index); last = index;
+        const old = page.live[index];
+        if (entry.completed_at_ms && !old.completed_at_ms || entry.message?.is_final && !old.message?.is_final) {
+          page.live[index] = { ...old, ...(entry.completed_at_ms ? { completed_at_ms: entry.completed_at_ms } : {}),
+            ...(entry.message?.is_final ? { message: { ...old.message, ...entry.message } } : {}) };
+          changed = true;
+        }
+      }
     }
-    if (older.length) { page.live = [...older, ...page.live]; page.timeline = null; }
-    return older.length > 0;
+    insert(last + 1);
+    if (insertions.size) {
+      const merged = [];
+      for (let i = 0; i <= page.live.length; i++) {
+        if (insertions.has(i)) merged.push(...insertions.get(i));
+        if (i < page.live.length) merged.push(page.live[i]);
+      }
+      page.live = merged; changed = true;
+    }
+    if (changed) page.timeline = null;
+    return changed;
   }
-  let changed = false;
   for (const entry of entries) {
     const index = positions.get(entryKey(entry));
     if (index === undefined) { positions.set(entryKey(entry), page.live.length); page.live.push(entry); changed = true; }
     else {
-      const value = !Number.isFinite(entry.started_at_ms) && Number.isFinite(page.live[index].started_at_ms) ? { ...entry, started_at_ms: page.live[index].started_at_ms } : entry;
+      const previous = page.live[index];
+      const value = { ...entry, ...(entry.started_at_ms == null && previous.started_at_ms != null ? { started_at_ms: previous.started_at_ms } : {}),
+        ...(entry.completed_at_ms == null && previous.completed_at_ms != null ? { completed_at_ms: previous.completed_at_ms } : {}) };
       if (JSON.stringify(page.live[index]) !== JSON.stringify(value)) { page.live[index] = value; changed = true; }
     }
   }
@@ -213,22 +262,32 @@ function conversationEntries(all, page) {
   const messageKey = (entry) => {
     if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) return null;
     const attachments = entry.data?.attachments ?? entry.data?.content?.filter(part => ['localImage', 'mention'].includes(part.type)) ?? [];
-    return JSON.stringify([entry.turn_id, entry.type === 'directUserMessage' ? 'user' : 'parent', body(entry), attachments.map(part => part.path)]);
+    return JSON.stringify([entry.turn_id, messageOrigin(entry) ?? 'parent', body(entry), attachments.map(part => part.path)]);
   };
   const nativeCopies = new Map();
   for (const entry of all) {
     const key = messageKey(entry);
-    if (key && !String(entry.id).startsWith('action:')) nativeCopies.set(key, (nativeCopies.get(key) ?? 0) + 1);
+    if (!key || String(entry.id).startsWith('action:')) continue;
+    if (!nativeCopies.has(key)) nativeCopies.set(key, { known: 0, unknown: [] });
+    const copies = nativeCopies.get(key);
+    if (messageOrigin(entry)) copies.known++;
+    else if (!entry.deferred && (entry.preview?.length ?? 0) < 4096) copies.unknown.push(entry);
   }
-  const entries = orderWaits(all.filter((entry) => {
+  const inferredParents = new Set();
+  const entries = all.filter((entry) => {
     if (!String(entry.id).startsWith('action:')) return true;
-    const key = messageKey(entry), count = nativeCopies.get(key) ?? 0;
-    if (!count) return true;
-    nativeCopies.set(key, count - 1); return false;
-  }));
-  return page ? entries.flatMap(entry => fileViewEntries(entry, page.agentId, { isOpen: key => state.folds.has(key), getDetail: path => fileStreamDetail(page, entry, path) })) : entries;
+    const copies = nativeCopies.get(messageKey(entry));
+    if (!copies) return true;
+    if (copies.known) { copies.known--; return false; }
+    if (messageOrigin(entry) !== 'parent' || copies.unknown.length !== 1) return true;
+    inferredParents.add(copies.unknown.pop());
+    return false;
+  }).map(entry => inferredParents.has(entry) ? { ...entry, data: { ...entry.data, message_origin: 'parent' } } : entry);
+  if (!page) return orderWaits(entries);
+  const timeline = turnTimeline(entries, page.turns, turnId => page.openTurns?.has(turnId), page.processPages);
+  return timeline.flatMap(entry => fileViewEntries(entry, page.agentId, { isOpen: key => state.folds.has(key), getDetail: path => fileStreamDetail(page, entry, path) }));
 }
-function refreshFileTimeline(page) {
+function refreshTimeline(page) {
   const old = drawnWindow(page), first = old.entries[0] && entryKey(old.entries[0]);
   page.timeline = conversationEntries(page.live, page);
   if (page.navigationTimeline) return;
@@ -243,6 +302,42 @@ function refreshFileTimeline(page) {
   const indices = new Map(page.timeline.map((entry, index) => [entryKey(entry), index]));
   page.renderedGroups = page.renderedGroups?.flatMap(group => indices.has(group.key) ? [{ ...group, start: indices.get(group.key), end: indices.get(group.key) + group.end - group.start }] : []);
   page.renderedWindow = null;
+}
+async function loadProcessPage($, id, ref) {
+  const page = pageFor(id), pages = page.processPages ??= new Map();
+  const request = pages.get(ref.pageKey);
+  if (request?.loading || request?.records) return;
+  const loading = { loading: true };
+  pages.set(ref.pageKey, loading);
+  const visible = () => state.opened && state.selected === id && state.pages.get(id) === page && page.openTurns?.has(ref.turn_id);
+  if (request?.error && visible()) { refreshTimeline(page); await invalidate($); }
+  try {
+    const result = await bridge($, 'ui_history', { target: id, process_page: ref.locator });
+    if (pages.get(ref.pageKey) !== loading) return;
+    if (!Array.isArray(result.entries)) throw new Error(failureText(result));
+    const records = new Map(result.entries.map(entry => [entry.id, { ...entry, pageKey: ref.pageKey }]));
+    if (!records.has(ref.id) || page.live.some(entry => entry.pageKey === ref.pageKey && !records.has(entry.id))) throw new Error('历史记录位置已变更');
+    pages.set(ref.pageKey, { records });
+    const inView = new Set(drawnWindow(page).entries.map(entry => entry.pageKey).filter(Boolean));
+    for (const [key, value] of pages) {
+      if (pages.size <= 16) break;
+      if (key !== ref.pageKey && !value.loading && !inView.has(key)) pages.delete(key);
+    }
+  } catch (error) {
+    if (pages.get(ref.pageKey) === loading) pages.set(ref.pageKey, { error: failureText(error) });
+  }
+  if (visible()) { refreshTimeline(page); await invalidate($); }
+  else page.timeline = null;
+}
+function hydrateVisibleProcess($, id, page) {
+  if (!page.openTurns?.size || page.navigating || page.navigationRequest || state.imagePreview) return;
+  const pages = page.processPages ??= new Map(), running = [...pages.values()].filter(value => value.loading).length;
+  let slots = 2 - running;
+  for (const entry of drawnWindow(page).entries) {
+    if (slots <= 0) break;
+    if (entry.type !== 'turnProcessPending' || pages.has(entry.pageKey) || !page.openTurns.has(entry.turn_id)) continue;
+    slots--; void loadProcessPage($, id, entry);
+  }
 }
 function timelineWindow(page, count = page.windowSize ?? VISIBLE_ENTRIES, from) {
   const all = page.navigationTimeline ?? (page.timeline ??= conversationEntries(page.live, page)), lastStart = Math.max(0, all.length - count);
@@ -278,6 +373,10 @@ function scrollPane($, args, valid = () => true, controller = null, targetOffset
   const request = { controller, targetOffset, restore: state.restore, valid: () => state.opened && state.selected === id && state.generation === generation && valid() };
   const run = async () => {
     if (!request.valid()) return { deny: 'obsolete navigation' };
+    // Raw Button callbacks can suppress our own scroll hook. A disclosure's
+    // keyed move still releases native following, so the next live revision
+    // must be able to re-arm it when the reader is at the tail.
+    if (args.to !== 'end' && state.pages.has(id)) state.pages.get(id).nativeFollowing = false;
     state.programmaticScroll = request;
     try {
       const result = await $.ui.scroll({ in: PANE, ...args });
@@ -294,12 +393,14 @@ function cancelNavigation(page) {
   page.navigationOwner = null; page.navigationRequest = null;
   page.navigationTimeline = null; page.adding = null; page.navigating = false;
   page.layoutFloor = null;
-  page.scroller?.cancel(); page.scroller = null; page.browseTimer?.cancel();
+  page.scroller?.cancel(); page.scroller = null; page.edgeGesture = null;
 }
 function resetTailWindow(page) {
   cancelNavigation(page);
+  page.nativeFollowing = false;
   page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++;
   page.upwardRead = null;
+  page.boundaryBlocked = null; page.measureAnchor = null;
   page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
 }
 function atPaneBottom(offset, contentRows, bodyRows, surface) {
@@ -307,19 +408,60 @@ function atPaneBottom(offset, contentRows, bodyRows, surface) {
   // up. The physical end can be two cells short of the reported row maximum.
   return offset >= contentRows - bodyRows - (surface === 'desktop' ? 2 : 1);
 }
-function requestTail($, id, placement = false, markerToken = null) {
+function requestTail($, id, placement = false) {
   const page = pageFor(id);
   page.tailRequest = { token: ++navigationSequence, generation: state.generation, scrollGeneration: page.scrollGeneration, placement };
-  page.tailMarkerToken = markerToken ?? page.tailRequest.token;
+  page.tailMarkerToken = page.tailRequest.token;
   return invalidate($);
 }
-async function requestHistoryNavigation($, id, direction) {
+async function revealTail($, id, token) {
+  const page = pageFor(id), request = page.tailRequest;
+  if (!request || request.token !== token || request.running) return;
+  const current = () => state.opened && state.selected === id && page.tailRequest === request &&
+    request.generation === state.generation && request.scrollGeneration === page.scrollGeneration &&
+    page.followTail && !state.imagePreview;
+  request.running = true;
+  const marker = tailKey(id, page.tailMarkerToken);
+  let previous = null;
+  for (const delay of [0, 32, 64, 128]) {
+    if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
+    if (!current()) break;
+    await refreshPaneGeometry($, page).catch(() => {});
+    if (!current()) break;
+    let geometry;
+    const result = await scrollPane($, { to: { key: marker }, block: 'end' }, current, null, event => {
+      geometry = request.geometry = { contentRows: event.contentRows, bodyRows: event.bodyRows };
+      return Math.max(0, event.contentRows - event.bodyRows);
+    }).catch(() => ({ deny: 'not painted' }));
+    if (result?.deny || !geometry) continue;
+    request.revealed = true;
+    if (page.surface === 'desktop' || delay >= 64 && previous?.contentRows === geometry.contentRows && previous.bodyRows === geometry.bodyRows) break;
+    previous = geometry;
+  }
+  const view = page.renderedWindow;
+  if (current() && page.surface === 'desktop' && view && view.start + view.entries.length === view.total) {
+    // A keyed jump is a one-time position. Native end follows the physical
+    // pixel bottom as Markdown and images grow, until the next real scroll.
+    // It also works when a host omits the marker from its bounded key table.
+    let observed = false;
+    const result = await scrollPane($, { to: 'end' }, current, null, event => {
+      observed = true;
+      return Math.max(0, event.contentRows - event.bodyRows);
+    }).catch(() => ({ deny: 'scroll refused' }));
+    if (current()) page.nativeFollowing = observed && !result?.deny;
+  }
+  if (page.tailRequest === request) {
+    page.tailRequest = null;
+    if (state.opened && state.selected === id && state.generation === request.generation) await invalidate($);
+  }
+}
+async function requestHistoryNavigation($, id, direction, automatic = false) {
   const page = pageFor(id), generation = state.generation;
   if (page.navigating || state.imagePreview) return;
   if (page.boundaryBlocked === direction) return;
   if (page.navigationRequest?.direction === direction && page.navigationRequest.generation === generation) return;
   page.boundaryBlocked = direction;
-  const request = { token: ++navigationSequence, direction, generation, scrollGeneration: page.scrollGeneration };
+  const request = { token: ++navigationSequence, direction, generation, scrollGeneration: page.scrollGeneration, resumeTail: automatic && page.followTail };
   page.navigationRequest = request; holdWindow(page);
   const current = () => state.opened && state.selected === id && state.generation === generation
     && page.navigationRequest === request && !state.imagePreview && !page.followTail;
@@ -334,6 +476,7 @@ async function requestHistoryNavigation($, id, direction) {
   const view = drawnWindow(page);
   if (direction < 0 ? view.start === 0 : view.start + view.entries.length >= view.total) {
     page.navigationRequest = null;
+    if (request.resumeTail && page.scrollGeneration === request.scrollGeneration) page.followTail = true;
     await invalidate($); return;
   }
   request.ready = true;
@@ -363,9 +506,12 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   const anchored = !!anchorGroup;
   if (anchored && page.measureAnchor !== anchorGroup.key) {
     page.measureAnchor = anchorGroup.key;
+    // Desktop drops press keys longer than 256 characters. An item identity
+    // may include a full file path; only the compact token travels to the host.
+    page.measureKey = `codex_read_anchor_${id}_${++navigationSequence}`;
     await invalidate($);
   }
-  const measurementKey = () => anchored ? `codex_read_anchor_${id}_${anchorGroup.key}` : historyKey(id, page);
+  const measurementKey = () => anchored ? page.measureKey : historyKey(id, page);
   const before = await scroller.measure(measurementKey(), null, false, anchored);
   if (!before || !state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
   const expanded = new Set(groupEntries(drawnWindow(page).entries).flatMap(group => state.folds.has(`${id}:${entryKey(group.items[0])}:group`) ? group.items.map(entryKey) : []));
@@ -389,7 +535,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
     await refreshPaneGeometry($, page);
     if (!state.opened || state.selected !== id || gen !== state.generation || page.navigationOwner !== owner) return false;
     state.scroll.set(id, before.offset);
-    await scrollPane($, { to: 'start' }, () => page.navigationOwner === owner);
+    await scrollPane($, { to: 'start' }, () => page.navigationOwner === owner, null, () => before.offset);
   }
   if (page.navigationOwner === owner) page.layoutFloor = null;
   return !!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner;
@@ -439,7 +585,7 @@ async function browseHistory($, id, direction) {
     const previous = drawnWindow(page), first = previous.entries[0], last = previous.entries.at(-1);
     page.navigationTimeline = null; page.adding = null; page.navigating = false; page.navigationOwner = null;
     page.layoutFloor = null;
-    page.edgeCooldownUntil = Date.now() + 150;
+    if (page.edgeGesture) page.edgeGesture.settled = true;
     if (!page.followTail && first && last) {
       const all = page.timeline ??= conversationEntries(page.live, page), start = all.findIndex(entry => entryKey(entry) === entryKey(first)), end = all.findIndex(entry => entryKey(entry) === entryKey(last));
       if (start >= 0 && end >= start) { page.windowStart = start; page.windowEnd = end + 1; page.windowSize = end - start + 1; }
@@ -455,13 +601,22 @@ const controlFor = (id) => {
   return state.controls.get(id);
 };
 const active = (agent) => ['running', 'waiting', 'starting', 'compacting'].includes(agent?.status);
+function deliveryChoice(agent) {
+  if (!agent) return;
+  if (agent.final_report_pending) return;
+  if (agent.parent_continuation_pending && !active(agent)) return 'continue';
+  if (active(agent) && agent.turn_origin === 'parent') return;
+  if (['unavailable', 'unknown'].includes(agent.parent_notification?.status)) return 'report';
+}
 const interruptible = (agent) => (!agent?.user_paused && active(agent)) || agent?.status === 'unknown' || ['stopping', 'unconfirmed'].includes(agent?.user_control_status);
 function updateAgent(id, fields) {
   const agent = state.agents.find((a) => idOf(a) === id);
   if (!agent) return false;
   let changed = false;
   for (const key of summaryFields) {
-    if (Object.hasOwn(fields, key) && agent[key] !== fields[key]) { agent[key] = fields[key]; changed = true; }
+    if (!Object.hasOwn(fields, key) || agent[key] === fields[key]) continue;
+    if (key === 'parent_notification' && agent[key]?.status === fields[key]?.status && agent[key]?.reason === fields[key]?.reason) continue;
+    agent[key] = fields[key]; changed = true;
   }
   return changed;
 }
@@ -530,10 +685,13 @@ async function sendAgent($, id) {
   let refreshActivity = false;
   const selected = state.agents.find((agent) => idOf(agent) === id);
   if (!selected || control.sending || control.stopping || selected.user_control_status === 'stopping' || (!message.trim() && !attachments.length)) return;
+  const choice = deliveryChoice(selected);
+  const route = choice === 'continue' && control.privateTask ? { private_task: true }
+    : choice === 'report' && control.reportFinal ? { report_to_parent: true } : {};
   const page = pageFor(id); cancelNavigation(page); page.scrollGeneration++;
   control.sending = true; control.mutationEpoch++; control.sendResult = '发送中…'; await invalidate($);
   try {
-    const result = await bridge($, 'ui_send', { target: id, message, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
+    const result = await bridge($, 'ui_send', { target: id, message, ...route, ...(attachments.length ? { attachments: attachments.map((path) => ({ path })) } : {}) }, { requestId: actionId() });
     if (result.error || result.offline) {
       control.sendResult = result.offline || result.error?.code === 'action_status_unknown' ? '发送状态未知，请查看活动后再试。' : `发送失败：${safe(result.error?.message || result.error).slice(0, 600)}。草稿已保留。`;
     } else if (result.agent_id === id && result.status === 'steer_unconfirmed') {
@@ -541,9 +699,13 @@ async function sendAgent($, id) {
       control.sendResult = '发送结果未确认。请查看同一代理的活动后再试。草稿已保留。';
     } else if (result.agent_id === id && typeof result.status === 'string') {
       refreshActivity = true; control.sendResult = '';
+      control.privateTask = false; control.reportFinal = false;
       if (control.draft === message) { control.draft = ''; control.inputVersion++; }
       if (control.attachmentVersion === attachmentVersion) { control.attachments = []; control.attachmentVersion++; }
-      if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) updateAgent(id, { ...(Object.hasOwn(result, 'user_paused') ? { user_paused: result.user_paused } : {}), ...(Object.hasOwn(result, 'user_control_status') ? { user_control_status: result.user_control_status } : {}), ...(result.status !== 'steered' ? { status: result.status } : {}) });
+      if (state.controls.get(id) === control && control.stopEpoch === stopEpoch) {
+        const { status, ...fields } = result;
+        updateAgent(id, status === 'steered' ? fields : result);
+      }
     } else control.sendResult = '发送状态未知，请查看活动后再试。';
   } catch (error) { control.sendResult = `发送状态未知：${safe(error?.message || error).slice(0, 600)}。请查看活动后再试，草稿已保留。`; }
   finally {
@@ -658,11 +820,11 @@ async function chooseAttachments($, id, source = 'file') {
     if (page.historyChecked) return;
     page.historyChecked = true;
     try {
-      const result = await bridge($, 'ui_history', { target: id, limit: RAW_WINDOW_LIMIT, character_budget: 64000 });
+      const result = await bridge($, 'ui_history', { target: id, limit: RAW_WINDOW_LIMIT, character_budget: 64000, fold_turns: true });
       if (!state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen) return;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
       const before = drawnWindow(page), first = before.entries[0] && entryKey(before.entries[0]);
-      const changed = mergeLive(page, result.entries, true), cursorChanged = JSON.stringify(page.cursor) !== JSON.stringify(result.next_cursor ?? null);
+      const changed = mergeLive(page, result.entries, true, result.turns), cursorChanged = JSON.stringify(page.cursor) !== JSON.stringify(result.next_cursor ?? null);
       if (changed && !page.followTail && first) {
         const index = timelineWindow(page).total && page.timeline.findIndex(entry => entryKey(entry) === first);
         if (index >= 0) { const delta = index - before.start; page.windowStart += delta; if (page.windowEnd != null) page.windowEnd += delta; }
@@ -695,18 +857,19 @@ async function chooseAttachments($, id, source = 'file') {
       if (result.entries && result.revision !== page.revision) {
         const known = new Set(page.live.map(entryKey));
         appended = result.entries.some(entry => !known.has(entryKey(entry)));
-        entriesChanged = mergeLive(page, result.entries);
+        entriesChanged = mergeLive(page, result.entries, false, result.turns);
         page.revision = result.revision;
         dirty ||= entriesChanged;
       }
       if (appended && page.followTail) page.windowAnchor = null;
-      if (entriesChanged && hadRevision && !state.opening && page.followTail && !page.navigating && !page.scroller?.pending && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
+      if (entriesChanged && hadRevision && !state.opening && page.followTail && !page.nativeFollowing && !page.navigating && !page.scroller?.pending && !page.windowAnchor && page.afterSendGeneration === undefined && !state.imagePreview) {
         // Install the tail request before the changed tree can emit layout
         // scroll events. One invalidation paints both content and its request.
         await requestTail($, id);
       } else if (dirty) await invalidate($);
       const selected = state.agents.find((agent) => idOf(agent) === id);
       if (selected && selected.status !== 'starting' && !page.historyChecked) await latestHistory($, id);
+      if (state.opened && state.selected === id && state.generation === gen) hydrateVisibleProcess($, id, page);
     } catch (error) {
       if (state.opened && state.selected === id && state.generation === gen) {
         const message = `无法更新对话：${failureText(error)}。请重试。`;
@@ -732,7 +895,7 @@ async function chooseAttachments($, id, source = 'file') {
     const start = value => {
       const key = JSON.stringify(value);
       if (!cache.has(key)) {
-        cache.set(key, { promise: bridge($, 'ui_history', { target: id, cursor: value, limit: RAW_WINDOW_LIMIT, character_budget: 64000 }).catch(error => ({ error: { message: failureText(error) } })) });
+        cache.set(key, { promise: bridge($, 'ui_history', { target: id, cursor: value, limit: RAW_WINDOW_LIMIT, character_budget: 64000, fold_turns: true }).catch(error => ({ error: { message: failureText(error) } })) });
         while (cache.size > 2) cache.delete(cache.keys().next().value);
       }
       return cache.get(key);
@@ -767,7 +930,7 @@ async function chooseAttachments($, id, source = 'file') {
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
       if (result.next_cursor && JSON.stringify(result.next_cursor) === JSON.stringify(cursor)) throw new Error('历史读取位置未推进');
       const previous = drawnWindow(page), first = previous.entries[0] && entryKey(previous.entries[0]);
-      changed = mergeLive(page, result.entries, true);
+      changed = mergeLive(page, result.entries, true, result.turns);
       if (changed && !page.followTail && first) {
         timelineWindow(page);
         const index = page.timeline.findIndex(entry => entryKey(entry) === first);
@@ -899,7 +1062,7 @@ async function chooseAttachments($, id, source = 'file') {
         if (result.error || result.offline || typeof result.text !== 'string') throw new Error(failureText(result));
         const next = appendFilePage(fileStreamDetail(page, entry, path), result, position);
         cacheFileDetail(page, key, next, foldKey);
-        refreshFileTimeline(page);
+        refreshTimeline(page);
         await invalidate($);
         position = next.next_offset;
       }
@@ -910,76 +1073,74 @@ async function chooseAttachments($, id, source = 'file') {
     } finally {
       if (current()) {
         page.detailRequests.delete(key);
-        refreshFileTimeline(page);
+        refreshTimeline(page);
         await invalidate($);
       } else if (page.detailRequests.get(key) === request) page.detailRequests.delete(key);
     }
   }
-  async function copyFile($, id, entry, path, foldKey, surface) {
-    return copyWithFeedback($, id, `diff:${foldKey}`, surface, async valid => {
-      const cached = fileStreamDetail(pageFor(id), entry, path);
-      let text = cached?.chunks?.map(chunk => chunk.text).join('') ?? '';
-      let offset = cached?.chunks?.length ? cached.next_offset : 0, count = 0;
-      while (offset != null) {
-        if (++count > MAX_COPY_PAGES) throw new Error('文件超过剪贴板大小限制');
-        const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, file_path: path, offset });
-        if (!valid()) return;
-        if (result.error || result.offline || typeof result.text !== 'string') throw new Error(failureText(result));
-        text += result.text;
-        if (text.length > MAX_COPY_LENGTH) throw new Error('文件超过剪贴板大小限制');
-        if (result.next_offset != null && (!Number.isSafeInteger(result.next_offset) || result.next_offset <= offset)) throw new Error('读取位置未推进');
-        offset = result.next_offset;
-      }
-      if (text.length > MAX_COPY_LENGTH) throw new Error('文件超过剪贴板大小限制');
-      return text;
-    });
+  function copyFile($, id, entry, path, foldKey, surface) {
+    const cached = fileStreamDetail(pageFor(id), entry, path);
+    const chunks = cached?.chunks;
+    const text = chunks?.length && cached.next_offset === null && chunks.reduce((sum, chunk) => sum + chunk.text.length, 0) <= MAX_CLIPBOARD_LENGTH
+      ? chunks.map(chunk => chunk.text).join('') : undefined;
+    copyWithFeedback($, id, `diff:${foldKey}`, surface, text, { turn_id: entry.turn_id, item_id: entry.id, file_path: path });
   }
-  async function copyWithFeedback($, id, key, surface, read) {
-    const page = pageFor(id), gen = state.generation, intent = ++copyIntent;
-    const valid = () => intent === copyIntent && state.opened && state.selected === id && state.generation === gen;
-    page.copyFeedback = { key, phase: 'pending', intent, generation: gen };
-    page.copyError = null;
-    void invalidate($);
-    try {
-      const text = typeof read === 'function' ? await read(valid) : read;
-      if (!valid() || typeof text !== 'string') return;
-      const result = await $.ui.copy({ text, surface });
-      if (result?.isCopied !== true) throw new Error(result?.reason || '剪贴板未确认复制成功');
-      if (!valid()) return;
-      page.copyFeedback = { key, phase: 'copied', intent, generation: gen };
-      await invalidate($);
-      $.clock.after(1600, async () => {
-        if (!valid() || page.copyFeedback?.intent !== intent) return;
-        page.copyFeedback = null;
-        await invalidate($);
-      });
-    } catch (error) {
-      if (valid()) {
-        page.copyFeedback = { key, phase: 'failed', intent, generation: gen };
-        page.copyError = { key, text: `复制失败：${failureText(error)}` };
-        await invalidate($);
-      }
-    }
-  }
-  async function copyMessage($, id, entry, surface, view = 'message') {
-    return copyWithFeedback($, id, entryKey(entry), surface, async valid => {
-      let text = view === 'communication' ? entry.communication.text : body(entry);
-      if (view === 'communication' ? entry.communication.truncated : entry.message?.truncated) {
-        text = ''; let offset = 0, pages = 0;
-        while (true) {
-          if (++pages > MAX_COPY_PAGES) throw new Error('正文超过复制大小限制');
-          const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view, offset, bulk: true });
-          if (!valid()) return;
-          if (result.error || result.offline || typeof result.text !== 'string') throw new Error(failureText(result));
-          text += result.text;
-          if (text.length > MAX_COPY_LENGTH || (Number.isFinite(result.total_length) && result.total_length > MAX_COPY_LENGTH)) throw new Error('正文超过复制大小限制');
-          if (result.next_offset == null) break;
-          if (!Number.isSafeInteger(result.next_offset) || result.next_offset <= offset) throw new Error('读取位置未推进');
-          offset = result.next_offset;
+  const localCopyFile = url => typeof url === 'string' && /^file:\/\/[^<>\r\n]+$/i.test(url);
+  function copyWithFeedback($, id, key, surface, text, source) {
+    if (!state.opened || state.selected !== id) return;
+    const page = pageFor(id), generation = state.generation;
+    if (page.copyFeedback?.key === key && page.copyFeedback.phase === 'pending' && page.copyFeedback.generation === generation) return;
+    const intent = ++copyIntent, feedback = { key, intent, generation };
+    const current = () => intent === copyIntent && state.opened && state.selected === id && state.generation === generation;
+    const update = (phase, extra) => {
+      if (!current()) return;
+      page.copyFeedback = { ...feedback, phase, ...extra };
+      void invalidate($);
+    };
+    const prepare = async copy => {
+      const value = await bridge($, 'ui_detail', { target: id, ...source, copy });
+      if (value.error || value.offline) throw new Error(failureText(value));
+      if (localCopyFile(value.file_url)) return { fileUrl: value.file_url };
+      if (copy === true && typeof value.text === 'string' && value.next_offset == null) return { text: value.text };
+      throw new Error('未能读取完整内容');
+    };
+    const execute = async () => {
+      try {
+        const value = source && (typeof text !== 'string' || text.length > MAX_CLIPBOARD_LENGTH) ? await prepare(true) : { text };
+        if (!current()) return;
+        if (value.fileUrl) { update('file', value); return; }
+        if (typeof value.text !== 'string' || value.text.length > MAX_CLIPBOARD_LENGTH) throw new Error('内容超过剪贴板大小限制');
+        const result = await $.ui.copy({ text: value.text, surface });
+        if (!current()) return;
+        if (result?.isCopied !== true) {
+          if (source && clipboardUnavailable.has(result?.reason)) {
+            const file = await prepare('file');
+            update('file', file);
+            return;
+          }
+          throw new Error(result?.reason || '剪贴板未确认复制成功');
         }
+        update('copied');
+        $.clock.after(1600, async () => {
+          if (!current() || page.copyFeedback?.intent !== intent) return;
+          page.copyFeedback = null;
+          await invalidate($);
+        });
+      } catch (error) {
+        update('failed', { text: `复制失败：${failureText(error)}` });
       }
-      return text;
-    });
+    };
+    page.copyFeedback = { ...feedback, phase: 'pending' };
+    // Keep the clipboard call in the native Button's own closure so desktop
+    // can associate it with the press. The host need not await clipboard I/O.
+    void execute();
+    if (page.copyFeedback.phase === 'pending') void invalidate($);
+  }
+  function copyMessage($, id, entry, surface) {
+    const cached = detailFor(pageFor(id), entry, undefined, 'message');
+    const text = !entry.message?.truncated && !entry.deferred && typeof entry.data?.text === 'string' ? entry.data.text
+      : !cached?.external && !cached?.error && typeof cached?.text === 'string' && cached.total_length === cached.text.length ? cached.text : undefined;
+    copyWithFeedback($, id, entryKey(entry), surface, text, { turn_id: entry.turn_id, item_id: entry.id, view: 'message' });
   }
   async function expandBody($, id, entry, view, foldKey) {
     const page = pageFor(id), key = detailKey(entry, undefined, view), gen = state.generation, historyGen = page.historyGeneration;
@@ -1036,10 +1197,23 @@ export function registerUI(on) {
     if (state.opening || state.imagePreview || state.restoringPreview) return next(e);
     const id = state.selected;
     const page = id && pageFor(id), gen = state.generation;
+    const now = Date.now(), direction = Math.sign(e.by);
+    const gesture = page?.edgeGesture;
+    // Desktop reports displacement, with no wheel-start or wheel-end event.
+    // Keep consuming the tail of a gesture while events keep arriving. A
+    // fixed delay from the layout commit can expire in the middle of inertia.
+    const continuing = gesture && direction === gesture.direction && now - gesture.lastAt < 180;
+    if (direction && gesture) {
+      if (continuing || page.navigating) gesture.lastAt = now;
+      else page.edgeGesture = null;
+    }
     if (page?.navigating && page.surface === 'desktop') {
       // Repeated wheel input during settlement is one loading gesture, not a
       // backlog of moves to replay after the reading position is restored.
       return next({ ...e, offset: state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
+    }
+    if (continuing && gesture.settled && page.surface === 'desktop') {
+      return next({ ...e, offset: state.scroll.get(id) ?? e.offset - e.by });
     }
     const oldGeometry = page?.scrollGeometry;
     if (page) page.scrollGeometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
@@ -1054,20 +1228,22 @@ export function registerUI(on) {
     }
     // Desktop reports content growth/resizing as person scrolls even when the
     // viewport did not move. That is not an instruction to stop live following.
-    if (page?.followTail && e.by === 0 && !page.scroller?.pending) {
+    const view = page && drawnWindow(page);
+    const newest = view && view.start + view.entries.length >= view.total;
+    const grew = oldGeometry && e.contentRows - e.bodyRows > oldGeometry.contentRows - oldGeometry.bodyRows;
+    if (page && !page.scroller?.pending && (e.by === 0 || page.followTail && (tail || page.nativeFollowing) && !page.windowAnchor && newest && direction > 0)) {
       // A mounted Markdown leaf can grow after the first placement and before
       // any new message arrives. One request covers repeated resize reports.
-      if (oldGeometry && e.contentRows > oldGeometry.contentRows && !atBottom && state.opened &&
+      if (page.followTail && (grew && !atBottom || direction > 0 && page.nativeFollowing) && state.opened &&
           !tail && !page.navigating && !page.navigationRequest && !page.windowAnchor) void requestTail($, id);
       return next(e);
     }
-    const view = page && drawnWindow(page);
     const controller = page && scrollController($, id, page);
     const intent = controller?.intent, observed = controller?.observe(e);
     if (controller && controller.intent === intent) return next(observed);
     if (e.origin.kind === 'person' && id) {
       const wasFollowing = page.followTail;
-      page.browseTimer?.cancel();
+      page.nativeFollowing = false;
       page.tailRequest = null;
       if (page.navigationRequest && e.by !== 0 && Math.sign(e.by) !== page.navigationRequest.direction) page.navigationRequest = null;
       const previousOffset = state.scroll.get(id);
@@ -1078,33 +1254,29 @@ export function registerUI(on) {
         page.upwardRead = atBottom && e.by < 0 && stableGeometry && e.offset < (previousOffset ?? e.offset)
           ? { offset: e.offset, contentRows: e.contentRows, bodyRows: e.bodyRows } : null;
       }
-      if (!page.navigating && !page.navigationRequest && !page.historyLoading && Date.now() >= (page.edgeCooldownUntil || 0) && stableGeometry && e.by !== 0) {
-        // A new wheel/key gesture can retry the same edge. Requiring the reader
-        // to leave three rows first permanently locks short panes and failures.
-        // Gestures during an in-flight navigation are consumed, never queued.
-        page.boundaryBlocked = null; page.lastEdgeRequest = null;
-      }
       page.windowAnchor = null;
       holdWindow(page);
       if (page.windowEnd == null) page.windowStart = view.start;
       // A downward move to the end of the newest window resumes following.
       // Layout clamps and repeated reports at an unchanged offset do not.
-      const movedDown = e.by > 0 && stableGeometry && (previousOffset == null || e.offset > previousOffset);
-      page.followTail = atBottom && view.start + view.entries.length >= view.total && (wasFollowing && e.by >= 0 || movedDown);
+      page.followTail = atBottom && newest && e.by > 0;
       page.awayFromBottom = !page.followTail;
+      if (!wasFollowing && page.followTail && page.surface === 'desktop') void requestTail($, id);
     }
     // Return the wheel dispatch immediately. History, state writes and paint
     // barriers run outside the host's scroll request chain.
-    if (e.origin.kind === 'person' && id && state.opened && !page.navigating && Date.now() >= (page.edgeCooldownUntil || 0)) {
+    if (direction && id && state.opened && !page.navigating && !page.navigationRequest && !page.edgeGesture) {
       const threshold = Math.max(2, (e.bodyRows || 12) * 2);
       if (e.by < 0 && e.offset <= threshold && page.cursor) prefetchHistory($, id);
       const needsTrim = view.entries.length >= 300 || page.renderCost?.chars > 48000 || page.renderCost?.nodes > 5500;
-      const earlier = page.boundaryBlocked !== -1 && e.by < 0 && e.offset <= (needsTrim ? 1 : threshold) && (view.start > 0 || page.cursor);
-      const later = page.boundaryBlocked !== 1 && e.by > 0 && e.offset >= e.contentRows - e.bodyRows - (needsTrim ? 1 : threshold) && view.start + view.entries.length < view.total;
+      const earlier = direction < 0 && e.offset <= (needsTrim ? 1 : threshold) && (view.start > 0 || page.cursor);
+      const nearEnd = needsTrim ? atBottom : e.offset >= e.contentRows - e.bodyRows - threshold;
+      const later = direction > 0 && nearEnd && view.start + view.entries.length < view.total;
       if (earlier || later) {
-        const scrollGen = page.scrollGeneration;
-        page.browseTimer = $.clock.after(32, () => {
-          if (state.opened && state.selected === id && gen === state.generation && scrollGen === page.scrollGeneration) return requestHistoryNavigation($, id, earlier ? -1 : 1);
+        page.boundaryBlocked = null;
+        const gesture = page.edgeGesture = { direction, lastAt: now, settled: false };
+        $.clock.after(0, () => {
+          if (state.opened && state.selected === id && gen === state.generation && page.edgeGesture === gesture) return requestHistoryNavigation($, id, direction);
         });
       }
     }
@@ -1126,6 +1298,9 @@ export function registerUI(on) {
       state.scroll.set(id, offset);
       return next({ ...e, offset });
     }
+    // Ordinary keyed moves, including a tool disclosure or a history probe,
+    // release Desktop's native end-follow mode.
+    page.nativeFollowing = false;
     if (transfer?.controller?.pending) return next(transfer.controller.observe(e));
     if (page.scroller?.pending) return next(page.scroller.observe(e));
     if (state.restore) return next({ ...e, offset: state.scroll.get(id) || 0 });
@@ -1163,52 +1338,11 @@ export function registerUI(on) {
       page.lastEdgeRequest = e.data.token;
       page.shortFillDone = true;
       const direction = e.data.direction === 1 ? 1 : -1;
-      $.clock.after(0, () => { if (state.opened && state.selected === id && state.generation === generation) return requestHistoryNavigation($, id, direction); });
+      $.clock.after(0, () => { if (state.opened && state.selected === id && state.generation === generation) return requestHistoryNavigation($, id, direction, true); });
       return {};
     }
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'tail') {
-      const id = state.selected, page = pageFor(id), request = page.tailRequest;
-      if (!request || request.token !== e.data.token || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) return {};
-      // The key proves this transcript has painted. Its own rectangle can end
-      // before a native Markdown leaf or the composer has finished laying out.
-      // Use the whole pane's measured end without enabling native followEnd().
-      let previousGeometry = null, elapsed = 0;
-      const markerToken = page.tailMarkerToken;
-      for (const delay of [0, 32, 64, 128]) {
-        if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
-        elapsed += delay;
-        if (state.selected !== id || page.tailRequest !== request || request.generation !== state.generation || request.scrollGeneration !== page.scrollGeneration || !page.followTail || state.imagePreview) break;
-        await refreshPaneGeometry($, page);
-        if (state.selected !== id || page.tailRequest !== request || !page.followTail) break;
-        let geometry;
-        const result = await scrollPane($, { to: { key: tailKey(id, markerToken) }, block: 'end' }, () => page.tailRequest === request && request.scrollGeneration === page.scrollGeneration && page.followTail, null, event => {
-          geometry = { contentRows: event.contentRows, bodyRows: event.bodyRows };
-          request.geometry = geometry;
-          return Math.max(0, event.contentRows - event.bodyRows);
-        }).catch(() => ({ deny: 'not painted' }));
-        if (!result?.deny && geometry) {
-          request.revealed = true;
-          if (request.token !== markerToken) break; // One late check of an existing marker.
-          if (elapsed >= 96 && previousGeometry &&
-              geometry.contentRows === previousGeometry.contentRows && geometry.bodyRows === previousGeometry.bodyRows &&
-              geometry.contentRows === page.scrollGeometry?.contentRows && geometry.bodyRows === page.scrollGeometry.bodyRows) break;
-          previousGeometry = geometry;
-        }
-      }
-      if (page.tailRequest === request) {
-        page.tailRequest = null;
-        if (request.placement && page.surface === 'desktop') {
-          // Late native leaves can grow without changing scrollTop or emitting
-          // a scroll event. Recheck the same painted transcript once in a fresh
-          // dispatch, after returning this hook and without delaying input.
-          $.clock.after(384, () => {
-            if (state.opened && state.selected === id && state.generation === request.generation &&
-                page.scrollGeneration === request.scrollGeneration && page.tailMarkerToken === markerToken &&
-                page.followTail && !page.tailRequest && !page.windowAnchor && !state.imagePreview) return requestTail($, id, false, markerToken);
-          });
-        }
-        await invalidate($);
-      }
+      await revealTail($, state.selected, e.data.token);
       return {};
     }
     if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'navigate') {
@@ -1220,6 +1354,13 @@ export function registerUI(on) {
       // which would suppress all our scroll observers. Keep this frame alive
       // until both measurements complete; never run a probe from a timer.
       await browseHistory($, state.selected, request.direction);
+      if (request.resumeTail && page.scrollGeneration === request.scrollGeneration && state.generation === request.generation && !page.followTail) {
+        const view = drawnWindow(page);
+        if (view.start + view.entries.length === view.total) {
+          page.followTail = true;
+          await requestTail($, state.selected);
+        }
+      }
       return {};
     }
     const file = controlFor(state.selected).fileActions?.get(e.element);
@@ -1334,9 +1475,13 @@ function renderPane($, e, next) {
       ] });
     }
     let view = timelineWindow(page), entries = view.entries;
-    const jump = async () => {
+    const jump = async event => {
       resetTailWindow(page);
       await requestTail($, id, true);
+      // The icon already runs in a registered message frame. Drive its jump
+      // here even if replacing a tall older window moves the sync Client out
+      // of the viewport. The request is shared with any concurrent paint post.
+      if (e.surface === 'desktop' && event?.data?.action === 'activate') await revealTail($, id, page.tailRequest?.token);
     };
     const navigation = [], composer = [];
     const caption = (key, value) => Text({ key, size: 'caption', dimColor: true, children: [safe(value)] });
@@ -1364,13 +1509,19 @@ function renderPane($, e, next) {
         Box({ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, children: [Client({ key, module: './icon-control.js', width, height, props: { expanded, action, rows: height } })] }),
       ] });
     };
+    const copyStatus = key => page.copyFeedback?.key === key && page.copyFeedback.generation === state.generation ? page.copyFeedback : null;
+    const copyNotice = (key, feedbackKey, label) => {
+      const feedback = copyStatus(feedbackKey);
+      if (feedback?.phase === 'file') return Markdown({ key, text: `[${label}](<${feedback.fileUrl}>)` });
+      if (feedback?.phase === 'failed') return caption(key, feedback.text);
+    };
     const copyButton = (key, feedbackKey, label, onPress) => {
-      const feedback = page.copyFeedback?.key === feedbackKey && page.copyFeedback.generation === state.generation ? page.copyFeedback : null;
+      const feedback = copyStatus(feedbackKey);
       const status = copyLabels[feedback?.phase];
-      const source = feedback?.phase === 'copied' ? copiedIcon : feedback?.phase === 'failed' ? copyFailedIcon : copyIcon;
-      return e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function'
-        ? hint(`${key}_hint`, iconButton(key, { source, label: status || label, size: 14, onPress }), status || label, 18, -10, !!status)
-        : Button({ key, plain: true, label: status || label, onPress });
+      const glyph = { pending: '…', copied: '✓', failed: '×', file: '↗' }[feedback?.phase] || '⧉';
+      const desktop = e.surface === 'desktop';
+      const button = Button({ key, plain: true, label: status || label, ...(desktop ? { children: [Text({ size: 'caption', children: [glyph] })] } : {}), onPress });
+      return desktop ? hint(`${key}_hint`, button, status || label, 18, -10, !!status) : button;
     };
     const disclosure = (key, label, onPress, entry, integration = false, expanded) => {
       const activate = entry ? (...args) => {
@@ -1387,6 +1538,7 @@ function renderPane($, e, next) {
         children.push(iconButton(hitKey, { source: disclosureIcon(expanded), label: expanded ? '收起' : '展开', onPress: activate, action: 'toggle', expanded, width: 1.5, align: 'flex-start' }));
       }
       const title = vector ? Box({ key: `title_${key}`, flexDirection: 'row', alignItems: 'center', gap: 0, minWidth: 0, children }) : button;
+      if (entry?.type === 'turnSummary') return title;
       return entry ? Box({ key: `row_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', children: [iconFor(`icon_${key}`, activityIcon(entry, integration)), title] }) : button;
     };
     const sourceCode = (key, source) => {
@@ -1451,7 +1603,7 @@ function renderPane($, e, next) {
         const key = entryKey(first), props = { key: `activity_group_${id}:${key}`, flexDirection: 'column', rowGap, minWidth: 0 };
         const groupTree = Box({ ...props, children });
         const anchored = node => record.key === page.measureAnchor ? Box({ key: `activity_read_anchor_${id}:${key}`, position: 'relative', flexDirection: 'column', minWidth: 0, children: [
-          Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: `codex_read_anchor_${id}_${record.key}`, plain: true, label: '·', onPress: () => {} })] }), node,
+          Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: page.measureKey, plain: true, label: '·', onPress: () => {} })] }), node,
         ] }) : node;
         // Leave room for both neighbours. A single nearly-full tree otherwise
         // rejects every prepend/append and traps navigation on the same item.
@@ -1470,6 +1622,11 @@ function renderPane($, e, next) {
         const node = paginate();
         return { node, cost: budget.cost(node), ...(first.fileView ? {} : { paginate }) };
       };
+      if (first.type === 'turnProcessPending') {
+        const key = `turn_process_page_${id}:${entryKey(first)}`;
+        if (!first.error) return groupBox([caption(key, '正在读取过程…')]);
+        return groupBox([caption(key + '_error', first.error), disclosure(key, '重新读取这段过程', () => loadProcessPage($, id, first), first)]);
+      }
       if (group.items.length > 1 || group.integration) {
         const groupLabel = group.integration ? `已使用 ${safe(group.integration)} 集成` : group.type === 'webSearch' ? '搜索' : safe(description(first)).slice(0, 120);
         groupRows.push(disclosure(`group_${groupKey}`, `${groupLabel}${!group.integration ? ` (${group.items.length})` : ''}`, () => { toggle(groupKey); return invalidate($); }, first, Boolean(group.integration), !folded));
@@ -1477,6 +1634,20 @@ function renderPane($, e, next) {
       }
       const itemRows = [];
       for (const entry of group.items) {
+        if (entry.type === 'turnSummary') {
+          const key = `turn_process_${id}:${entry.turn_id}`, label = durationLabel(entry.duration_ms);
+          if (!entry.hasProcess) {
+            if (Number.isFinite(entry.duration_ms)) itemRows.push(caption(key, label));
+          } else itemRows.push(disclosure(key, label, async () => {
+            page.openTurns ??= new Set();
+            if (entry.open) page.openTurns.delete(entry.turn_id);
+            else page.openTurns.add(entry.turn_id);
+            refreshTimeline(page);
+            await invalidate($);
+            if (!entry.open && entry.firstPage) return loadProcessPage($, id, entry.firstPage);
+          }, entry, false, entry.open));
+          continue;
+        }
         if (['collabAgentToolCall', 'collabToolCall', 'subAgentActivity'].includes(entry.type) && !entry.communication) {
           const d = entry.data || {}, target = d.agentThreadId || d.agent_id || d.agentId || d.agents?.[0]?.id || d.receiverThreadIds?.[0] || d.name || d.names?.[0] || entry.id;
           const waiting = d.tool === 'wait';
@@ -1494,12 +1665,15 @@ function renderPane($, e, next) {
           const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
           const shown = bodyOpen && loaded && !loaded.error ? loaded : null;
           const text = safe(shown?.text ?? (local && truncated && !bodyOpen ? rawBody.slice(0, 4096) : rawBody));
-          message.push(shown?.external ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: normalizeMessageMarkdown(text, { displayMath: e.surface === 'desktop' }) }));
+          message.push(shown?.external ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: normalizeMessageMarkdown(text, { nativeMath: e.surface === 'desktop' }) }));
           if (entry.type === 'agentMessage' && entry.message?.is_final) {
             const copy = (press = {}) => copyMessage($, id, entry, press.surface ?? e.surface);
             const action = copyButton(`message_copy_${key}`, entryKey(entry), '复制回复', copy);
-            message.push(Box({ key: `message_actions_${key}`, flexDirection: 'row', justifyContent: 'flex-start', children: [action] }));
-            if (page.copyError?.key === entryKey(entry)) message.push(caption(`message_copy_error_${key}`, page.copyError.text));
+            const time = finalTimestamp(entry.completed_at_ms ?? page.turns?.get(entry.turn_id)?.completed_at_ms);
+            message.push(Box({ key: `message_actions_${key}`, flexDirection: 'row', alignItems: 'center', gap: 'xs', justifyContent: 'flex-start',
+              children: [action, ...(time ? [caption(`message_time_${key}`, time)] : [])] }));
+            const notice = copyNotice(`message_copy_error_${key}`, entryKey(entry), '打开完整回复');
+            if (notice) message.push(notice);
           }
           const attachments = Array.isArray(entry.data?.attachments) ? entry.data.attachments : Array.isArray(entry.data?.content) ? entry.data.content.filter((part) => ['localImage', 'mention'].includes(part?.type)) : [];
           if (attachments.length) message.push(Box({ key: `attachments_${key}`, flexDirection: 'row', flexWrap: 'wrap', gap: 'sm', children: attachments.map((part, index) => {
@@ -1515,9 +1689,9 @@ function renderPane($, e, next) {
             if (local || (loaded && !loaded.error)) return invalidate($);
             return expandBody($, id, entry, view, bodyKey);
           }));
-          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { alignSelf: 'flex-end', minWidth: 0, borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: e.surface === 'desktop' ? 0.8 : 1 }), children: message });
-          const bounded = incoming ? Box({ key: `message_limit_${key}`, width: '85%', flexDirection: 'column', alignItems: 'flex-end', children: [content] }) : content;
-          itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', justifyContent: incoming ? 'flex-end' : 'flex-start', children: [bounded] }));
+          const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { flexShrink: 1, minWidth: 0, borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: e.surface === 'desktop' ? 0.8 : 1 }), children: message });
+          const bounded = incoming ? Box({ key: `message_limit_${key}`, width: '85%', minWidth: 0, flexDirection: 'row', justifyContent: 'flex-end', children: [content] }) : content;
+          itemRows.push(Box({ key: `message_container_${key}`, flexDirection: 'row', minWidth: 0, justifyContent: incoming ? 'flex-end' : 'flex-start', children: [bounded] }));
           continue;
         }
         if (entry.fileView) {
@@ -1531,7 +1705,7 @@ function renderPane($, e, next) {
               if (!page.followTail) holdWindow(page);
               toggle(fileKey);
               if (open) page.detailRequests.delete(detailKey(original, file.path));
-              refreshFileTimeline(page);
+              refreshTimeline(page);
               await invalidate($);
               if (!open && !loaded?.chunks) await loadFileStream($, id, original, file.path, fileKey);
             }, { ...entry, type: 'fileChange' }, false, open));
@@ -1557,7 +1731,8 @@ function renderPane($, e, next) {
             control.fileActions.set(controlKey, { ...file, token, offset });
             if (typeof Client === 'function') itemRows.push(Box({ position: 'relative', height: 0, children: [Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 1, children: [Client({ key: controlKey, module: './file-stream-control.js', width: 1, height: 1, props: { token } })] })] }));
           }
-          if (file.isFirst && page.copyError?.key === `diff:${fileKey}`) itemRows.push(caption(`diff_copy_error_${fileKey}`, page.copyError.text));
+          const notice = file.isFirst && copyNotice(`diff_copy_error_${fileKey}`, `diff:${fileKey}`, '打开完整差异');
+          if (notice) itemRows.push(notice);
           continue;
         }
         const toolStart = itemRows.length;
@@ -1572,11 +1747,10 @@ function renderPane($, e, next) {
           if (expanded) {
             const loaded = detailFor(page, entry, undefined, view), shown = bodyOpen && loaded && !loaded.error ? loaded : null;
             const text = safe(shown?.text ?? entry.communication.text);
-            const contents = [shown?.external ? Text({ key: `communication_${key}`, size: 'body', children: [text] }) : Markdown({ key: `communication_${key}`, text: normalizeMessageMarkdown(text, { displayMath: e.surface === 'desktop' }) })];
+            const contents = [shown?.external ? Text({ key: `communication_${key}`, size: 'body', children: [text] }) : Markdown({ key: `communication_${key}`, text: normalizeMessageMarkdown(text, { nativeMath: e.surface === 'desktop' }) })];
             const failure = communicationFailure(entry);
             if (failure) contents.push(caption(`communication_failure_${key}`, `发送异常：${failure}`));
             if (bodyOpen && loaded?.error) contents.push(caption(`communication_error_${key}`, loaded.text));
-            if (page.copyError?.key === entryKey(entry)) contents.push(caption(`communication_copy_error_${key}`, page.copyError.text));
             const rawKey = `${key}:raw`, sections = toolSections(entry);
             if (sections.length) {
               contents.push(Box({ key: `tool_raw_row_${key}`, flexDirection: 'row', children: [hint(`tool_raw_hover_${key}`, disclosure(`tool_raw_${key}`, '‹/›', () => { toggle(rawKey); return invalidate($); }), state.folds.has(rawKey) ? '收起原始调用' : '显示原始调用', 16)] }));
@@ -1638,8 +1812,9 @@ function renderPane($, e, next) {
           const localImage = typeof imagePath === 'string' && /^(?:[a-z]:[\\/]|\/(?!\/))/i.test(imagePath);
           if (['imageView', 'imageGeneration'].includes(entry.type) && localImage && !entry.media?.has_images) {
             if (typeof Image === 'function' && /\.png$/i.test(imagePath)) itemRows.push(previewImage(`legacy_${key}`, { ...entry.data, path: imagePath, alt: `图片：${imagePath}` }, key));
-            itemRows.push(copyButton(`copy_${key}`, `image:${key}`, '复制图片路径', press => copyWithFeedback($, id, `image:${key}`, press.surface ?? e.surface, imagePath)));
-            if (page.copyError?.key === `image:${key}`) itemRows.push(caption(`image_copy_error_${key}`, page.copyError.text));
+            itemRows.push(copyButton(`copy_${key}`, `image:${key}`, '复制图片路径', (press = {}) => copyWithFeedback($, id, `image:${key}`, press.surface ?? e.surface, imagePath)));
+            const notice = copyNotice(`image_copy_error_${key}`, `image:${key}`);
+            if (notice) itemRows.push(notice);
           }
           if (loaded?.offset > 0) itemRows.push(disclosure(`detail_prev_${key}`, '上一页输出', () => detail($, id, entry, Math.max(0, loaded.offset - 16000))));
           const truncated = entry.deferred || (entry.preview?.length ?? 0) >= 4096 || entry.preview?.includes('[truncated]') || JSON.stringify(entry.data || {}).includes('[truncated]');
@@ -1659,6 +1834,22 @@ function renderPane($, e, next) {
       disclosure(`attachment_${id}_${index}`, `${safe(attachmentName(path, index))} ×`, () => { control.attachments = control.attachments.filter((_, i) => i !== index); control.attachmentVersion++; return invalidate($); }), Box({ position: 'absolute', top: -2, left: 0, width: 40, display: 'none', hover: { display: 'flex' }, children: [Text({ size: 'caption', inverse: true, children: [safe(displayLabel(path.split(/[\\/]/).at(-1) || path))] })] })] })) }));
     if (control.pathEntry) composer.push(Input({ key: `attachment_path_${id}_${control.attachmentVersion}`, label: '文件路径', placeholder: '输入文件的绝对路径', submitLabel: '添加', onSubmit: (path) => { addAttachments(control, [path]); control.pathEntry = false; return invalidate($); } }));
     if (control.attachmentNotice) composer.push(caption(`codex_attachment_notice_${id}`, control.attachmentNotice));
+    if (selected.final_report_pending) composer.push(caption(`codex_report_pending_${id}`, '本轮最终回复将发给 Claude'));
+    const choice = deliveryChoice(selected);
+    if (choice) {
+      const key = `codex_delivery_choice_${id}`;
+      const toggleChoice = () => {
+        if (control.sending || state.selected !== id || deliveryChoice(state.agents.find(agent => idOf(agent) === id)) !== choice) return;
+        if (choice === 'continue') control.privateTask = !control.privateTask;
+        else control.reportFinal = !control.reportFinal;
+        return invalidate($);
+      };
+      control.navigationActions.set(key, toggleChoice);
+      const label = choice === 'continue'
+        ? (control.privateTask ? '单独提问 · 切换为继续 Claude 的任务' : '继续 Claude 的任务 · 切换为单独提问')
+        : `${control.reportFinal ? '☑' : '☐'} 把本轮最终回复发给 Claude`;
+      composer.push(Button({ key, plain: true, label, onPress: toggleChoice }));
+    }
     composer.push(Box({ key: `codex_input_${id}`, flexDirection: 'column', width: '100%', alignItems: 'stretch', children: [Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, ...(e.surface === 'desktop' ? {} : { submitLabel: '发送' }), onInput: control.actions.input, onSubmit: control.actions.submit })] }));
     const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
     const used = selected?.context_used_tokens, limit = selected?.context_limit_tokens;
@@ -1769,7 +1960,7 @@ function renderPane($, e, next) {
       const cost = sumCost();
       if (cost.chars <= paneLimit.chars && cost.nodes <= paneLimit.nodes && cost.depth <= paneLimit.depth) break;
       const anchorIndex = selectedGroups.findIndex(group => group.key === page.measureAnchor || Number.isInteger(anchor) && group.start <= anchor && group.end > anchor);
-      if (anchorIndex >= selectedGroups.length / 2 || page.adding?.direction > 0 && anchorIndex < 0) selectedGroups.shift();
+      if (page.followTail && !page.windowAnchor || anchorIndex >= selectedGroups.length / 2 || page.adding?.direction > 0 && anchorIndex < 0) selectedGroups.shift();
       else selectedGroups.pop();
     }
     if (selectedGroups.length) { plan.start = selectedGroups[0].start; plan.end = selectedGroups.at(-1).end; }
