@@ -11,7 +11,7 @@ const resultMessage = (result, tool_use_id = 'wait-1') => ({ role: 'user', conte
 
 async function setup(respond = () => ({}), history = [], userConfig = {}) {
   const { register } = await import('../hooks/register.js?' + randomUUID());
-  const handlers = new Map(), toolHandlers = [], appendHandlers = [], calls = [], envs = [], prompts = [], registered = [], retained = [...history];
+  const handlers = new Map(), toolHandlers = [], appendHandlers = [], calls = [], envs = [], prompts = [], logs = [], registered = [], retained = [...history];
   let timer, scans = 0, submit = async () => ({}), appendNote = async args => ({ message: args.message, uuid: 'note' });
   register((event, filter, handler) => {
     if (event === 'session.append') appendHandlers.push({ filter, handler });
@@ -21,7 +21,7 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
   const $ = {
     session: { id: async () => 'owner', cwd: async () => '/workspace', messages: async () => { scans++; return retained; }, append: args => appendNote(args) },
     env: { get: async () => undefined }, plugin: { root: '/plugin' },
-    tool: { register: async tool => { registered.push(tool); } }, clock: { every: (_, callback) => { timer = callback; } }, ui: { status: async () => {}, invalidate: () => {} },
+    tool: { register: async tool => { registered.push(tool); } }, clock: { every: (_, callback) => { timer = callback; } }, ui: { status: async () => {}, invalidate: () => {}, log: (text, options) => { logs.push({ text, options }); } },
     prompt: { submit: args => { prompts.push(args); return submit(args); } },
     process: { run: async (_, options) => {
       const body = JSON.parse(options.stdin); calls.push(body); envs.push(options.env);
@@ -29,7 +29,7 @@ async function setup(respond = () => ({}), history = [], userConfig = {}) {
     } },
   };
   const h = {
-    calls, envs, prompts, registered, retained, appendHandlers, handlers, get scans() { return scans; }, setSubmit: fn => { submit = fn; }, setAppendNote: fn => { appendNote = fn; },
+    calls, envs, prompts, logs, registered, retained, appendHandlers, handlers, get scans() { return scans; }, setSubmit: fn => { submit = fn; }, setAppendNote: fn => { appendNote = fn; }, setLog: fn => { $.ui.log = fn; },
     start: () => handlers.get('session.start')($, {}, async e => e), observe: () => timer(),
     emit: (name, args = {}) => handlers.get(name)($, args, async e => e),
     step: async (args, downstream = async function* () {}, signal) => {
@@ -114,6 +114,7 @@ test('a bounded wait delivers an available event and confirms only after final a
   assert.equal(result.events[0].seq, 11); assert.equal(h.calls.length, 1);
   await h.append(resultMessage(result));
   assert.deepEqual(h.calls[1].args, { observations: [{ delivery_id: 'd1', sequences: [11], events: [event()] }] });
+  assert.deepEqual(h.logs, []);
 });
 
 test('append subscriptions exclude protected doors and unrelated tool results', async () => {
@@ -257,6 +258,7 @@ test('queued prompt owns delivery until final append, renews lease, and lets too
   await h.observe(); assert.deepEqual(h.calls.at(-1).args, { deliver: false, lease_id: 'p1' });
   queued.resolve({}); await tick(); assert.equal(h.calls.some(x => x.operation === 'confirm'), false);
   await h.append({ role: 'user', content: h.prompts[0].text }, { door: 'prompt' }); assert.equal(h.calls.at(-1).operation, 'confirm');
+  assert.deepEqual(h.logs, []);
 });
 
 test('supported step boundary preserves stream and result, observing only after downstream completes', async () => {
@@ -444,22 +446,44 @@ test('busy note refusal, rewrite or exception releases the lease without acknowl
     h.setAppendNote(async () => { if (outcome instanceof Error) throw outcome; return outcome; }); await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
     assert.equal(h.calls.at(-1).operation, 'release'); assert.equal(h.calls.some(call => call.operation === 'confirm'), false);
     assert.equal(h.prompts.length, 0);
+    assert.deepEqual(h.logs, []);
   }
 });
 
 test('busy note confirms only exact retained events and recovers that note on restart', async () => {
   let note;
-  const h = await setup(body => body.operation === 'observe' ? { events: [event(), event(12)], delivery_id: 'busy' } : {});
+  const accepted = { ...event(12), name: '审阅', result: 'FULL_CODEX_RESULT' };
+  const h = await setup(body => body.operation === 'observe' ? { events: [{ ...event(), name: '已过滤' }, accepted], delivery_id: 'busy' } : {});
   h.setAppendNote(async args => {
     const original = JSON.parse(args.message.content[0].text.slice(EVENT_PREFIX.length));
-    note = { type: 'user', content: [{ type: 'text', text: EVENT_PREFIX + JSON.stringify({ ...original, events: [event(12)] }) }] };
+    note = { type: 'user', content: [{ type: 'text', text: EVENT_PREFIX + JSON.stringify({ ...original, events: [accepted] }) }] };
     return { message: note, uuid: 'kept' };
   });
   await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep();
-  const observation = { delivery_id: 'busy', sequences: [12], events: [event(12)] };
+  const observation = { delivery_id: 'busy', sequences: [12], events: [accepted] };
   assert.deepEqual(h.calls.at(-1).args.observations, [observation]);
+  assert.deepEqual(h.logs, [{ text: 'Codex 发来反馈 · 审阅 已完成', options: { to: 'transcript' } }]);
+  assert.equal(h.prompts.length, 0);
   const reopened = await setup(() => ({}), [note]); await reopened.start();
   assert.deepEqual(reopened.calls[0].args.observations, [observation]);
+  assert.deepEqual(reopened.logs, []);
+});
+
+test('busy note feedback is independent of log availability and confirmation retries', async () => {
+  for (const log of [undefined, () => { throw new Error('unavailable'); }, async () => { throw new Error('unavailable'); }]) {
+    let confirms = 0, logs = 0;
+    const h = await setup(body => {
+      if (body.operation === 'observe' && body.args.deliver) return { events: [event()], delivery_id: 'busy' };
+      if (body.operation === 'confirm' && confirms++ === 0) return { offline: true };
+      return {};
+    });
+    h.setLog(log && (() => { logs++; return log(); }));
+    await h.start(); await h.emit('turn.start', { turnId: 'turn' }); await h.toolStep(); await h.observe();
+    assert.equal(confirms, 2);
+    assert.equal(logs, log ? 1 : 0);
+    assert.equal(h.calls.some(call => call.operation === 'release'), false);
+    assert.deepEqual(h.prompts, []);
+  }
 });
 
 test('a wait starting during observation wins over a late busy note', async () => {

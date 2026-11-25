@@ -6,9 +6,9 @@ import { copyIcon, copyPendingIcon, copiedIcon, copyFailedIcon, copyFileIcon } f
 
 const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 async function fixture(t, entries, copy, detail) {
-  const hooks = [], timers = [], requests = [];
+  const hooks = [], timers = [], requests = [], scrollCalls = [];
   const $ = {
-    ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}), copy },
+    ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async options => { scrollCalls.push(options); return {}; }, copy },
     clock: { every: () => ({ cancel() {} }), after(ms, fn) { if (ms === 1600) timers.push(fn); else setImmediate(fn); return { cancel() {} }; } },
     state: { get: async () => ({ value: undefined, version: 0 }), set: async () => ({ isSet: true }) },
     session: { id: async () => 'session', cwd: async () => 'C:/work' }, env: { get: async () => undefined }, plugin: { root: 'C:/plugin' },
@@ -21,13 +21,15 @@ async function fixture(t, entries, copy, detail) {
     } },
   };
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
-  const draw = async (surface = 'desktop') => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null));
+  const render = (surface = 'desktop', scroll) => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface, props: { scroll } }, () => null);
+  const draw = async (...args) => nodes(await render(...args));
   const press = async key => { const all = await draw(), button = all.find(n => n.type === 'Button' && n.props.key === key); if (button) return button.props.onPress({ surface: 'desktop' }); return hooks.find(h => h.event === 'ui.message').fn($, { element: key, surface: 'desktop', data: { action: 'activate', expanded: false } }, () => { throw new Error(`Unmatched ${key}`); }); };
-  return { draw, press, timers, requests };
+  return { render, draw, press, timers, requests, scrollCalls };
 }
 const final = id => ({ id, turn_id: 't', type: 'agentMessage', data: { text: `raw ${id}` }, message: { is_final: true } });
 const hasText = (all, value) => all.some(n => n.type === 'Text' && n.props.children.includes(value));
 const copyGraphic = (all, key) => all.find(n => n.props.key === `${key}_graphic`);
+const desktopNodeCount = node => 1 + (node.props?.children ?? []).reduce((sum, child) => sum + desktopNodeCount(child), 0);
 
 test('desktop draws the copy graphic beneath the native press target, with a readable terminal fallback', async t => {
   const key = 'message_copy_a:t:reply';
@@ -68,6 +70,64 @@ test('copy feedback is immediate, reports actual success, and old timers do not 
   await f.timers[1]();
   assert.ok(!hasText(await f.draw(), '已复制'));
   assert.deepEqual(copied, ['raw one', 'raw two']);
+});
+
+test('copying from a dense desktop conversation keeps the same host-sized history window and footer', async t => {
+  const entries = Array.from({ length: 300 }, (_, index) => final(`reply-${index}`));
+  const copied = [];
+  let finish;
+  const f = await fixture(t, entries, ({ text }) => {
+    copied.push(text);
+    return new Promise(resolve => { finish = resolve; });
+  });
+  const dimensions = { offset: 600, bodyRows: 24, contentRows: 624 };
+  const paint = async () => {
+    const tree = await f.render('desktop', dimensions);
+    assert.ok(desktopNodeCount(tree) < 2000, 'Claude Desktop discards the entire tree at its node limit');
+    const drawn = nodes(tree);
+    assert.ok(drawn.find(node => node.type === 'Input'), 'the composer stays mounted');
+    return { drawn, messages: drawn.filter(node => node.type === 'Markdown').map(node => node.props.key) };
+  };
+  const before = await paint();
+  const key = 'message_copy_a:t:reply-299';
+  const scrollCount = f.scrollCalls.length;
+  before.drawn.find(node => node.type === 'Button' && node.props.key === key).props.onPress({ surface: 'desktop' });
+  const pending = await paint();
+  assert.deepEqual(pending.messages, before.messages);
+  assert.equal(copyGraphic(pending.drawn, key).props.children[0].props.source, copyPendingIcon);
+  finish({ isCopied: true });
+  const copiedFrame = await paint();
+  assert.deepEqual(copiedFrame.messages, before.messages);
+  assert.equal(copyGraphic(copiedFrame.drawn, key).props.children[0].props.source, copiedIcon);
+  await f.timers[0]();
+  assert.deepEqual((await paint()).messages, before.messages);
+  assert.deepEqual(copied, ['raw reply-299']);
+  assert.equal(f.scrollCalls.length, scrollCount, 'copy and its feedback make no scroll requests');
+  const draft = '待发送'.repeat(32000);
+  await before.drawn.find(node => node.type === 'Input').props.onInput(draft);
+  const withDraft = await paint();
+  assert.equal(withDraft.drawn.find(node => node.type === 'Input').props.value, draft);
+  assert.deepEqual(withDraft.messages, before.messages, 'the independent large draft allowance preserves the transcript');
+});
+
+test('a final reply file notice cannot make the Desktop host discard a dense conversation', async t => {
+  const fileUrl = 'file:///C:/Temp/complete.md';
+  const entries = [
+    ...Array.from({ length: 10 }, (_, index) => ({ ...final(`f${index}`), message: undefined })),
+    ...Array.from({ length: 146 }, (_, index) => final(`m${index}`)),
+    { ...final('end'), message: { is_final: true, truncated: true } },
+  ];
+  const f = await fixture(t, entries, async () => assert.fail('the whole reply was exported'), async () => ({ file_url: fileUrl }));
+  const geometry = { offset: 600, bodyRows: 24, contentRows: 624 };
+  const keys = tree => nodes(tree).filter(node => node.props.key?.startsWith('message_a:')).map(node => node.props.key);
+  const before = await f.render('desktop', geometry);
+  assert.ok(desktopNodeCount(before) < 2000);
+  await f.press('message_copy_a:t:end');
+  await new Promise(setImmediate);
+  const after = await f.render('desktop', geometry);
+  assert.ok(desktopNodeCount(after) < 2000);
+  assert.deepEqual(keys(after), keys(before));
+  assert.ok(nodes(after).some(node => node.type === 'Markdown' && node.props.text.includes(fileUrl)));
 });
 
 test('a clipped final reply reads once and copies the exact original from the desktop press', async t => {

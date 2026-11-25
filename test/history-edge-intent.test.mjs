@@ -12,6 +12,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   closeUI();
   const hooks = [], scrolls = [], calls = [], timers = [];
   let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0;
+  const rows = tree => typeof nativeContentRows === 'function' ? nativeContentRows(tree) : nativeContentRows ?? Math.max(20, tree.filter(n => n.type === 'Markdown').length + 10);
   const surfacePending = new Set();
   const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
     const task = new Promise(resolve => setImmediate(resolve)).then(() => { if (!closed) return host.surface(() => host.dispatch('ui.message', { element: 'codex_navigation_sync_a', data })); });
@@ -26,7 +27,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
         if (args.to?.key || args.to === 'end') {
           if (args.to.key && (args.to.key.length > 256 || !nativePainted.some(n => n.type === 'Button' && n.props.key === args.to.key))) throw Error('key not painted');
           if (args.to.key) await onMeasurement(args.to.key);
-          const contentRows = nativeContentRows ?? Math.max(20, nativePainted.filter(n => n.type === 'Markdown').length + 10);
+          const contentRows = rows(nativePainted);
           const markerIndex = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
           const precedingRows = nativePainted.slice(0, markerIndex).filter(n => n.type === 'Markdown' || n.type === 'Text' && n.props.key?.startsWith('message_')).length;
           const destination = args.to === 'end' || args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
@@ -70,9 +71,15 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
     const e = { origin: { kind: 'person' }, by, offset: at, contentRows: Math.max(20, painted.filter(n => n.type === 'Markdown').length + 10), bodyRows: 10 };
     return host.dispatch('ui.scroll', e);
   };
+  const nativeMove = async delta => {
+    const contentRows = rows(painted), next = Math.max(0, Math.min(offset + delta, contentRows - 10));
+    if (next === offset) return;
+    const event = { origin: { kind: 'person' }, by: next - offset, offset: next, contentRows, bodyRows: 10 };
+    offset = (await host.dispatch('ui.scroll', event)).offset;
+  };
   const waitNavigation = async () => { await pause(300); while (surfacePending.size) await Promise.all([...surfacePending]); };
   const visitEdge = async direction => { wheel(-direction, 5); await pause(200); wheel(direction); await waitNavigation(); };
-  return { $, draw, wheel, visitEdge, calls, scrolls, tick: () => timers[0](), waitNavigation, open: id => openAgent($, id), press: key => host.dispatch('ui.press', { requestId: 'codex_subagent_activity', element: key }), resetConstructed: () => { maxConstructed = 0; }, get maxConstructed() { return maxConstructed; }, host, get offset() { return offset; }, get painted() { return painted; }, close: () => { closed = true; closeUI(); } };
+  return { $, draw, wheel, nativeMove, visitEdge, calls, scrolls, tick: () => timers[0](), waitNavigation, open: id => openAgent($, id), press: key => host.dispatch('ui.press', { requestId: 'codex_subagent_activity', element: key }), resetConstructed: () => { maxConstructed = 0; }, get maxConstructed() { return maxConstructed; }, host, get offset() { return offset; }, get painted() { return painted; }, close: () => { closed = true; closeUI(); } };
 }
 const messages = h => h.painted.filter(n => n.type === 'Markdown').map(n => n.props.text);
 const hasMessage = (h, prefix) => h.painted.some(n => n.type === 'Markdown' && n.props.text?.startsWith(prefix) || n.type === 'Text' && n.props.key?.startsWith('message_') && n.props.children?.some(value => typeof value === 'string' && value.startsWith(prefix)));
@@ -114,9 +121,10 @@ test('continuous wheel inertia crossing a prepend keeps the committed reading po
   assert.equal((await upward(h, messages(h).length + 10, -3)).offset, held);
   assert.equal(navigations(h), 1, 'events continuing after settlement belong to the same gesture');
   clearInterval(wheel);
-  await pause(210);
-  await upward(h, messages(h).length + 10); await h.waitNavigation();
-  assert.equal(navigations(h), 2, 'the next upward gesture can load on its first movement');
+  await h.nativeMove(-1);
+  assert.equal(h.offset, held - 1, 'native input based on the committed frame can move without an idle interval');
+  await h.nativeMove(-1000); await h.waitNavigation();
+  assert.equal(navigations(h), 2, 'subsequent sustained input reaches the new edge');
 });
 
 test('jump from older history reaches the true end even while the new sync client is suspended', async t => {
@@ -133,21 +141,38 @@ test('jump from older history reaches the true end even while the new sync clien
   assert.equal(h.offset, Math.max(10, messages(h).length));
 });
 
-test('short viewport accepts each new upward gesture without an impossible offset', async t => {
-  const h = await setup({ nativeContentRows: 10, history: args => {
-    const index = args.cursor?.index ?? 4;
+test('short viewport consumes multiple cursors before a native wheel can move', async t => {
+  const h = await setup({ nativeContentRows: tree => Math.max(10, 9 + tree.filter(node => node.type === 'Markdown').length), history: args => {
+    const index = args.cursor?.index ?? 8;
     return { entries: [entry(index)], next_cursor: index > 0 ? { index: index - 1 } : null };
   } }); t.after(h.close);
-  await pause(700);
-  assert.deepEqual(messages(h), ['message-3', 'message-4']);
+  for (let attempt = 0; attempt < 8 && !messages(h).includes('message-5'); attempt++) await h.waitNavigation();
+  assert.deepEqual(messages(h), ['message-5', 'message-6', 'message-7', 'message-8']);
   const before = navigations(h);
-  await upward(h, 10, 0); await h.waitNavigation();
+  await upward(h, 13, 0); await h.waitNavigation();
   assert.equal(navigations(h), before, 'layout-only events do not unlock navigation');
-  await upward(h); await h.waitNavigation(); await pause(200);
-  assert.ok(messages(h).includes('message-2'));
-  await upward(h); await h.waitNavigation();
-  assert.ok(messages(h).includes('message-1'), JSON.stringify({ messages: messages(h), navigations: navigations(h), calls: h.calls }));
-  assert.equal(navigations(h), before + 2);
+  await h.nativeMove(-10); await h.waitNavigation();
+  assert.ok(messages(h).includes('message-4'));
+  assert.equal(navigations(h), before + 1);
+});
+
+test('one native edge visit advances past many pages containing only folded process records', async t => {
+  const h = await setup({ history: ({ cursor }) => {
+    if (!cursor) return {
+      entries: Array.from({ length: 20 }, (_, i) => ({ ...entry(i), turn_id: i ? `t${i}` : 't', message: { phase: 'final_answer', is_final: true } })),
+      turns: [{ id: 't', status: 'completed', duration_ms: 1000, history_start_loaded: false }], next_cursor: { index: 20 },
+    };
+    if (cursor.index === 0) return { entries: [{ ...entry(-1), turn_id: 'oldest' }], next_cursor: null };
+    return {
+      entries: [{ type: 'turnProcessPage', turn_id: 't', cursor: String(cursor.index), limit: 50, ids: [`tool-${cursor.index}`] }],
+      next_cursor: { index: cursor.index - 1 },
+    };
+  } }); t.after(h.close);
+  await h.nativeMove(-1000);
+  for (let attempt = 0; attempt < 8 && !messages(h).includes('message--1'); attempt++) await h.waitNavigation();
+  assert.deepEqual(messages(h), ['message--1', ...Array.from({ length: 20 }, (_, i) => `message-${i}`)]);
+  assert.equal(navigations(h), 1);
+  assert.deepEqual(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).map(call => call.args.cursor.index), Array.from({ length: 21 }, (_, i) => 20 - i));
 });
 
 test('a scroll during cooldown does not consume the next upward intent', async t => {

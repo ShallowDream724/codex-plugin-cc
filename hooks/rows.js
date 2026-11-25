@@ -1,4 +1,4 @@
-import { messageDeliveries } from './delivery.js';
+import { eventIdentity, messageDeliveries } from './delivery.js';
 import { openAgent, openDirectory } from './ui.js';
 import { agentIcon, agentVisual, agentDisplayName } from './presentation.js';
 
@@ -14,6 +14,23 @@ function eventText(event) {
 }
 const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
 const short = (value, max = 32) => { const chars = [...safe(value)]; return chars.length > max ? chars.slice(0, max).join('') + '…' : chars.join(''); };
+
+export function showNoteFeedback($, events) {
+  try {
+    const statuses = new Map();
+    for (const event of events) {
+      const identity = eventIdentity(event);
+      if (!identity || statuses.has(identity.seq)) continue;
+      const name = short(agentDisplayName(event.name));
+      const status = short(eventText(event), 48);
+      statuses.set(identity.seq, name ? `${name} ${status}` : status);
+    }
+    if (!statuses.size) return;
+    const preview = [...statuses.values()].slice(0, 3).join(' · ');
+    const more = statuses.size > 3 ? ` · 另有 ${statuses.size - 3} 项` : '';
+    void Promise.resolve($.ui.log(`Codex 发来反馈 · ${preview}${more}`, { to: 'transcript' })).catch(() => {});
+  } catch { /* The host's rendering is independent of delivery confirmation. */ }
+}
 
 export function parseDisplayResult(value, depth = 0) {
   if (depth > 4 || value == null) return null;

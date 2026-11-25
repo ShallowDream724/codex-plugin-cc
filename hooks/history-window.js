@@ -1,16 +1,14 @@
+import { appendRenderCost, renderCostFits, RENDER_LIMIT } from './render-budget.js';
+
 const ZERO = Object.freeze({ chars: 0, nodes: 0, depth: 0 });
-export const HISTORY_RENDER_LIMIT = Object.freeze({ chars: 80000, nodes: 12000, depth: 28 });
+export const HISTORY_RENDER_LIMIT = RENDER_LIMIT;
 
 export function historyWindowCost(shellCost = ZERO, groups = []) {
-  return groups.reduce((cost, group) => ({
-    chars: cost.chars + group.cost.chars,
-    nodes: cost.nodes + group.cost.nodes,
-    // A group is a child of the timeline, itself a child of the root.
-    depth: Math.max(cost.depth, group.cost.depth + 2),
-  }), { ...shellCost });
+  // A group is a child of the timeline, itself a child of the root.
+  return groups.reduce((cost, group) => appendRenderCost(cost, group.cost, 2), { ...shellCost });
 }
 export function historyWindowFits(cost, limit = HISTORY_RENDER_LIMIT) {
-  return cost.chars <= limit.chars && cost.nodes <= limit.nodes && cost.depth <= limit.depth;
+  return renderCostFits(cost, limit);
 }
 
 // Descriptors are cheap contiguous groups; renderGroup constructs their native
@@ -46,7 +44,7 @@ export function planHistoryWindow({ groups, renderGroup, retained, direction = -
     const end = side < 0 ? groups[last].end : groups[index].end;
     if (end - start > maxEntries) return false;
     const group = materialize(index);
-    const next = { chars: cost.chars + group.cost.chars, nodes: cost.nodes + group.cost.nodes, depth: Math.max(cost.depth, group.cost.depth + 2) };
+    const next = appendRenderCost(cost, group.cost, 2);
     if (!historyWindowFits(next, limit)) return false;
     if (side < 0) { first = index; selected.unshift(group); } else { last = index; selected.push(group); }
     cost = next;

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { planHistoryWindow, historyWindowCost, historyWindowFits } from '../hooks/history-window.js';
+import { RENDER_LIMIT } from '../hooks/render-budget.js';
 import { registerUI, openAgent, closeUI } from '../hooks/ui.js';
 
 const descriptors = costs => costs.map((cost, start) => ({ start, end: start + 1, key: `g${start}`, cost }));
@@ -49,7 +50,7 @@ test('prepend and append preserve every retained boundary and never skip a full 
 test('native node and depth costs constrain selection independently of text length', () => {
   const groups = descriptors(Array.from({ length: 100 }, () => ({ chars: 10, nodes: 1000, depth: 4 })));
   const result = planHistoryWindow({ groups, shellCost, renderGroup: render });
-  assert.equal(result.groups.length, 11);
+  assert.equal(result.groups.length, Math.floor((RENDER_LIMIT.nodes - shellCost.nodes) / 1000));
   assert.ok(historyWindowFits(result.cost));
   assert.equal(historyWindowFits(historyWindowCost(shellCost, [{ cost: { chars: 1, nodes: 1, depth: 27 } }])), false);
 });

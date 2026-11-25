@@ -26,6 +26,30 @@ function fixture(turns) {
   return { client, store: ActivityStore.attach(client, controller), requests };
 }
 
+async function openFixturePane(t, store, revision = args => store.revision(args)) {
+  const hooks = [];
+  let poll;
+  const scrolls = [];
+  const $ = {
+    ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Svg', 'Client', 'Code'].map(type => [type, props => ({ type, props })])),
+      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async request => { scrolls.push(request); return {}; } },
+    clock: { every: (_, fn) => { poll = fn; return { cancel() {} }; }, after: () => ({ cancel() {} }) },
+    state: { get: async () => ({}), set: async () => ({ isSet: true }) },
+    env: { get: async () => undefined }, plugin: { root: 'C:/plugin' }, session: { id: async () => 'owner', cwd: async () => 'C:/work' },
+    process: { run: async (_, options) => {
+      const { operation, args } = JSON.parse(options.stdin);
+      const data = operation === 'ui_history' ? await store.history(args) : operation === 'ui_revision' ? revision(args) : store.list();
+      return { stdout: JSON.stringify(data), exitCode: 0 };
+    } },
+  };
+  closeUI(); t.after(async () => { closeUI(); await store.close(); });
+  registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
+  const leaves = node => node && typeof node === 'object' ? [node, ...(node.props?.children ?? []).flatMap(leaves)] : [];
+  const draw = async surface => leaves(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null));
+  const byKey = (nodes, key) => nodes.find(n => n.props.key === key);
+  return { draw, byKey, poll, scrolls };
+}
+
 test('over forty native process pages fit alongside older answers without transferring tool previews', async t => {
   const process = Array.from({ length: 2050 }, (_, i) => ({ id: 'cmd-' + i, type: 'commandExecution', command: 'long-command-'.repeat(500) }));
   process.splice(500, 0, prompt('steer', '[Direct message from the user]\n\nmid-turn steer'));
@@ -176,6 +200,125 @@ test('an evicted live prompt and late action echoes stay scoped to their native 
   assert.deepEqual(suffix.map(item => item.id), ['@turn-summary', 'resumed-final']);
 });
 
+test('a history-only turn folds on interruption even when no live item arrives', async t => {
+  const { client, store } = fixture([{ id: 't', status: 'inProgress', startedAt: 100,
+    items: [prompt('ask', 'initial assignment'), message('progress', 'commentary', 'working'),
+      prompt('steer', '[Direct message from the user]\n\nmid-turn steer'), { id: 'compact', type: 'contextCompaction' }] }]);
+  let stale = false;
+  const { draw, byKey, poll } = await openFixturePane(t, store, args => stale
+    ? { revision: 'late', entries: [], turns: [{ id: 't', status: 'inProgress', history_start_loaded: false }] }
+    : store.revision(args));
+  let tree = await draw();
+  assert.ok(byKey(tree, 'message_a:t:progress'));
+  assert.ok(byKey(tree, 'message_a:t:steer'));
+  assert.ok(!byKey(tree, 'turn_process_a:t'));
+
+  client.emit('notification', { method: 'turn/completed', params: { threadId: 'root', turn: { id: 't', status: 'interrupted' } } });
+  await poll(); tree = await draw();
+  assert.match(byKey(tree, 'turn_process_a:t').props.label, /查看过程/);
+  assert.ok(byKey(tree, 'message_a:t:ask'));
+  assert.ok(!byKey(tree, 'message_a:t:progress'));
+  assert.ok(!byKey(tree, 'message_a:t:steer'));
+
+  stale = true;
+  await poll(); tree = await draw();
+  assert.ok(byKey(tree, 'turn_process_a:t'));
+  assert.ok(!byKey(tree, 'message_a:t:steer'));
+  await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
+  assert.ok(byKey(tree, 'message_a:t:progress'));
+  assert.ok(byKey(tree, 'message_a:t:steer'));
+});
+
+test('a native successor closes a previous turn with no completion without inventing timing or a final', async t => {
+  const { client, store } = fixture([{ id: 'old', status: 'inProgress', startedAt: 100,
+    items: [prompt('ask', 'original task'), message('progress', 'commentary', 'working'), { id: 'compact', type: 'contextCompaction' }, prompt('steer', 'clarification')] }]);
+  t.after(() => store.close());
+  const emit = (method, params, threadId = 'root') => client.emit('notification', { method, params: { threadId, ...params } });
+  const start = (id, startedAt, threadId) => emit('turn/started', { turn: { id, status: 'inProgress', startedAt } }, threadId);
+  const { entries, turns } = await store.history({ target: 'a', fold_turns: true });
+  const initial = new Map(turns.map(turn => [turn.id, turn]));
+  assert.deepEqual(turnTimeline(entries, initial, () => false).map(entry => entry.id), ['ask', 'progress', 'compact', 'steer']);
+
+  start('descendant', 200, 'child');
+  start('late-start', 90);
+  assert.ok(!store.revision({ target: 'a' }).turns.find(turn => turn.id === 'old')?.superseded);
+  start('next', 201);
+  const updated = store.revision({ target: 'a' });
+  assert.deepEqual(updated.entries, []);
+  for (const turn of updated.turns) initial.set(turn.id, { ...initial.get(turn.id), ...turn });
+  assert.deepEqual(initial.get('old'), { id: 'old', status: 'inProgress', started_at_ms: 100000, history_start_loaded: true, superseded: true });
+  const folded = turnTimeline(entries, initial, () => false);
+  assert.deepEqual(folded.map(entry => entry.id), ['ask', '@turn-summary']);
+  assert.equal(durationLabel(folded[1].duration_ms), '查看过程');
+  assert.deepEqual(turnTimeline(entries, initial, () => true).map(entry => entry.id), ['ask', '@turn-summary', 'progress', 'compact', 'steer']);
+  assert.deepEqual(turnTimeline([{ id: 'new-work', turn_id: 'next', type: 'contextCompaction' }], initial, () => false).map(entry => entry.id), ['new-work']);
+
+  emit('turn/completed', { turn: { id: 'old', status: 'completed', completedAt: 200 } });
+  const finished = store.revision({ target: 'a', revision: updated.revision }).turns.find(turn => turn.id === 'old');
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.duration_ms, 100000);
+});
+
+test('an earlier native history turn folds when a successor is listed before it', async t => {
+  const { store } = fixture([
+    { id: 'new', status: 'inProgress', items: [prompt('new-task', 'another task'), message('new-progress', 'commentary', 'working')] },
+    { id: 'old', status: 'inProgress', items: [prompt('old-task', 'original task'), { id: 'compact', type: 'contextCompaction' }] },
+  ]);
+  t.after(() => store.close());
+  const { entries, turns } = await store.history({ target: 'a', fold_turns: true });
+  const timeline = turnTimeline(expandProcessReferences(entries), new Map(turns.map(turn => [turn.id, turn])), () => false);
+  assert.deepEqual(timeline.map(entry => entry.id), ['old-task', '@turn-summary', 'new-task', 'new-progress']);
+  assert.equal(timeline[1].duration_ms, undefined);
+});
+
+test('late active history and older start notifications leave the newer active turn open', async t => {
+  const { client, store } = fixture([{ id: 'old', status: 'inProgress', startedAt: 100,
+    items: [prompt('old-task', 'original task'), message('old-progress', 'commentary', 'working')] }]);
+  t.after(() => store.close());
+  const request = client.request;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  client.request = async (method, args) => {
+    const result = await request(method, args);
+    if (method === 'thread/turns/list') await gate;
+    return result;
+  };
+  const start = (id, startedAt) => client.emit('notification', { method: 'turn/started', params: { threadId: 'root', turn: { id, status: 'inProgress', startedAt } } });
+  const read = store.history({ target: 'a', fold_turns: true });
+  start('active', 200);
+  start('earlier', 99);
+  start('unverified');
+  client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 'active', item: message('active-progress', 'commentary', 'still working') } });
+  release();
+  const history = await read, live = store.revision({ target: 'a' });
+  const turns = new Map([...history.turns, ...live.turns].map(turn => [turn.id, turn]));
+  assert.equal(turns.get('old').superseded, true);
+  assert.equal(turns.get('active').superseded, undefined);
+  const timeline = turnTimeline(expandProcessReferences(history.entries).concat(live.entries), turns, () => false);
+  assert.deepEqual(timeline.map(entry => entry.id), ['old-task', '@turn-summary', 'active-progress']);
+});
+
+test('only a sole unphased reply in complete success history stays outside its fold', async t => {
+  const { store } = fixture([
+    { id: 'interrupted', status: 'interrupted', items: [prompt('interrupted-prompt', 'work'), message('interrupted-note', null, 'unfinished note')] },
+    { id: 'explicit', status: 'completed', items: [prompt('explicit-prompt', 'work'), message('explicit-note', null, 'old note'), message('explicit-final', 'finalAnswer', 'done')] },
+    { id: 'ambiguous', status: 'completed', items: [prompt('ambiguous-prompt', 'work'), message('first-note', null, 'old note'), message('second-note', null, 'old note')] },
+    { id: 'legacy', status: 'completed', items: [prompt('legacy-prompt', 'work'), message('legacy-reply', null, 'old reply')] },
+  ]);
+  t.after(() => store.close());
+  const result = await store.history({ target: 'a', fold_turns: true });
+  const entries = expandProcessReferences(result.entries);
+  const turns = new Map(result.turns.map(turn => [turn.id, turn]));
+  const folded = turnTimeline(entries, turns, () => false);
+  assert.deepEqual(folded.map(entry => entry.id), ['legacy-prompt', 'legacy-reply', 'ambiguous-prompt', '@turn-summary',
+    'explicit-prompt', '@turn-summary', 'explicit-final', 'interrupted-prompt', '@turn-summary']);
+  assert.deepEqual(folded.filter(entry => entry.message?.is_final).map(entry => entry.id), ['explicit-final']);
+  assert.ok(turnTimeline(entries, turns, () => true).some(entry => entry.id === 'interrupted-note'));
+  turns.get('legacy').history_start_loaded = false;
+  const partial = turnTimeline(entries.filter(entry => entry.id !== 'legacy-prompt'), turns, () => false);
+  assert.ok(!partial.some(entry => entry.id === 'legacy-reply'));
+});
+
 test('native pane folds intermediate guidance, keeps the prompt and final copy/time visible, and reuses hydrated records', async t => {
   const ended = new Date(2026, 6, 9, 15, 42).getTime();
   const { store, requests, client } = fixture([{ id: 't', status: 'completed', durationMs: 65000, completedAt: (ended + 60000) / 1000,
@@ -186,34 +329,16 @@ test('native pane folds intermediate guidance, keeps the prompt and final copy/t
   // The send was acknowledged before its native echo. The later commentary
   // reached the live cache first, while persisted native order is unambiguous.
   store.recordAction({ kind: 'send', turn_input: 'steer', agent_id: 'a', thread_id: 'root', turn_id: 't', message: 'clarification' });
-  for (const item of [message('comment2', 'commentary', 'checking the result'), prompt('follow', 'Claude is your parent agent.\n\nclarification')]) {
+  for (const item of [message('comment2', null, 'checking the result'), prompt('follow', 'Claude is your parent agent.\n\nclarification')]) {
     client.emit('notification', { method: 'item/completed', params: { threadId: 'root', turnId: 't', item } });
   }
-  const hooks = [];
-  let poll;
-  const scrolls = [];
-  const $ = {
-    ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Svg', 'Client', 'Code'].map(type => [type, props => ({ type, props })])),
-      invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async request => { scrolls.push(request); return {}; } },
-    clock: { every: (_, fn) => { poll = fn; return { cancel() {} }; }, after: () => ({ cancel() {} }) },
-    state: { get: async () => ({}), set: async () => ({ isSet: true }) },
-    env: { get: async () => undefined }, plugin: { root: 'C:/plugin' }, session: { id: async () => 'owner', cwd: async () => 'C:/work' },
-    process: { run: async (_, options) => {
-      const { operation, args } = JSON.parse(options.stdin);
-      const data = operation === 'ui_history' ? await store.history(args) : operation === 'ui_revision' ? store.revision(args) : store.list();
-      return { stdout: JSON.stringify(data), exitCode: 0 };
-    } },
-  };
-  closeUI(); t.after(async () => { closeUI(); await store.close(); });
-  registerUI((...args) => hooks.push({ event: args[0], fn: args.at(-1) })); await openAgent($, 'a');
-  const leaves = node => node && typeof node === 'object' ? [node, ...(node.props?.children ?? []).flatMap(leaves)] : [];
-  const draw = async surface => leaves(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface }, () => null));
-  const byKey = (nodes, key) => nodes.find(n => n.props.key === key);
+  const { draw, byKey, poll, scrolls } = await openFixturePane(t, store);
   let tree = await draw();
   assert.equal(byKey(tree, 'message_time_a:t:done').props.children[0], finalTimestamp(ended));
   assert.ok(byKey(tree, 'message_copy_a:t:done'));
   assert.match(byKey(tree, 'turn_process_a:t').props.label, /用时 1分5秒/);
   assert.ok(byKey(tree, 'message_a:t:ask')); assert.ok(!byKey(tree, 'message_a:t:comment')); assert.ok(!byKey(tree, 'message_a:t:follow'));
+  assert.ok(!byKey(tree, 'message_a:t:comment2'), 'native process classification survives the duplicate live message with no phase');
   const before = requests.length;
   scrolls.length = 0;
   await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();

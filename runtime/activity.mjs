@@ -6,7 +6,7 @@ import { materializeImage, pngDimensions } from './tool-media-files.mjs';
 import { RolloutMedia } from './rollout-media.mjs';
 import { parentNotificationCapability, parentReportPending } from './parent-notification.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
-import { finishedTurn, inputItem, processItem } from '../shared/turn-history.mjs';
+import { finishedTurn, foldableTurn, inputItem, messagePhase, processItem } from '../shared/turn-history.mjs';
 import { claudeMessagePrefix, communication, safeBoundary } from '../shared/communication.mjs';
 import { fileChanges, fileChangeSummary, fileChangePage, fileChangeSource } from '../shared/file-changes.mjs';
 import { MAX_CLIPBOARD_LENGTH } from '../shared/clipboard.mjs';
@@ -150,7 +150,7 @@ const simplify = (item, turnId, deferred = false, stage, startedAtMs, threadId) 
   const end = message ? Math.min(message.text.length, 2048) : 0;
   const safeEnd = message && end < message.text.length && safeBoundary(message.text, end) !== end ? end - 1 : end;
   const communicationPreview = message && { title: message.title, text: message.text.slice(0, safeEnd), truncated: safeEnd < message.text.length };
-  const phase = ['final_answer', 'commentary', 'partial_answer'].includes(item.phase) ? item.phase : null;
+  const phase = messagePhase(item.phase);
   const messageMeta = item.type === 'agentMessage' ? { phase, complete: stage === 'completed', truncated: typeof item.text === 'string' && data.text !== item.text, is_final: phase === 'final_answer' && stage === 'completed' } : null;
   return { ...input, ...(item.turn_input ? { turn_input: item.turn_input } : {}), ...(images.length || omitted ? { media: { count: images.length, has_images: images.length > 0, ...(omitted ? { omitted: true } : {}) } } : {}), ...(communicationPreview ? { communication: communicationPreview } : {}), ...(messageMeta ? { message: messageMeta } : {}), ...(item.type === 'fileChange' ? { file_preview: { complete: filePreviewComplete(item, data) } } : {}), id: String(item.id ?? ''), turn_id: turnId, type: item.type ?? 'unknown', data, preview: formatItem(data).slice(0, PREVIEW_BUDGET / 2), deferred, ...(Number.isFinite(startedAtMs) ? { started_at_ms: startedAtMs } : {}) };
 };
@@ -424,7 +424,7 @@ export class ActivityStore {
   }
   bucket(id) {
     let bucket = this.live.get(id);
-    if (!bucket) { bucket = { revision: this.nextRevision++, entries: [] }; }
+    if (!bucket) { bucket = { revision: this.nextRevision++, entries: [], updatedTurns: new Set() }; }
     else this.live.delete(id);
     this.live.set(id, bucket);
     while (this.live.size > AGENT_LIMIT) this.live.delete(this.live.keys().next().value);
@@ -468,6 +468,32 @@ export class ActivityStore {
     this.remember(this.turnStates, key, meta);
     return meta;
   }
+  updateTurnRevision(bucket, id) {
+    bucket.updatedTurns.delete(id);
+    bucket.updatedTurns.add(id);
+    if (bucket.updatedTurns.size > LIVE_LIMIT) bucket.updatedTurns.delete(bucket.updatedTurns.values().next().value);
+    bucket.revision = this.nextRevision++;
+  }
+  supersedeTurn(agent, bucket, turn) {
+    const meta = { ...turn, superseded: true };
+    this.remember(this.turnStates, `${agent.threadId}:${turn.id}`, meta);
+    this.updateTurnRevision(bucket, turn.id);
+    return meta;
+  }
+  rememberHistoryTurn(agent, turn, older) {
+    const previous = this.turnStates.get(`${agent.threadId}:${turn.id}`);
+    const meta = this.rememberTurn(agent.threadId, turn);
+    const bucket = this.bucket(agent.id);
+    if (previous && !finishedTurn(previous) && finishedTurn(meta)) this.updateTurnRevision(bucket, turn.id);
+    const latest = this.turnStates.get(`${agent.threadId}:${bucket.latestTurnId}`);
+    // A native successor closes the visible interval even if the original
+    // writer left no completion event or timing behind.
+    if (!foldableTurn(meta) && (older && turn.id !== bucket.latestTurnId || latest?.started_at_ms > meta.started_at_ms)) {
+      return this.supersedeTurn(agent, bucket, meta);
+    }
+    if (!older && !bucket.latestTurnId) bucket.latestTurnId = turn.id;
+    return meta;
+  }
   stage(item, threadId, turnId, entry = item) {
     if (entry.completedAtMs != null || item.completedAtMs != null || this.turnStates.get(`${threadId}:${turnId}`)?.status === 'completed') return 'completed';
     return entry.startedAtMs != null || item.startedAtMs != null ? 'started' : undefined;
@@ -500,10 +526,18 @@ export class ActivityStore {
         meta.opening_item_id ??= p.turn.items?.find(item => inputItem(item.type))?.id ?? null;
       }
       const bucket = this.bucket(agent.id);
-      bucket.revision = this.nextRevision++;
+      if (message.method === 'turn/started' && !foldableTurn(meta)) {
+        const previous = this.turnStates.get(`${agent.threadId}:${bucket.latestTurnId}`);
+        const accepted = agent.turnId === meta.id && !(meta.started_at_ms < previous?.started_at_ms);
+        if (!previous || previous.id === meta.id || accepted || meta.started_at_ms > previous.started_at_ms) {
+          if (previous && previous.id !== meta.id && !foldableTurn(previous)) this.supersedeTurn(agent, bucket, previous);
+          bucket.latestTurnId = meta.id;
+        }
+      }
+      this.updateTurnRevision(bucket, meta.id);
       if (message.method === 'turn/completed' && p.turn.status === 'completed') {
         for (const item of p.turn.items ?? []) {
-          if (item.type !== 'agentMessage' || item.phase !== 'final_answer' || !item.id || typeof item.text !== 'string') continue;
+          if (item.type !== 'agentMessage' || messagePhase(item.phase) !== 'final_answer' || !item.id || typeof item.text !== 'string') continue;
           const old = bucket.entries.find(entry => entry.turn_id === p.turn.id && entry.id === item.id);
           const final = simplify(item, p.turn.id, false, 'completed', item.startedAtMs ?? old?.started_at_ms, agent.threadId);
           const ended = timestamp(item.completedAtMs) ?? old?.completed_at_ms;
@@ -536,7 +570,7 @@ export class ActivityStore {
     const summary = { agent: this.summary(agent), revision: bucket.revision };
     if (revision === bucket.revision) return summary;
     const inputTurns = new Set(bucket.entries.filter(entry => inputItem(entry.type)).map(entry => entry.turn_id));
-    const turns = [...new Set(bucket.entries.map(entry => entry.turn_id))].map(id => {
+    const turns = [...new Set([...bucket.entries.map(entry => entry.turn_id), ...bucket.updatedTurns])].map(id => {
       const meta = this.turnStates.get(`${agent.threadId}:${id}`);
       // Attaching after turn/started yields only a suffix until history arrives.
       return meta && !meta.opening_item_id && inputTurns.has(id) ? { ...meta, history_start_loaded: false } : meta;
@@ -593,7 +627,7 @@ export class ActivityStore {
       const page = await this.client.request('thread/turns/list', { threadId: agent.threadId, limit: 1, sortDirection: 'desc',
         itemsView: 'notLoaded', ...(turnPageCursor ? { cursor: turnPageCursor } : {}) });
       requests++;
-      if (page.data?.[0]?.id === turnId) turns.set(turnId, this.rememberTurn(agent.threadId, page.data[0]));
+      if (page.data?.[0]?.id === turnId) turns.set(turnId, this.rememberHistoryTurn(agent, page.data[0], !!turnPageCursor));
     }
     const advance = (current, next, seen) => {
       if (!validToken(next)) throw new Error('Invalid native history cursor.');
@@ -612,7 +646,7 @@ export class ActivityStore {
         turnsCursor = advance(turnsCursor, page.nextCursor, seenTurns);
         turnId = page.data?.[0]?.id;
         if (turnId && !validToken(turnId)) throw new Error('Invalid native turn ID.');
-        if (turnId) turns.set(turnId, this.rememberTurn(agent.threadId, page.data[0]));
+        if (turnId) turns.set(turnId, this.rememberHistoryTurn(agent, page.data[0], !!turnPageCursor));
         else if (!turnsCursor) done = true;
         continue;
       }
@@ -629,7 +663,7 @@ export class ActivityStore {
       for (const record of page.data ?? []) {
         const item = record.item, actualTurn = record.turnId ?? turnId;
         if (!visible(item)) continue;
-        if (foldTurns && actualTurn === turnId && finishedTurn(meta) && item.id && processItem(item.type, item.phase)) {
+        if (foldTurns && actualTurn === turnId && foldableTurn(meta) && item.id && processItem(item.type, messagePhase(item.phase))) {
           if (!run) {
             run = { type: 'turnProcessPage', turn_id: turnId, cursor: pageCursor, limit: pageLimit, ids: [] };
             projected.push(run);

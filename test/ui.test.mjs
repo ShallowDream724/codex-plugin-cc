@@ -77,18 +77,31 @@ test('composer routes an interrupted Claude task and an explicit final report in
   await openAgent($, 'a');
   const draw = async () => nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null));
   const option = async () => (await draw()).find(node => node.props.key === 'codex_delivery_choice_a');
+  // The desktop host expects a consumed ui.press to return the element key.
+  // Invoke its bottom callback again to exercise replay of a stale press.
+  const press = async button => {
+    const e = { component: 'Pane', requestId: 'codex_subagent_activity', surface: 'desktop', element: button.props.key };
+    const result = await hooks.find(h => h.event === 'ui.press').fn($, e, () => assert.fail('unhandled choice'));
+    assert.deepEqual(result, { element: e.element });
+    await button.props.onPress(e);
+  };
   const send = async text => (await draw()).find(node => node.type === 'Input').props.onSubmit(text);
   assert.match((await option()).props.label, /^继续 Claude/);
   await send('继续');
   assert.deepEqual(sends.pop(), { target: 'a', message: '继续' });
-  await (await option()).props.onPress();
+  await press(await option());
+  assert.match((await option()).props.label, /^单独提问/);
   await send('另外问一句');
   assert.deepEqual(sends.pop(), { target: 'a', message: '另外问一句', private_task: true });
   agent.parent_continuation_pending = false;
   await observeUI($, { agents: [agent] });
   await send('仅给我看');
   assert.deepEqual(sends.pop(), { target: 'a', message: '仅给我看' });
-  await (await option()).props.onPress();
+  await press(await option());
+  assert.match((await option()).props.label, /^☑/);
+  await press(await option());
+  assert.match((await option()).props.label, /^☐/);
+  await press(await option());
   await send('整理后汇报');
   assert.deepEqual(sends.pop(), { target: 'a', message: '整理后汇报', report_to_parent: true });
   assert.match((await option()).props.label, /^☐/);

@@ -4,12 +4,13 @@ import { toolSections, communicationFailure } from './tool-presentation.js';
 import { activityIcon, contextIndicator, disclosureIcon, jumpIcon, copyIcon, copyPendingIcon, copiedIcon, copyFailedIcon, copyFileIcon } from './tool-icons.js';
 import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
+import { mergeTurnMetadata } from '../shared/turn-history.mjs';
 import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences } from './turn-history.js';
 import { renderDiff } from './diff-view.js';
 import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
-import { nativeRenderBudget } from './render-budget.js';
+import { GROUP_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
 import { paneScroll } from './pane-scroll.js';
-import { planHistoryWindow } from './history-window.js';
+import { historyWindowCost, historyWindowFits, planHistoryWindow } from './history-window.js';
 import { renderAgentDirectory } from './agent-directory.js';
 import { fileViewEntries, appendFilePage } from './file-stream.js';
 import { parseUnifiedDiffDetailed } from '../shared/unified-diff.mjs';
@@ -29,6 +30,8 @@ const RAW_WINDOW_LIMIT = 400;
 let copyIntent = 0;
 const copyLabels = { pending: '正在复制…', copied: '已复制', failed: '复制失败，请重试', file: '已保存完整内容' };
 const copyIcons = { pending: copyPendingIcon, copied: copiedIcon, failed: copyFailedIcon, file: copyFileIcon };
+const copyLabelWidth = Math.max(...Object.values(copyLabels).map(label => label.length));
+const copyIconSize = Math.max(copyIcon.length, ...Object.values(copyIcons).map(source => source.length));
 const clipboardUnavailable = new Set(['no-clipboard', 'no-surface', 'unanswered']);
 const safe = (value) => String(value).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '�');
 const idOf = (agent) => agent.agent_id || agent.id;
@@ -215,11 +218,9 @@ function mergeLive(page, entries, prepend = false, turns = []) {
   page.turns ??= new Map();
   for (const turn of turns) {
     const old = page.turns.get(turn.id);
-    const next = prepend ? { ...turn, ...old } : { ...old, ...turn };
     // History may return after a final stream notification, or be the first
     // source to learn that a formerly active turn has finished.
-    if (['completed', 'failed', 'interrupted'].includes(turn.status)) next.status = turn.status;
-    if (old?.history_start_loaded || turn.history_start_loaded) next.history_start_loaded = true;
+    const next = mergeTurnMetadata(old, turn, prepend);
     if (JSON.stringify(next) !== JSON.stringify(old)) { page.turns.set(turn.id, next); changed = true; }
   }
   const positions = new Map(page.live.map((entry, index) => [entryKey(entry), index]));
@@ -244,10 +245,13 @@ function mergeLive(page, entries, prepend = false, turns = []) {
         insert(index); last = index;
         const old = page.live[index];
         const origin = !messageOrigin(old) && messageOrigin(entry);
-        if (origin || entry.turn_input && !old.turn_input || entry.completed_at_ms && !old.completed_at_ms || entry.message?.is_final && !old.message?.is_final) {
+        const process = entry.type === 'turnProcessRef' && old.type === 'agentMessage' && !old.turn_process;
+        const completeMessage = entry.message?.complete && (!old.message?.complete || entry.message.is_final && !old.message?.is_final);
+        if (origin || process || entry.turn_input && !old.turn_input || entry.completed_at_ms && !old.completed_at_ms || completeMessage) {
           page.live[index] = { ...old, ...(entry.completed_at_ms ? { completed_at_ms: entry.completed_at_ms } : {}),
             ...(origin ? { data: { ...old.data, message_origin: origin } } : {}), ...(entry.turn_input ? { turn_input: entry.turn_input } : {}),
-            ...(entry.message?.is_final ? { message: { ...old.message, ...entry.message } } : {}) };
+            ...(process ? { turn_process: true } : {}),
+            ...(completeMessage ? { message: { ...old.message, ...entry.message } } : {}) };
           changed = true;
         }
       }
@@ -272,6 +276,7 @@ function mergeLive(page, entries, prepend = false, turns = []) {
       const value = { ...entry, ...(entry.started_at_ms == null && previous.started_at_ms != null ? { started_at_ms: previous.started_at_ms } : {}),
         ...(!messageOrigin(entry) && messageOrigin(previous) ? { data: { ...entry.data, message_origin: messageOrigin(previous) } } : {}),
         ...(!entry.turn_input && previous.turn_input ? { turn_input: previous.turn_input } : {}),
+        ...(entry.type === 'agentMessage' && (previous.turn_process || previous.type === 'turnProcessRef') ? { turn_process: true } : {}),
         ...(entry.completed_at_ms == null && previous.completed_at_ms != null ? { completed_at_ms: previous.completed_at_ms } : {}) };
       if (JSON.stringify(page.live[index]) !== JSON.stringify(value)) { page.live[index] = value; changed = true; }
     }
@@ -433,7 +438,7 @@ function resetTailWindow(page) {
   page.nativeFollowing = false;
   page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++;
   page.upwardRead = null;
-  page.boundaryBlocked = null; page.measureAnchor = null;
+  page.shortFillDirection = null; page.measureAnchor = null;
   page.windowAnchor = null; page.windowEnd = null; page.windowSize = VISIBLE_ENTRIES; page.renderedWindow = null;
 }
 function atPaneBottom(offset, contentRows, bodyRows, surface) {
@@ -491,29 +496,36 @@ async function revealTail($, id, token) {
 async function requestHistoryNavigation($, id, direction, automatic = false) {
   const page = pageFor(id), generation = state.generation;
   if (page.navigating || state.imagePreview) return;
-  if (page.boundaryBlocked === direction) return;
   if (page.navigationRequest?.direction === direction && page.navigationRequest.generation === generation) return;
-  page.boundaryBlocked = direction;
+  page.shortFillDirection = direction;
   const request = { token: ++navigationSequence, direction, generation, scrollGeneration: page.scrollGeneration, resumeTail: automatic && page.followTail };
   page.navigationRequest = request; holdWindow(page);
   const current = () => state.opened && state.selected === id && state.generation === generation
     && page.navigationRequest === request && !state.imagePreview && !page.followTail;
-  // Fetch outside the render/scroll dispatch. A slow history read must not
-  // exhaust the host's hook deadline or hold the wheel event open.
-  for (let scanned = 0; direction < 0 && drawnWindow(page).start === 0 && page.cursor && scanned < 16; scanned++) {
-    await history($, id);
+  const prepare = async () => {
     if (!current()) return;
-    if (page.historyError) break;
-  }
-  if (!current()) return;
-  const view = drawnWindow(page);
-  if (direction < 0 ? view.start === 0 : view.start + view.entries.length >= view.total) {
-    page.navigationRequest = null;
-    if (request.resumeTail && page.scrollGeneration === request.scrollGeneration) page.followTail = true;
-    await invalidate($); return;
-  }
-  request.ready = true;
-  await invalidate($);
+    let view = drawnWindow(page);
+    if (direction < 0 && view.start === 0 && page.cursor && !page.historyError) {
+      // A cursor can advance across folded operations without adding any
+      // visible rows. Continue from a fresh callback while this intent owns it.
+      await history($, id);
+      if (!current()) return;
+      view = drawnWindow(page);
+      if (view.start === 0 && page.cursor && !page.historyError) {
+        $.clock.after(0, prepare);
+        return;
+      }
+    }
+    if (direction < 0 ? view.start === 0 : view.start + view.entries.length >= view.total) {
+      page.navigationRequest = null;
+      if (page.edgeGesture) page.edgeGesture.settled = true;
+      if (request.resumeTail && page.scrollGeneration === request.scrollGeneration) page.followTail = true;
+    } else request.ready = true;
+    await invalidate($);
+  };
+  // Allow an explicit scroll to retry a failed history read.
+  if (!automatic && direction < 0 && drawnWindow(page).start === 0 && page.cursor && page.historyError) await history($, id);
+  await prepare();
 }
 function scrollController($, id, page) {
   if (page.scroller) return page.scroller;
@@ -535,7 +547,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   const scroller = scrollController($, id, page), gen = state.generation;
   const oldView = drawnWindow(page);
   const oldGroups = page.renderedGroups;
-  const anchorGroup = above && start < oldView.start ? page.renderedGroups?.find(group => group.start === oldView.start) : null;
+  const anchorGroup = above ? page.renderedGroups?.find(group => group.start === Math.max(start, oldView.start)) : null;
   const anchored = !!anchorGroup;
   if (anchored && page.measureAnchor !== anchorGroup.key) {
     page.measureAnchor = anchorGroup.key;
@@ -554,6 +566,7 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   page.followTail = false; page.windowAnchor = null;
   page.windowStart = start; page.windowEnd = end; page.windowSize = Math.max(1, end - start);
   page.layoutRevision = (page.layoutRevision ?? 0) + 1;
+  if (anchored) page.measureKey = `codex_read_anchor_${id}_${++navigationSequence}`;
   if (anchored || end > oldView.start + oldView.entries.length) page.layoutFloor = before.contentRows;
   scroller.stage(before, above, anchored);
   await invalidate($);
@@ -572,6 +585,15 @@ async function resizeWindow($, id, page, start, end, above, owner) {
   }
   if (page.navigationOwner === owner) page.layoutFloor = null;
   return !!after && state.opened && state.selected === id && gen === state.generation && page.navigationOwner === owner;
+}
+const historyCostFields = ['chars', 'wireChars', 'nodes'];
+const availableHistoryCost = (page, field) => Math.max(0, RENDER_LIMIT[field] - (page.historyShellCost?.[field] ?? 0));
+function historyWindowNeedsTrim(page, count) {
+  return count >= 300 || historyCostFields.some(field => {
+    const room = availableHistoryCost(page, field);
+    const used = (page.renderCost?.[field] ?? 0) - (page.historyShellCost?.[field] ?? 0);
+    return used > Math.max(0, Math.min(room * 0.6, room - GROUP_RENDER_LIMIT[field]));
+  });
 }
 async function browseHistory($, id, direction) {
   const page = pageFor(id), gen = state.generation;
@@ -594,14 +616,16 @@ async function browseHistory($, id, direction) {
     // Trim only the opposite, off-screen side, then measure that frame before
     // adding anything. Mixing a prepend and a tail eviction in one redraw
     // makes total-height compensation incorrect.
-    if (view.entries.length > 1 && (view.entries.length >= 300 || page.renderCost?.chars > 48000 || page.renderCost?.nodes > 5500)) {
+    if (view.entries.length > 1 && historyWindowNeedsTrim(page, view.entries.length)) {
       const groups = (page.renderedGroups || []).filter(group => group.start >= view.start && group.end <= view.start + view.entries.length);
       const near = direction < 0 ? groups : [...groups].reverse();
-      let chars = 0, nodes = 0, keep = 0;
+      const keepLimits = Object.fromEntries(historyCostFields.map(field => [field, availableHistoryCost(page, field) * 0.45]));
+      let cost = { chars: 0, wireChars: 0, nodes: 0 }, keep = 0;
       for (const group of near) {
         const count = group.end - group.start;
-        if (keep && (chars + group.cost.chars > 36000 || nodes + group.cost.nodes > 3500 || keep + count > 200)) break;
-        chars += group.cost.chars; nodes += group.cost.nodes; keep += count;
+        const next = Object.fromEntries(historyCostFields.map(field => [field, cost[field] + group.cost[field]]));
+        if (keep && (keep + count > 200 || historyCostFields.some(field => next[field] > keepLimits[field]))) break;
+        cost = next; keep += count;
       }
       keep = Math.max(1, Math.min(200, keep || Math.ceil(view.entries.length / 2)));
       if (keep < view.entries.length) {
@@ -980,6 +1004,7 @@ async function chooseAttachments($, id, source = 'file') {
         page.windowStart = 0; page.windowEnd = count; page.windowSize = Math.max(1, count);
       }
       page.cursor = result.next_cursor ?? null; page.historyError = '';
+      page.historyPage = (page.historyPage ?? 0) + 1;
       continueHistory = !changed && Boolean(page.cursor) && page.scrollGeneration === scrollGen;
       loaded = true;
     } catch (error) { if (state.opened && state.selected === id && state.generation === gen) page.historyError = `无法读取对话记录：${failureText(error)}。请重试。`; }
@@ -990,7 +1015,7 @@ async function chooseAttachments($, id, source = 'file') {
           if (state.opened && state.selected === id && state.generation === gen) {
             await invalidate($);
             if (loaded) queueHistoryPrefetch($, id);
-            if (continueHistory && page.scrollGeneration === scrollGen) $.clock.after(0, () => history($, id));
+            if (continueHistory && !page.navigationRequest && !page.navigating && page.scrollGeneration === scrollGen) $.clock.after(0, () => history($, id));
           }
         }
       } finally { request.finish(); }
@@ -1232,21 +1257,24 @@ export function registerUI(on) {
     const page = id && pageFor(id), gen = state.generation;
     const now = Date.now(), direction = Math.sign(e.by);
     const gesture = page?.edgeGesture;
-    // Desktop reports displacement, with no wheel-start or wheel-end event.
-    // Keep consuming the tail of a gesture while events keep arriving. A
-    // fixed delay from the layout commit can expire in the middle of inertia.
+    // Desktop reports displacement from its previous rounded native offset.
+    // An event queued before the commit can still describe the old frame.
     const continuing = gesture && direction === gesture.direction && now - gesture.lastAt < 180;
-    if (direction && gesture) {
-      if (continuing || page.navigating) gesture.lastAt = now;
-      else page.edgeGesture = null;
-    }
     if (page?.navigating && page.surface === 'desktop') {
+      if (direction && gesture) gesture.lastAt = now;
       // Repeated wheel input during settlement is one loading gesture, not a
       // backlog of moves to replay after the reading position is restored.
       return next({ ...e, offset: state.scroll.get(id) ?? Math.max(0, e.offset - e.by) });
     }
-    if (continuing && gesture.settled && page.surface === 'desktop') {
-      return next({ ...e, offset: state.scroll.get(id) ?? e.offset - e.by });
+    if (direction && gesture) {
+      const settledOffset = state.scroll.get(id);
+      const tolerance = atPaneBottom(settledOffset, e.contentRows, e.bodyRows, page.surface) ? 2 : 1;
+      if (continuing && gesture.settled && page.surface === 'desktop' && Number.isFinite(settledOffset) &&
+          Math.abs(e.offset - e.by - settledOffset) > tolerance) {
+        gesture.lastAt = now;
+        return next({ ...e, offset: settledOffset });
+      }
+      if (!continuing || gesture.settled) page.edgeGesture = null;
     }
     const oldGeometry = page?.scrollGeometry;
     if (page) page.scrollGeometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
@@ -1301,12 +1329,11 @@ export function registerUI(on) {
     if (direction && id && state.opened && !page.navigating && !page.navigationRequest && !page.edgeGesture) {
       const threshold = Math.max(2, (e.bodyRows || 12) * 2);
       if (e.by < 0 && e.offset <= threshold && page.cursor) prefetchHistory($, id);
-      const needsTrim = view.entries.length >= 300 || page.renderCost?.chars > 48000 || page.renderCost?.nodes > 5500;
+      const needsTrim = historyWindowNeedsTrim(page, view.entries.length);
       const earlier = direction < 0 && e.offset <= (needsTrim ? 1 : threshold) && (view.start > 0 || page.cursor);
       const nearEnd = needsTrim ? atBottom : e.offset >= e.contentRows - e.bodyRows - threshold;
       const later = direction > 0 && nearEnd && view.start + view.entries.length < view.total;
       if (earlier || later) {
-        page.boundaryBlocked = null;
         const gesture = page.edgeGesture = { direction, lastAt: now, settled: false };
         $.clock.after(0, () => {
           if (state.opened && state.selected === id && gen === state.generation && page.edgeGesture === gesture) return requestHistoryNavigation($, id, direction);
@@ -1347,7 +1374,9 @@ export function registerUI(on) {
     const action = state.opened && (state.view === 'directory' ? directory.actions.get(e.element) : state.controls.get(state.selected)?.navigationActions?.get(e.element));
     // Run navigation under this registered frame, rather than the Button's raw
     // callback origin (which suppresses every hook owned by this plugin).
-    return action ? (await action(), {}) : next(e);
+    if (!action) return next(e);
+    await action();
+    return { element: e.element };
   });
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     if (state.opened && e.data?.action === 'open-agent' && e.element?.startsWith('directory_hit_')) {
@@ -1369,7 +1398,6 @@ export function registerUI(on) {
       const id = state.selected, page = pageFor(id), generation = state.generation;
       if (!e.data.token || e.data.token !== page.edgeKey || page.lastEdgeRequest === e.data.token || page.navigating || page.navigationRequest || page.tailRequest || state.imagePreview) return {};
       page.lastEdgeRequest = e.data.token;
-      page.shortFillDone = true;
       const direction = e.data.direction === 1 ? 1 : -1;
       $.clock.after(0, () => { if (state.opened && state.selected === id && state.generation === generation) return requestHistoryNavigation($, id, direction, true); });
       return {};
@@ -1478,14 +1506,18 @@ function renderPane($, e, next) {
     const cached = state.pages.get(state.selected)?.renderCache;
     const draft = state.controls.get(state.selected)?.draft;
     if (cached?.key === frameKey && cached.draft === draft) return cached.draw(e.props?.scroll);
+    const id = state.selected, generation = state.generation;
     const budget = nativeRenderBudget($.ui.resolve(e), {
-      copy: (text, key) => copyWithFeedback($, state.selected, `full-content:${key}`, e.surface, text),
+      copy: (text, key) => {
+        if (state.generation === generation) copyWithFeedback($, id, `full-content:${key}`, e.surface, text);
+      },
+      copyLabelWidth,
       copyLabel: key => {
-        const feedback = state.pages.get(state.selected)?.copyFeedback;
-        return feedback?.key === `full-content:${key}` && feedback.generation === state.generation ? copyLabels[feedback.phase] : null;
+        const feedback = state.pages.get(id)?.copyFeedback;
+        return feedback?.key === `full-content:${key}` && feedback.generation === generation ? copyLabels[feedback.phase] : null;
       },
     });
-    const { Box, Text, Button, Input, Markdown, Image, Code, Svg, Client } = budget.ui, id = state.selected;
+    const { Box, Text, Button, Input, Markdown, Image, Code, Svg, Client } = budget.ui;
     const selected = state.agents.find((agent) => idOf(agent) === id);
     if (state.opening && !selected) return Text({ size: 'caption', dimColor: true, children: ['正在打开对话…'] });
     if (!selected) return Box({ key: 'codex_recovery', flexDirection: 'column', gap: 'sm', children: [Text({ size: 'caption', dimColor: true, children: [state.error || '重新读取代理列表以恢复对话。'] }), Button({ key: 'codex_retry', variant: 'secondary', label: '重新读取', onPress: () => openAgent($, state.requested) })] });
@@ -1553,11 +1585,16 @@ function renderPane($, e, next) {
       const feedback = copyStatus(feedbackKey);
       const status = copyLabels[feedback?.phase];
       const name = status || label;
-      if (e.surface !== 'desktop' || typeof Svg !== 'function') return Button({ key, plain: true, label: name, onPress });
-      const control = nativeGraphicButton({ Box, Button }, { key, label: name, onPress, width: 3, children: [
-        Svg({ key: `${key}_icon`, source: copyIcons[feedback?.phase] || copyIcon, alt: name, width: 15, height: 15 }),
+      const press = event => { if (state.generation === generation) onPress(event); };
+      const labelPadding = Math.max(label.length, copyLabelWidth) - name.length;
+      if (e.surface !== 'desktop' || typeof Svg !== 'function') return budget.reserveChars(Button({ key, plain: true, label: name, onPress: press }), labelPadding);
+      const source = copyIcons[feedback?.phase] || copyIcon;
+      const control = nativeGraphicButton({ Box, Button }, { key, label: name, onPress: press, width: 3, children: [
+        Svg({ key: `${key}_icon`, source, alt: name, width: 15, height: 15 }),
       ] });
-      return hint(`${key}_hint`, control, name, 18, 0, !!status);
+      // Feedback paints over the same control. Budget for the largest icon and
+      // label from the first frame so copy cannot change the transcript window.
+      return budget.reserveChars(hint(`${key}_hint`, control, name, 18, 0, !!status), 3 * labelPadding, 3 * labelPadding + copyIconSize - source.length);
     };
     const disclosure = (key, label, onPress, entry, integration = false, expanded) => {
       const activate = entry ? (...args) => {
@@ -1638,6 +1675,7 @@ function renderPane($, e, next) {
       if (page.historyError) navigation.push(caption('codex_history_error', page.historyError));
       navigation.push(disclosure('codex_retry_conversation', '重新读取', async () => { if (state.error) return openAgent($, id); if (page.cursor && page.historyError) return history($, id); page.historyChecked = false; await poll($); }));
     }
+    const fileBuffer = (key, children) => Box({ key: `file_buffer_${key}`, flexDirection: 'column', gap: 0, minWidth: 0, children });
     const renderGroup = record => {
       const group = record.group;
       const first = group.items[0], groupKey = `${id}:${entryKey(first)}:group`, folded = !state.folds.has(groupKey);
@@ -1650,7 +1688,7 @@ function renderPane($, e, next) {
         ] }) : node;
         // Leave room for both neighbours. A single nearly-full tree otherwise
         // rejects every prepend/append and traps navigation on the same item.
-        const paginate = (limit = { chars: 32000, nodes: 4000, depth: 22 }) => {
+        const paginate = (limit = GROUP_RENDER_LIMIT) => {
           if (budget.fits(groupTree, limit)) return anchored(groupTree);
           const parts = budget.pages(groupTree, limit);
           page.contentPages ??= new Map();
@@ -1663,7 +1701,10 @@ function renderPane($, e, next) {
           ] })] }));
         };
         const node = paginate();
-        return { node, cost: budget.cost(node), ...(first.fileView ? {} : { paginate }) };
+        // Adjacent file chunks share one wrapper in the final tree. Counting
+        // it with each chunk keeps the planner safe even for scattered files.
+        const cost = budget.cost(first.fileView?.kind === 'chunk' ? fileBuffer(first.fileView.key, [node]) : node);
+        return { node, cost, ...(first.fileView ? {} : { paginate }) };
       };
       if (first.type === 'turnProcessPending') {
         const key = `turn_process_page_${id}:${entryKey(first)}`;
@@ -1880,18 +1921,20 @@ function renderPane($, e, next) {
     if (selected.final_report_pending) composer.push(caption(`codex_report_pending_${id}`, '本轮最终回复将发给 Claude'));
     const choice = deliveryChoice(selected);
     if (choice) {
+      const field = choice === 'continue' ? 'privateTask' : 'reportFinal';
+      const checked = !!control[field];
       const key = `codex_delivery_choice_${id}`;
-      const toggleChoice = () => {
+      const setChoice = () => {
         if (control.sending || state.selected !== id || deliveryChoice(state.agents.find(agent => idOf(agent) === id)) !== choice) return;
-        if (choice === 'continue') control.privateTask = !control.privateTask;
-        else control.reportFinal = !control.reportFinal;
+        if (!!control[field] !== checked) return;
+        control[field] = !checked;
         return invalidate($);
       };
-      control.navigationActions.set(key, toggleChoice);
+      control.navigationActions.set(key, setChoice);
       const label = choice === 'continue'
-        ? (control.privateTask ? '单独提问 · 切换为继续 Claude 的任务' : '继续 Claude 的任务 · 切换为单独提问')
-        : `${control.reportFinal ? '☑' : '☐'} 把本轮最终回复发给 Claude`;
-      composer.push(Button({ key, plain: true, label, onPress: toggleChoice }));
+        ? (checked ? '单独提问 · 切换为继续 Claude 的任务' : '继续 Claude 的任务 · 切换为单独提问')
+        : `${checked ? '☑' : '☐'} 把本轮最终回复发给 Claude`;
+      composer.push(Button({ key, plain: true, label, onPress: setChoice }));
     }
     composer.push(Box({ key: `codex_input_${id}`, flexDirection: 'column', width: '100%', alignItems: 'stretch', children: [Input({ key: `codex_message_${id}_${control.inputVersion}`, placeholder: '给代理发送消息', value: control.draft, rows: 3, ...(e.surface === 'desktop' ? {} : { submitLabel: '发送' }), onInput: control.actions.input, onSubmit: control.actions.submit })] }));
     const permission = ({ 'full-access': '完全访问', 'auto-review': '自动审查', ask: '需要批准' })[selected?.permissions_mode];
@@ -1936,10 +1979,11 @@ function renderPane($, e, next) {
       // off-screen Client regions. Its empty node never handles pointer input.
       const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
       const contentRows = scroll?.contentRows ?? page.scrollGeometry?.contentRows;
-      const short = Number.isFinite(contentRows) && contentRows <= bodyRows + 1;
+      const short = Number.isFinite(contentRows) && atPaneBottom(0, contentRows, bodyRows, e.surface);
       const canRequest = !page.navigating && !page.navigationRequest && !page.tailRequest && !page.historyLoading && !page.historyError && !state.restoringPreview;
-      const edgeDirection = canRequest && short && !page.shortFillDone ? hasEarlier ? -1 : hasLater ? 1 : 0 : 0;
-      const edgeToken = edgeDirection ? JSON.stringify([state.generation, id, edgeDirection, view.start, entries.length, view.total, page.cursor]) : '';
+      const fillDirection = page.shortFillDirection ?? (hasEarlier ? -1 : 1);
+      const edgeDirection = canRequest && short && (fillDirection < 0 ? hasEarlier : hasLater) ? fillDirection : 0;
+      const edgeToken = edgeDirection ? JSON.stringify([state.generation, id, page.scrollGeneration, edgeDirection, view.start, entries.length, view.total, page.historyPage ?? 0]) : '';
       page.edgeKey = edgeToken;
       const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
       const loadingLayer = settling ? [Box({ key: `codex_history_settling_${id}`, position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'background', children: [
@@ -1974,8 +2018,9 @@ function renderPane($, e, next) {
     // jump overlay. A small token allowance covers changed edge JSON digits.
     hasEarlier = true; hasLater = true;
     const measuredShell = budget.cost(root([timeline([])]));
-    const shellCost = { ...measuredShell, chars: measuredShell.chars + 512 };
-    const paneLimit = { chars: 80000, nodes: 12000, depth: 28 };
+    const shellCost = { ...measuredShell, chars: measuredShell.chars + 512, wireChars: measuredShell.wireChars + 512 };
+    page.historyShellCost = shellCost;
+    const paneLimit = RENDER_LIMIT;
     const retained = page.adding;
     const anchor = page.windowAnchor ? (page.navigationTimeline ?? page.timeline).findIndex(entry => entryKey(entry) === page.windowAnchor) : undefined;
     const plan = planHistoryWindow({ groups, renderGroup, retained, direction: page.adding?.direction ?? -1, anchor: anchor >= 0 ? anchor : undefined, shellCost, limit: paneLimit, maxEntries: 400 });
@@ -1983,17 +2028,18 @@ function renderPane($, e, next) {
     // every retained boundary and apply the existing content pager to the
     // largest representations rather than evicting a message being read.
     const selectedGroups = plan.groups;
-    const sumCost = () => selectedGroups.reduce((cost, group) => ({ chars: cost.chars + group.cost.chars, nodes: cost.nodes + group.cost.nodes, depth: Math.max(cost.depth, group.cost.depth + 2) }), { ...shellCost });
+    const sumCost = () => historyWindowCost(shellCost, selectedGroups);
+    const fraction = cost => Math.max(cost.chars / paneLimit.chars, cost.wireChars / paneLimit.wireChars, cost.nodes / paneLimit.nodes);
     for (let pass = 0; pass < selectedGroups.length * 12; pass++) {
       const cost = sumCost();
-      if (cost.chars <= paneLimit.chars && cost.nodes <= paneLimit.nodes && cost.depth <= paneLimit.depth) break;
-      const candidates = selectedGroups.filter(group => group.paginate && (group.cost.chars > 512 || group.cost.nodes > 32 || group.cost.depth + 2 > paneLimit.depth));
-      candidates.sort((a, b) => Math.max(b.cost.chars / paneLimit.chars, b.cost.nodes / paneLimit.nodes) - Math.max(a.cost.chars / paneLimit.chars, a.cost.nodes / paneLimit.nodes));
+      if (historyWindowFits(cost, paneLimit)) break;
+      const candidates = selectedGroups.filter(group => group.paginate && (group.cost.chars > 512 || group.cost.wireChars > 1024 || group.cost.nodes > 32 || group.cost.depth + 2 > paneLimit.depth));
+      candidates.sort((a, b) => fraction(b.cost) - fraction(a.cost));
       const group = candidates[0];
       if (!group) break;
-      const node = group.paginate({ chars: Math.max(256, Math.floor(group.cost.chars * 0.55)), nodes: Math.max(16, Math.floor(group.cost.nodes * 0.55)), depth: 22 });
+      const node = group.paginate({ chars: Math.max(256, Math.floor(group.cost.chars * 0.55)), wireChars: Math.max(512, Math.floor(group.cost.wireChars * 0.55)), nodes: Math.max(16, Math.floor(group.cost.nodes * 0.55)), depth: GROUP_RENDER_LIMIT.depth });
       const nextCost = budget.cost(node);
-      if (nextCost.chars >= group.cost.chars && nextCost.nodes >= group.cost.nodes && nextCost.depth >= group.cost.depth) { group.paginate = null; continue; }
+      if (nextCost.chars >= group.cost.chars && nextCost.wireChars >= group.cost.wireChars && nextCost.nodes >= group.cost.nodes && nextCost.depth >= group.cost.depth) { group.paginate = null; continue; }
       group.node = node; group.cost = nextCost;
     }
     // Fixed controls may themselves exceed the allowance after several pending
@@ -2001,7 +2047,7 @@ function renderPane($, e, next) {
     // never hand an oversized tree to the host or rebuild the candidate groups.
     while (selectedGroups.length > 1) {
       const cost = sumCost();
-      if (cost.chars <= paneLimit.chars && cost.nodes <= paneLimit.nodes && cost.depth <= paneLimit.depth) break;
+      if (historyWindowFits(cost, paneLimit)) break;
       const anchorIndex = selectedGroups.findIndex(group => group.key === page.measureAnchor || Number.isInteger(anchor) && group.start <= anchor && group.end > anchor);
       if (page.followTail && !page.windowAnchor || anchorIndex >= selectedGroups.length / 2 || page.adding?.direction > 0 && anchorIndex < 0) selectedGroups.shift();
       else selectedGroups.pop();
@@ -2024,7 +2070,7 @@ function renderPane($, e, next) {
         cluster.nodes.push(group.node);
       } else { cluster = null; visualGroups.push({ node: group.node }); }
     }
-    const tree = root([timeline(visualGroups.map(group => group.node ?? Box({ key: `file_buffer_${group.key}`, flexDirection: 'column', gap: 0, minWidth: 0, children: group.nodes })))]);
+    const tree = root([timeline(visualGroups.map(group => group.node ?? fileBuffer(group.key, group.nodes)))]);
     page.renderedGroups = selectedGroups.map(({ start, end, key, cost }) => ({ start, end, key, cost }));
     page.renderedWindow = { ...view, entries, timeline: page.navigationTimeline ?? page.timeline }; page.renderCost = budget.cost(tree);
     if (!page.followTail) { page.windowStart = view.start; page.windowEnd = view.start + entries.length; page.windowSize = Math.max(1, entries.length); }

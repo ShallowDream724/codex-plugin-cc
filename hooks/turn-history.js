@@ -1,4 +1,4 @@
-import { finishedTurn, inputItem, processItem } from '../shared/turn-history.mjs';
+import { foldableTurn, inputItem, processItem } from '../shared/turn-history.mjs';
 import { orderWaits } from '../shared/activity-order.mjs';
 
 export function durationLabel(ms) {
@@ -60,7 +60,7 @@ export function turnTimeline(entries, turns, isOpen, pages) {
     ? pages.get(entry.pageKey)?.records?.get(entry.id) ?? entry : entry) : entries);
   const spans = new Map();
   for (const entry of entries) {
-    if (!entry.turn_id || !finishedTurn(turns?.get(entry.turn_id))) continue;
+    if (!entry.turn_id || !foldableTurn(turns?.get(entry.turn_id))) continue;
     if (!spans.has(entry.turn_id)) spans.set(entry.turn_id, []);
     spans.get(entry.turn_id).push(entry);
   }
@@ -71,7 +71,15 @@ export function turnTimeline(entries, turns, isOpen, pages) {
     if (entry !== items[0]) continue;
     const meta = turns.get(entry.turn_id), open = isOpen(entry.turn_id);
     const opener = openingInput(items, meta);
-    const process = item => item !== opener && processItem(item.type, item.message?.phase, true);
+    const isFinal = item => item.message?.phase === 'final_answer' || item.message?.is_final;
+    const unphased = item => item.type === 'agentMessage' && item.message?.phase == null;
+    let legacyReply;
+    if (meta.status === 'completed' && meta.history_start_loaded === true && !items.some(isFinal)) {
+      const candidates = items.filter(item => unphased(item) && !item.turn_process);
+      if (candidates.length === 1 && candidates[0].message?.complete) [legacyReply] = candidates;
+    }
+    const process = item => item !== opener && item !== legacyReply && !isFinal(item)
+      && (item.turn_process || unphased(item) || processItem(item.type, item.message?.phase, true));
     const firstProcess = items.find(process);
     if (opener) out.push(opener);
     if (firstProcess || Number.isFinite(meta.duration_ms)) {
@@ -84,7 +92,7 @@ export function turnTimeline(entries, turns, isOpen, pages) {
     const finals = [];
     for (const item of items) {
       if (item === opener) continue;
-      if (item.message?.phase === 'final_answer' || item.message?.is_final) { finals.push(item); continue; }
+      if (isFinal(item)) { finals.push(item); continue; }
       if (!open && process(item)) continue;
       out.push(item.type === 'turnProcessRef' ? { ...item, type: 'turnProcessPending', error: pages?.get(item.pageKey)?.error } : item);
     }

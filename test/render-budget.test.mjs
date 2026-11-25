@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nativeRenderBudget, RENDER_LIMIT } from '../hooks/render-budget.js';
+import { INPUT_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from '../hooks/render-budget.js';
 import { registerUI, openAgent, closeUI } from '../hooks/ui.js';
 
 const types = ['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code'];
@@ -59,13 +59,24 @@ test('many short native rows also page before the host node limit', () => {
   for (const page of pages) assert.equal(budget.fits(page), true);
 });
 
-test('single children and independent input values follow the native constructor contract', () => {
+test('single children and the host-clipped serialized input value are accounted for', () => {
   const budget = nativeRenderBudget(constructors), { Box, Text, Input } = budget.ui;
   const tree = Box({ children: Text({ children: 'readable' }) });
   assert.equal(budget.fits(tree), true);
   const draft = 'draft'.repeat(30000), input = Input({ value: draft, placeholder: 'Write' });
   assert.equal(input.props.value, draft);
-  assert.ok(budget.cost(input).chars < 100, 'Input.value uses the separate host field allowance');
+  const empty = budget.cost(Input({ placeholder: 'Write' }));
+  assert.equal(budget.cost(input).chars, empty.chars);
+  assert.equal(budget.cost(input).wireChars - empty.wireChars, INPUT_RENDER_LIMIT);
+});
+
+test('serialized SVG and Markdown pressable links use the Desktop tree allowance', () => {
+  const budget = nativeRenderBudget({ ...constructors, Svg: props => ({ props }) });
+  const source = '<svg>' + 'x'.repeat(1000) + '</svg>';
+  const svg = budget.ui.Svg({ source, alt: 'Copy' });
+  const markdown = budget.ui.Markdown({ text: 'Links', pressableLinks: ['/one', '/two'] });
+  assert.equal(budget.cost(svg).wireChars, source.length + 4);
+  assert.equal(budget.cost(markdown).nodes, 3);
 });
 
 test('source pages preserve Unicode and provide one complete copy without partial-code actions', async () => {

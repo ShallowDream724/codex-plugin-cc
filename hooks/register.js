@@ -1,7 +1,7 @@
 // A Claude Code mod. No model requests or per-task tool definitions.
 import { WAIT_TOOL, EVENT_PREFIX, messageDeliveries, scanRetainedDeliveries, retainedSequences, filterClosed, retainedActionFailures } from './delivery.js';
 import { registerUI, observeUI, closeUI } from './ui.js';
-import { registerRows } from './rows.js';
+import { registerRows, showNoteFeedback } from './rows.js';
 import { configureBridge, requestBridge } from './bridge.js';
 const OBJECT = { type: 'object' };
 const STR = { type: 'string' };
@@ -196,6 +196,7 @@ async function observe($, atBoundary = false, signal) {
           const retained = receipt?.deny ? [] : messageDeliveries(receipt?.message, { prompt: true });
           const accepted = acceptedEvents(retained, delivery.delivery_id, deliveries.get(delivery.delivery_id));
           if (accepted.length) {
+            showNoteFeedback($, accepted);
             // A tool can still end the turn. Only an unread request that blocks
             // a worker justifies starting another turn after the note is retained.
             const requests = accepted.filter(event => ['question', 'approval'].includes(event.kind) && typeof event.request_id === 'string')

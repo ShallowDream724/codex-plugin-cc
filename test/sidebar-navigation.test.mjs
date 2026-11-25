@@ -158,19 +158,17 @@ test('desktop short history continues after native scroll geometry is sampled', 
   assert.equal(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).length, 1);
 });
 
-test('a short viewport loads only one history batch until another user scroll', async t => {
+test('a short viewport stops automatic history loads after exhausting its cursor', async t => {
   const h = await setup({ nativeContentRows: 10, history: args => {
     const index = args.cursor?.index ?? 3;
     return { entries: [entry(index)], next_cursor: index > 0 ? { index: index - 1 } : null };
   } }); t.after(h.close);
   await pause(900);
-  assert.deepEqual(messages(h), ['message-2', 'message-3'], 'one automatic edge visit adds one batch and preserves the reading anchor');
+  assert.deepEqual(messages(h), ['message-0', 'message-1', 'message-2', 'message-3']);
   const snapshot = messages(h);
   await pause(700);
-  assert.deepEqual(messages(h), snapshot, 'cursor or window changes alone do not trigger another batch');
-  h.wheel(1, 5); await pause(100);
-  h.wheel(-1, 0); await h.waitNavigation();
-  assert.ok(messages(h).includes('message-1'), 'leaving and returning to the edge permits the next batch');
+  assert.deepEqual(messages(h), snapshot);
+  assert.equal(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).length, 3);
 });
 
 test('one upward edge visit does not trigger repeated navigation as the window changes', async t => {
