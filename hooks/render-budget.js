@@ -21,8 +21,8 @@ export const appendRenderCost = (own, child, depthOffset = 1) => ({
   depth: Math.max(own.depth, child.depth + depthOffset),
 });
 const childrenOf = value => value == null ? [] : Array.isArray(value) ? value : [value];
-function compactKey(key) {
-  if (typeof key !== 'string' || key.length <= 4096) return key;
+export function compactKey(key, limit = 4096) {
+  if (typeof key !== 'string' || key.length <= limit) return key;
   let hash = 2166136261;
   for (let index = 0; index < key.length; index++) hash = Math.imul(hash ^ key.charCodeAt(index), 16777619);
   return `${key.slice(0, 128)}:${(hash >>> 0).toString(36)}:${key.length}`;
@@ -64,6 +64,25 @@ export function nativeRenderBudget(constructors, { copy, copyLabel, copyLabelWid
     return node;
   };
   const ui = Object.fromEntries(Object.entries(constructors).map(([type, constructor]) => [type, typeof constructor === 'function' ? props => build(type, props) : constructor]));
+  // An edge handoff may momentarily need the old reading strip at its
+  // original coordinate. Keep only presentation; callbacks, client ports,
+  // focus targets and registered keys always belong to the live transcript.
+  const readingStrip = node => {
+    if (typeof node === 'string') return node;
+    const record = records.get(node);
+    if (!record) return null;
+    const { type, props } = record;
+    if (type === 'Client') return { type: 'Box', props: { width: props.width, height: props.height, children: [] } };
+    if (type === 'Button') return { type: 'Text', props: { dimColor: props.dimColor, children: [props.label ?? ''] } };
+    if (!['Box', 'Text', 'Markdown', 'Code', 'Svg', 'Image'].includes(type)) return null;
+    const { key, children, hover, pressableLinks, ...visual } = props;
+    const safe = Object.fromEntries(Object.entries(visual).filter(([, value]) => typeof value !== 'function'));
+    if (type === 'Svg') safe.isInteractive = false;
+    return { type, props: { ...safe, ...(children ? { children: children.map(readingStrip).filter(child => child != null) } : {}) } };
+  };
+  const drawStrip = value => typeof value === 'string' ? value : build(value.type, {
+    ...value.props, ...(value.props.children ? { children: value.props.children.map(drawStrip) } : {}),
+  });
   const reserveChars = (node, additional, wireAdditional = additional) => {
     const record = records.get(node);
     if (record) {
@@ -116,7 +135,7 @@ export function nativeRenderBudget(constructors, { copy, copyLabel, copyLabelWid
     if (batch.length) result.push(build(type, { ...props, children: batch }));
     return result.length ? result : [node];
   };
-  return { ui, cost, fits: (node, limit = RENDER_LIMIT) => renderCostFits(cost(node), limit), pages, reserveChars,
+  return { ui, cost, fits: (node, limit = RENDER_LIMIT) => renderCostFits(cost(node), limit), pages, reserveChars, readingStrip, drawStrip,
     // A retained native Button still counts against this frame's budget.
     buttonWith: (props, construct) => build('Button', props, construct) };
 }

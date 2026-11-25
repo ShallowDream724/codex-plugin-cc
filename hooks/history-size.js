@@ -13,7 +13,8 @@ export default function historySize(props, surface) {
     surface.setState({ key: props.key, rows: 0, extent });
   } else if (rows > 0 && (prior.rows !== rows || prior.extent !== extent)) {
     surface.setState({ key: props.key, rows, extent });
-    surface.post({ action: 'history-size', key: props.key, rows });
+    if (props.scale) surface.post({ action: 'history-band-part-size', key: props.key, part: props.part, rows: rows / props.scale });
+    else surface.post({ action: props.band ? 'history-band-size' : 'history-size', key: props.key, rows });
   }
   return surface.elements.Box({ width: 1, height: extent, children: [] });
 }

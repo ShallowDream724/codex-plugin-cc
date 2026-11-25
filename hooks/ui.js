@@ -5,12 +5,13 @@ import { activityIcon, contextIndicator, disclosureIcon, jumpIcon, copyIcon, cop
 import { normalizeMessageMarkdown } from './message-markdown.js';
 import { orderWaits } from '../shared/activity-order.mjs';
 import { mergeTurnMetadata } from '../shared/turn-history.mjs';
-import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences } from './turn-history.js';
+import { durationLabel, finalTimestamp, turnTimeline, expandProcessReferences, processPageError } from './turn-history.js';
 import { renderDiff } from './diff-view.js';
 import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs';
-import { GROUP_RENDER_LIMIT, INPUT_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
+import { compactKey, GROUP_RENDER_LIMIT, INPUT_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
 import { paneMarkerOffset, paneScroll, probeDenial } from './pane-scroll.js';
 import { historyWindowCost, historyWindowFits, planHistoryWindow } from './history-window.js';
+import { bandSections, cropBandSections, historyBand, historyCoreLimit } from './history-band.js';
 import { mostRecentAgent, renderAgentDirectory } from './agent-directory.js';
 import { fileViewEntries, appendFilePage } from './file-stream.js';
 import { parseUnifiedDiffDetailed } from '../shared/unified-diff.mjs';
@@ -223,7 +224,17 @@ function mergeLive(page, entries, prepend = false, turns = []) {
     const next = mergeTurnMetadata(old, turn, prepend);
     if (JSON.stringify(next) !== JSON.stringify(old)) { page.turns.set(turn.id, next); changed = true; }
   }
-  const positions = new Map(page.live.map((entry, index) => [entryKey(entry), index]));
+  if (!entries.length) {
+    if (changed) page.timeline = null;
+    return changed;
+  }
+  // Live deltas and deferred page reads can alternate throughout a long
+  // turn. Build the lookup once; keep it aligned with the canonical array.
+  let positions = page.livePositions;
+  if (!positions) {
+    positions = page.livePositions = new Map();
+    for (let index = 0; index < page.live.length; index++) positions.set(entryKey(page.live[index]), index);
+  }
   if (prepend) {
     const history = expandProcessReferences(entries);
     if (restoreNativeOrder(page.live, history, positions)) changed = true;
@@ -261,12 +272,16 @@ function mergeLive(page, entries, prepend = false, turns = []) {
     if (insertions.size) {
       const merged = [];
       for (let i = 0; i <= page.live.length; i++) {
-        if (insertions.has(i)) merged.push(...insertions.get(i));
-        if (i < page.live.length) merged.push(page.live[i]);
+        const inserted = insertions.get(i);
+        if (inserted) for (const entry of inserted) { positions.set(entryKey(entry), merged.length); merged.push(entry); }
+        if (i < page.live.length) {
+          const entry = page.live[i];
+          positions.set(entryKey(entry), merged.length); merged.push(entry);
+        }
       }
       page.live = merged; changed = true;
     }
-    if (changed) page.timeline = null;
+    if (changed) { page.timeline = null; page.reconciledInputs = null; }
     return changed;
   }
   for (const entry of entries) {
@@ -286,7 +301,7 @@ function mergeLive(page, entries, prepend = false, turns = []) {
       if (JSON.stringify(page.live[index]) !== JSON.stringify(value)) { page.live[index] = value; changed = true; }
     }
   }
-  if (changed) page.timeline = null;
+  if (changed) { page.timeline = null; page.reconciledInputs = null; }
   return changed;
 }
 function fileStreamDetail(page, entry, path) {
@@ -298,7 +313,8 @@ function fileStreamDetail(page, entry, path) {
   const source = fileChangeSource(change);
   return { chunks: [{ offset: 0, ...source, rows: source.format === 'diff' ? parseUnifiedDiffDetailed(source.text) : undefined }], next_offset: null, offset: 0 };
 }
-function conversationEntries(all, page) {
+function reconcileInputs(all) {
+  if (!all.some(entry => ['parentMessage', 'directUserMessage', 'userMessage'].includes(entry.type) && String(entry.id).startsWith('action:'))) return all;
   const copies = new Map(), matchedActions = new Set(), nativeMetadata = new Map();
   for (const entry of all) {
     if (!entry.turn_id || !['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type)) continue;
@@ -325,18 +341,23 @@ function conversationEntries(all, page) {
     // retain the original rows. An action must account for exactly one echo.
     if (group.unknown.length === 1 && pending.length && new Set(pending.map(messageOrigin)).size === 1) match(group.unknown[0], pending[0]);
   }
-  const entries = all.filter(entry => !matchedActions.has(entry)).map(entry => nativeMetadata.get(entry) ?? entry);
+  return matchedActions.size ? all.filter(entry => !matchedActions.has(entry)).map(entry => nativeMetadata.get(entry) ?? entry) : all;
+}
+function conversationEntries(all, page) {
+  const entries = page ? page.reconciledInputs ??= reconcileInputs(all) : reconcileInputs(all);
   if (!page) return orderWaits(entries);
   const timeline = turnTimeline(entries, page.turns, turnId => page.openTurns?.has(turnId), page.processPages);
   return timeline.flatMap(entry => fileViewEntries(entry, page.agentId, { isOpen: key => state.folds.has(key), getDetail: path => fileStreamDetail(page, entry, path) }));
 }
 function refreshTimeline(page) {
-  const old = drawnWindow(page), first = old.entries[0] && entryKey(old.entries[0]);
+  const old = drawnWindow(page), first = old.entries[0];
   page.timeline = conversationEntries(page.live, page);
   if (page.navigationTimeline) return;
   const size = Math.min(RAW_WINDOW_LIMIT, Math.max(1, old.entries.length + Math.max(0, page.timeline.length - old.total)));
   if (!page.followTail && first) {
-    const start = page.timeline.findIndex(entry => entryKey(entry) === first);
+    const key = entryKey(first), source = entryKey(first.fileView?.source ?? first);
+    let start = page.timeline.findIndex(entry => entryKey(entry) === key);
+    if (start < 0) start = page.timeline.findIndex(entry => entryKey(entry.fileView?.source ?? entry) === source);
     if (start >= 0) {
       page.windowStart = start; page.windowEnd = start + size;
       page.windowSize = size;
@@ -346,44 +367,221 @@ function refreshTimeline(page) {
   page.renderedGroups = page.renderedGroups?.flatMap(group => indices.has(group.key) ? [{ ...group, start: indices.get(group.key), end: indices.get(group.key) + group.end - group.start }] : []);
   page.renderedWindow = null;
 }
+function retainedHistoryWindow(page, previous) {
+  const first = previous.entries[0];
+  if (!first || page.followTail) return;
+  const entries = page.timeline ??= conversationEntries(page.live, page);
+  const start = entries.findIndex(entry => entryKey(entry) === entryKey(first));
+  if (start < 0) return;
+  const next = previous.entries[1];
+  if (first.type === 'turnSummary' && first.open && next?.turn_id === first.turn_id) {
+    // An older continuation of this turn inserts its records after the
+    // summary. Advance the retained window from the first unchanged body row
+    // so the newly available prefix can enter through normal navigation.
+    const body = entries.findIndex(entry => entryKey(entry) === entryKey(next));
+    if (body > start + 1) return { start: body, count: previous.entries.length - 1 };
+  }
+  return { start, count: previous.entries.length };
+}
+const PROCESS_PARALLEL_PAGES = 2;
+const PROCESS_CACHE_LIMIT = 16;
+const PROCESS_PREFETCH_ENTRIES = 50;
+function currentProcessPane(id, page) {
+  return state.opened && state.selected === id && state.pages.get(id) === page && !state.imagePreview;
+}
+function visibleProcessEntries(page, view) {
+  const geometry = page.scrollGeometry, offset = state.scroll.get(page.agentId);
+  if (!page.hasHistoryBands || view !== page.renderedWindow || !geometry || !Number.isFinite(offset)) return view.entries;
+  const nearby = (band, distance) => band?.timeline === view.timeline && distance <= geometry.bodyRows + band.rows ? band.entries ?? [] : [];
+  return [...nearby(page.upperBand, offset), ...view.entries, ...nearby(page.lowerBand, paneEnd(geometry) - offset)];
+}
+function processViewportPages(page, direction = page.processDirection ?? 1) {
+  const view = drawnWindow(page), timeline = page.navigationTimeline ?? page.timeline;
+  const end = view.start + view.entries.length;
+  const mounted = visibleProcessEntries(page, view);
+  const visible = direction < 0 ? mounted : mounted.slice().reverse();
+  const ahead = (direction < 0 ? timeline.slice(Math.max(0, view.start - PROCESS_PREFETCH_ENTRIES), view.start).reverse()
+    : timeline.slice(end, end + PROCESS_PREFETCH_ENTRIES));
+  const candidates = new Map();
+  for (const item of [...visible, ...ahead]) {
+    const entry = item.fileView?.source ?? item;
+    if (entry.pageKey && !candidates.has(entry.pageKey) && page.openTurns.has(entry.turn_id)) candidates.set(entry.pageKey, entry);
+    if (candidates.size >= PROCESS_CACHE_LIMIT / 2) break;
+  }
+  return candidates;
+}
+function queueProcessHydration($, id, page) {
+  if (page.processHydration || !page.openTurns?.size) return;
+  const generation = state.generation;
+  const request = {};
+  page.processHydration = request;
+  $.clock.after(0, () => {
+    if (page.processHydration !== request) return;
+    page.processHydration = null;
+    if (state.generation === generation) hydrateVisibleProcess($, id, page);
+  });
+}
+function revealCachedProcess($, page) {
+  if (!page.processPages?.size || page.navigationTimeline || page.disclosurePlacement?.running) return;
+  const layoutChanged = visibleProcessEntries(page, drawnWindow(page)).some(item => {
+    const entry = item.fileView?.source ?? item;
+    if (!entry.pageKey) return false;
+    const cached = page.processPages.get(entry.pageKey), hydrated = cached?.records?.has(entry.id);
+    return entry.type === 'turnProcessPending' ? hydrated || entry.error !== processPageError(cached) : !hydrated;
+  });
+  if (!layoutChanged) return;
+  refreshTimeline(page);
+  void invalidate($);
+}
 async function loadProcessPage($, id, ref) {
   const page = pageFor(id), pages = page.processPages ??= new Map();
-  const request = pages.get(ref.pageKey);
-  if (request?.loading || request?.records) return;
-  const loading = { loading: true };
-  pages.set(ref.pageKey, loading);
-  const visible = () => state.opened && state.selected === id && state.pages.get(id) === page && page.openTurns?.has(ref.turn_id);
-  if (request?.error && visible()) { refreshTimeline(page); await invalidate($); }
+  const previous = pages.get(ref.pageKey), generation = state.generation;
+  if (previous?.loading || previous?.records?.has(ref.id) || (page.processInFlight ?? 0) >= PROCESS_PARALLEL_PAGES || !page.openTurns?.has(ref.turn_id)) return;
+  const request = { loading: true, turnId: ref.turn_id };
+  pages.set(ref.pageKey, request);
+  page.processInFlight = (page.processInFlight ?? 0) + 1;
+  const current = () => state.generation === generation && currentProcessPane(id, page) && page.openTurns.has(ref.turn_id);
+  let settled = false;
   try {
+    if (previous?.error && current()) { refreshTimeline(page); await invalidate($); }
+    if (!current() || pages.get(ref.pageKey) !== request) return;
     const result = await bridge($, 'ui_history', { target: id, process_page: ref.locator });
-    if (pages.get(ref.pageKey) !== loading) return;
+    if (!current() || pages.get(ref.pageKey) !== request) return;
     if (!Array.isArray(result.entries)) throw new Error(failureText(result));
     const records = new Map(result.entries.map(entry => [entry.id, { ...entry, pageKey: ref.pageKey }]));
-    if (!records.has(ref.id) || page.live.some(entry => entry.pageKey === ref.pageKey && !records.has(entry.id))) throw new Error('历史记录位置已变更');
-    pages.set(ref.pageKey, { records });
-    const inView = new Set(drawnWindow(page).entries.map(entry => entry.pageKey).filter(Boolean));
-    for (const [key, value] of pages) {
-      if (pages.size <= 16) break;
-      if (key !== ref.pageKey && !value.loading && !inView.has(key)) pages.delete(key);
-    }
+    if (!(ref.processIds ?? [ref.id]).every(itemId => records.has(itemId))) throw new Error('历史记录位置已变更');
+    pages.delete(ref.pageKey);
+    pages.set(ref.pageKey, { records, turnId: ref.turn_id });
+    settled = true;
   } catch (error) {
-    if (pages.get(ref.pageKey) === loading) pages.set(ref.pageKey, { error: failureText(error) });
+    if (current() && pages.get(ref.pageKey) === request) {
+      pages.set(ref.pageKey, { error: failureText(error), turnId: ref.turn_id });
+      settled = true;
+    }
+  } finally {
+    page.processInFlight--;
+    if (pages.get(ref.pageKey) === request) pages.delete(ref.pageKey);
+    if (settled && current()) {
+      if (pages.size > PROCESS_CACHE_LIMIT) {
+        const keep = processViewportPages(page);
+        for (const [key, value] of pages) {
+          if (pages.size <= PROCESS_CACHE_LIMIT) break;
+          if (value.loading || key === ref.pageKey || keep.has(key)) continue;
+          pages.delete(key);
+        }
+      }
+      revealCachedProcess($, page);
+    }
+    if (currentProcessPane(id, page)) queueProcessHydration($, id, page);
   }
-  if (visible()) { refreshTimeline(page); await invalidate($); }
-  else page.timeline = null;
 }
 function hydrateVisibleProcess($, id, page) {
-  if (!page.openTurns?.size || page.navigating || page.navigationRequest || state.imagePreview) return;
-  const pages = page.processPages ??= new Map(), running = [...pages.values()].filter(value => value.loading).length;
-  let slots = 2 - running;
-  for (const entry of drawnWindow(page).entries) {
-    if (slots <= 0) break;
-    if (entry.type !== 'turnProcessPending' || pages.has(entry.pageKey) || !page.openTurns.has(entry.turn_id)) continue;
+  if (!currentProcessPane(id, page) || !page.openTurns?.size || page.disclosurePlacement?.running) return;
+  revealCachedProcess($, page);
+  if (page.navigating || page.navigationRequest) return;
+  let slots = PROCESS_PARALLEL_PAGES - (page.processInFlight ?? 0);
+  if (slots <= 0) return;
+  for (const [key, entry] of processViewportPages(page)) {
+    if (entry.type !== 'turnProcessPending' || page.processPages?.has(key)) continue;
     slots--; void loadProcessPage($, id, entry);
+    if (!slots) break;
   }
+}
+async function placeDisclosure($, id, page, { key, entry, generation, geometry, keepHeight = false, inline = false }, apply) {
+  if (state.generation !== generation || !currentProcessPane(id, page)) return;
+  holdWindow(page);
+  cancelNavigation(page, true);
+  page.tailRequest = null;
+  const wasFollowing = page.nativeFollowing;
+  page.nativeFollowing = false;
+  const scrollGeneration = ++page.scrollGeneration;
+  const position = page.scrollGeometry ?? geometry;
+  const offset = state.scroll.get(id) ?? geometry?.offset ?? 0;
+  const preserve = page.surface === 'desktop' && Number.isFinite(position?.bodyRows);
+  const placement = { key, running: preserve, minHeight: preserve && keepHeight ? offset + position.bodyRows : 0 };
+  page.disclosurePlacement = placement;
+  const current = () => state.generation === generation && currentProcessPane(id, page) && page.disclosurePlacement === placement;
+  const canPlace = () => current() && page.scrollGeneration === scrollGeneration;
+  let before;
+  if (preserve) {
+    for (const block of ['start', 'end']) {
+      const probe = { probing: true, observe(e) {
+        const clipped = e.offset < 0 || (block === 'start' ? e.offset >= paneEnd(e) : e.offset === 0);
+        if (!clipped) before = { block, offset: e.offset, viewport: Math.max(0, e.offset - e.by) };
+        return { deny: probeDenial };
+      } };
+      await scrollPane($, { to: { key }, block }, canPlace, probe).catch(() => {});
+      if (before || !canPlace()) break;
+    }
+  }
+  if (!current()) return;
+  const entryId = entryKey(entry);
+  holdDisclosureWindow(page, entryId);
+  const marker = canPlace() && preserve ? `codex_read_anchor_${id}_${++navigationSequence}` : null;
+  if (marker) {
+    if (inline) placement.marker = marker;
+    else { page.measureAnchor = entryId; page.measureKey = marker; }
+  }
+  let changed;
+  try {
+    changed = apply();
+    await invalidate($);
+    if (marker) {
+      for (const delay of [0, 16, 32, 64]) {
+        if (!canPlace()) break;
+        if (delay) await new Promise(resolve => $.clock.after(delay, resolve));
+        if (!canPlace()) break;
+        await refreshPaneGeometry($, page).catch(() => {});
+        const targetOffset = e => {
+          const clipped = e.offset < 0 || (before?.block === 'end' ? e.offset === 0 : e.offset >= paneEnd(e));
+          const target = before && !clipped ? before.viewport + e.offset - before.offset : offset;
+          return Math.max(0, Math.min(paneEnd(e), target));
+        };
+        const args = { to: { key: marker }, block: before?.block ?? 'start' };
+        let sample;
+        const probe = { probing: true, observe(e) {
+          sample = { target: targetOffset(e), viewport: Math.max(0, e.offset - e.by) };
+          return { deny: probeDenial };
+        } };
+        await scrollPane($, args, canPlace, probe).catch(() => {});
+        if (!sample || !canPlace()) continue;
+        // A same-cell commit rounds the native pixel position. Only move for
+        // an actual displacement, or to release native end following.
+        if (sample.target === sample.viewport && !wasFollowing) break;
+        const result = await scrollPane($, args, canPlace, null, targetOffset).catch(() => ({ deny: 'not painted' }));
+        if (!result?.deny) break;
+      }
+    }
+  } finally {
+    placement.running = false;
+    placement.marker = null;
+    if (marker && page.measureKey === marker && !page.navigationOwner) page.measureAnchor = null;
+    if (current()) queueProcessHydration($, id, page);
+  }
+  return changed;
+}
+async function toggleTurnProcess($, id, page, key, entry, generation, geometry) {
+  if (Boolean(page.openTurns?.has(entry.turn_id)) !== entry.open) return;
+  const applied = await placeDisclosure($, id, page, { key, entry, generation, geometry, keepHeight: entry.open }, () => {
+    page.shortFillDirection = page.processDirection = 1;
+    page.openTurns ??= new Set();
+    if (entry.open) {
+      page.openTurns.delete(entry.turn_id);
+      for (const [pageKey, value] of page.processPages ?? []) {
+        if (value.turnId === entry.turn_id && !value.records) page.processPages.delete(pageKey);
+      }
+    } else page.openTurns.add(entry.turn_id);
+    refreshTimeline(page);
+    return true;
+  });
+  if (applied && state.generation === generation && !entry.open && entry.firstPage) void loadProcessPage($, id, entry.firstPage);
 }
 function timelineWindow(page, count = page.windowSize ?? VISIBLE_ENTRIES, from) {
   const all = page.navigationTimeline ?? (page.timeline ??= conversationEntries(page.live, page));
+  const tail = page.followedBandWindow;
+  if (page.followTail && tail?.timeline === all && !page.windowAnchor && !page.adding) {
+    return { entries: all.slice(tail.start, tail.end), start: tail.start, total: all.length };
+  }
   if (page.adding) {
     const { direction, start, end, count } = page.adding;
     const from = direction < 0 ? Math.max(0, start - count) : start;
@@ -403,6 +601,29 @@ function holdWindow(page) {
   const view = drawnWindow(page);
   page.windowStart = view.start; page.windowEnd = view.start + view.entries.length;
   page.windowSize = Math.max(1, view.entries.length); page.followTail = false;
+}
+function holdDisclosureWindow(page, key) {
+  const view = drawnWindow(page);
+  page.bandCore = null;
+  holdWindow(page);
+  page.windowAnchor = key;
+  page.disclosurePrefix = { first: view.entries[0] && entryKey(view.entries[0]), key };
+  const band = page.upperBand, last = band?.entries?.at(-1);
+  if (last?.type === 'turnSummary' && entryKey(last) === key && band.timeline === view.timeline) {
+    // Retain the physical summary immediately above the core. The newly
+    // opened process belongs in the core that begins under it.
+    const { seam, rows, columns, bodyRows, cost } = band;
+    page.disclosurePrefix.upper = { seam, rows, columns, bodyRows, cost, count: band.entries.length, first: entryKey(band.entries[0]) };
+  }
+  if (view.entries.some(entry => entryKey(entry) === key)) return;
+  const all = page.navigationTimeline ?? (page.timeline ??= conversationEntries(page.live, page));
+  const index = all.findIndex(entry => entryKey(entry) === key);
+  if (index < 0) return;
+  const size = Math.min(all.length, Math.max(1, view.entries.length));
+  const start = index < view.start ? index : Math.max(0, index - size + 1);
+  page.disclosurePrefix.first = entryKey(all[start]);
+  page.windowStart = start; page.windowEnd = start + size; page.windowSize = size;
+  page.renderedWindow = null; page.renderedGroups = null;
 }
 const historyKey = (id, page) => `codex_history_${id}_${page.layoutRevision ?? 0}`;
 const tailKey = (id, token) => `codex_tail_${id}_${token || 0}`;
@@ -442,16 +663,26 @@ function scrollPane($, args, valid = () => true, controller = null, targetOffset
   state.scrollQueue = operation.catch(() => {});
   return operation;
 }
-function cancelNavigation(page) {
+function cancelNavigation(page, keepBandCore = false) {
+  page.followedBandWindow = null;
+  if (!keepBandCore) page.bandTrail = null;
+  if (page.bandExposure && !page.bandExposure.placed) page.bandExposure.frame.rows = page.bandExposure.rows;
+  page.bandExposure = null;
+  page.bandIntent = 0;
+  page.resumeOnBandSize = false;
+  if (!keepBandCore) page.bandCore = null;
+  page.waitingBand = null;
+  page.disclosurePrefix = null;
   page.navigationOwner = null; page.navigationRequest = null;
   page.navigationTimeline = null; page.adding = null; page.navigating = false;
   page.historyBlockedNavigation = null; page.obsoleteScroll = null;
   page.layoutFloor = null; page.measureAnchor = null; page.historyPositionedAt = null;
   page.scroller?.cancel(); page.scroller = null; page.edgeGesture = null; page.readingAnchor = null;
-  page.historyApproach = 0; page.boundary = null;
+  page.historyApproach = 0; page.boundary = null; page.disclosurePlacement = null;
 }
 function resetTailWindow(page) {
   cancelNavigation(page);
+  page.primeHistoryPages = 2;
   page.nativeFollowing = false;
   page.followTail = true; page.awayFromBottom = false; page.scrollGeneration++;
   page.upwardRead = null;
@@ -464,6 +695,138 @@ function atPaneBottom(offset, contentRows, bodyRows, surface) {
   return offset >= contentRows - bodyRows - (surface === 'desktop' ? 2 : 1);
 }
 const paneEnd = ({ contentRows, bodyRows }) => Math.max(0, contentRows - bodyRows);
+const bandSeamRows = 0.5;
+function reachesTail(page, view) {
+  return view && (view.start + view.entries.length >= view.total ||
+    page.lowerBand?.open && page.lowerBand.timeline === view.timeline && page.lowerBand.groups?.at(-1)?.end === view.total);
+}
+function promoteUpperBand(page, e) {
+  const band = page.upperBand, all = page.timeline;
+  if (!all || !band?.groups?.length || !band.naturalRows || band.rows < band.naturalRows ||
+      e.offset + e.bodyRows + 1 > band.rows || band.timeline !== all) return false;
+  const first = band.groups[0], last = band.groups.at(-1);
+  if (first.start <= 0 || last.end > drawnWindow(page).start) return false;
+  // The whole viewport lies in this measured band. Keep that exact native
+  // height and bottom alignment as the new core. Its next older neighbour
+  // first mounts at zero height, leaving the old first pixel where it was.
+  page.bandCore = { first: first.key, last: last.key, rows: band.rows,
+    partRows: band.partRows?.slice(), naturalRows: band.naturalRows, partCounts: band.partCounts?.slice() };
+  page.windowStart = first.start; page.windowEnd = last.end;
+  page.windowSize = last.end - first.start;
+  page.renderedWindow = null; page.renderedGroups = band.groups;
+  page.upperBand = null; page.lowerBand = null; page.bandIntent = 0;
+  page.readingAnchor = null; page.measureAnchor = null; page.historyApproach = 0;
+  return true;
+}
+function promoteLowerBand(page, e) {
+  const core = page.bandCore, band = page.lowerBand, all = page.timeline;
+  if (!core || !band?.open || !band.naturalRows || band.timeline !== all ||
+      paneEnd(e) - e.offset + e.bodyRows + 1 > band.rows) return false;
+  const first = band.groups[0], last = band.groups.at(-1);
+  if (!first || last.end >= all.length) return false;
+  const remember = frame => frame && { seam: frame.seam, columns: frame.columns, bodyRows: frame.bodyRows,
+    rows: frame.rows, open: frame.open, token: ++navigationSequence };
+  const trail = page.bandTrail ??= [];
+  trail.push({ core, upper: remember(page.upperBand), lower: remember(band), end: paneEnd(e) });
+  // Every component before this band has an explicit native height. Reuse
+  // their real measured extent as the prefix for the next window. The older
+  // window stays in the trail and is restored on approach from this side.
+  const prefixRows = (page.upperBand?.rows ?? 0) + core.rows + bandSeamRows;
+  page.bandCore = { first: first.key, last: last.key, rows: band.rows, align: 'start', prefixRows };
+  page.windowStart = first.start; page.windowEnd = last.end; page.windowSize = last.end - first.start;
+  page.renderedWindow = null; page.renderedGroups = band.groups;
+  page.upperBand = null; page.lowerBand = null; page.bandIntent = 1;
+  page.historyApproach = 0; page.boundary = null;
+  return true;
+}
+function restoreBandOnApproach(page, e) {
+  const trail = page.bandTrail, all = page.timeline;
+  let core = page.bandCore, step;
+  while (trail?.length && core?.prefixRows != null && e.offset <= core.prefixRows + e.bodyRows * 2 &&
+      e.offset + 1 < trail.at(-1).end) {
+    step = trail.pop(); core = step.core;
+  }
+  if (!step) return false;
+  const start = all.findIndex(entry => entryKey(entry) === core.first), last = all.findIndex(entry => entryKey(entry) === core.last);
+  if (start < 0 || last < start) { trail.length = 0; return false; }
+  page.bandCore = core; page.upperBand = step.upper; page.lowerBand = step.lower;
+  page.windowStart = start; page.windowEnd = last + 1; page.windowSize = last - start + 1;
+  page.renderedWindow = null; page.renderedGroups = null; page.bandIntent = -1;
+  return true;
+}
+function waitForUpperBand($, id, page) {
+  const core = page.waitingBand = page.bandCore, generation = state.generation;
+  $.clock.after(600, () => {
+    if (!state.opened || state.selected !== id || generation !== state.generation || page.waitingBand !== core) return;
+    page.waitingBand = null;
+    if ((state.scroll.get(id) || 0) <= 1) return requestHistoryNavigation($, id, -1);
+  });
+}
+async function resumeUpperBand($, id, page) {
+  const geometry = page.scrollGeometry, offset = state.scroll.get(id) ?? 0, band = page.upperBand;
+  if (!geometry || offset > 1 || !band?.groups?.length) return false;
+  if (promoteUpperBand(page, { ...geometry, offset })) {
+    waitForUpperBand($, id, page);
+    await invalidate($);
+    return true;
+  }
+  if (band.naturalRows > band.rows) {
+    return exposeUpperBand($, id, page, offset);
+  }
+  if (band.groups[0].start === 0 && page.cursor && !page.historyError) {
+    page.historyApproach = -1;
+    await history($, id);
+    return true;
+  }
+  if (!band.naturalRows) { page.resumeOnBandSize = true; return true; }
+  return band.groups[0].start === 0 && !page.cursor;
+}
+function exposeUpperBand($, id, page, offset) {
+  if (page.bandExposure) return true;
+  const frame = page.upperBand, delta = frame.naturalRows - frame.rows;
+  if (delta <= 0) return false;
+  const token = ++navigationSequence;
+  const exposure = page.bandExposure = { token, frame, rows: frame.rows, delta, offset, attempt: 0,
+    marker: `codex_band_exposure_${id}_${token}`, strip: page.captureBandStrip?.() };
+  frame.rows += delta; page.historyApproach = 0; page.bandIntent = 0;
+  void invalidate($);
+  const retry = () => {
+    if (page.bandExposure !== exposure || exposure.running) return;
+    if (exposure.attempt++ < 2) { void invalidate($); $.clock.after(350, retry); }
+    else { frame.rows = exposure.rows; page.bandExposure = null; void invalidate($); void requestHistoryNavigation($, id, -1); }
+  };
+  $.clock.after(350, retry);
+  return true;
+}
+async function placeExposedBand($, id, page, token) {
+  const exposure = page.bandExposure;
+  // Retries redraw the same immutable extent/marker. A delayed first post
+  // is just as valid as the most recent one once the native key is present.
+  if (!exposure || exposure.running || typeof token !== 'string' || !token.startsWith(`${exposure.token}/`)) return;
+  exposure.running = true;
+  const current = () => state.opened && state.selected === id && page.bandExposure === exposure && page.upperBand === exposure.frame;
+  try {
+    for (const delay of [0, 16, 32, 64, 128, 192]) {
+      if (!current()) break;
+      if (delay) { await new Promise(resolve => $.clock.after(delay, resolve)); await refreshPaneGeometry($, page); }
+      const target = exposure.offset + exposure.delta;
+      const controller = { pending: true, observe: e => {
+        if (paneEnd(e) < target) return { deny: 'unpainted extent' };
+        exposure.target = target;
+        return { ...e, offset: target };
+      } };
+      const result = await scrollPane($, { to: { key: exposure.marker }, block: 'start' }, current, controller).catch(() => ({ deny: 'unpainted' }));
+      if (!result?.deny && current()) { exposure.placed = true; state.scroll.set(id, target); break; }
+    }
+  } finally {
+    if (page.bandExposure === exposure) {
+      if (!exposure.placed) exposure.frame.rows = exposure.rows;
+      page.bandExposure = null; page.historyApproach = 0;
+      await invalidate($);
+      if (!exposure.placed) void requestHistoryNavigation($, id, -1);
+    }
+  }
+}
 const historyMargin = (geometry, desktop) => desktop ? Math.max(2, Math.ceil(paneEnd(geometry) / 5)) : Math.max(2, (geometry.bodyRows || 12) * 2);
 const samePaneGeometry = (a, b) => a && a.contentRows === b.contentRows && a.bodyRows === b.bodyRows;
 const desktopWheelQuietMs = 180;
@@ -502,7 +865,7 @@ async function revealTail($, id, token, painted = false) {
   const delays = desktop ? desktopDelays : [0, 32, 64, 128];
   const newestDrawn = () => {
     const view = page.renderedWindow;
-    return view && view.start + view.entries.length === view.total;
+    return reachesTail(page, view);
   };
   const beforeMove = event => Math.max(0, Math.min(paneEnd(event), event.offset - event.by));
   const geometry = (event, offset) => ({ contentRows: event.contentRows, bodyRows: event.bodyRows, offset });
@@ -720,7 +1083,7 @@ async function reconcileReadingAnchor($, id, key, sensor, rows) {
       const committed = await scrollPane($, { to: { key }, block }, current, null, event => {
         if (block === 'end' && event.offset === 0) {
           sample = { clipped: true };
-          return Math.max(0, event.offset - event.by);
+          return null;
         }
         const marker = paneMarkerOffset(event, block);
         // The host reports browser scroll anchoring and wheel displacement in
@@ -728,12 +1091,16 @@ async function reconcileReadingAnchor($, id, key, sensor, rows) {
         // already includes the prefix growth, so account for it only once.
         const shift = marker - anchor.anchorOffset, layout = anchor.layoutDisplacement;
         const browserDisplacement = Number.isFinite(layout) && Math.sign(shift) === Math.sign(layout) && Math.abs(shift - layout) <= 1 ? layout : 0;
-        const movement = anchor.movement, readerDisplacement = movement - browserDisplacement;
+        const viewport = Math.max(0, event.offset - event.by);
+        const movement = anchor.movement;
+        const readerDisplacement = shift === 0 ? viewport - marker - anchor.distance : movement - browserDisplacement;
         const offset = Math.max(0, Math.min(marker + anchor.distance + readerDisplacement, paneEnd(event)));
         sample = { offset, marker, movement, readerDisplacement, contentRows: event.contentRows, bodyRows: event.bodyRows };
-        return offset;
+        // The host may commit an accepted request after several more wheel
+        // events. A marker that is already in place has nothing to write.
+        return offset === viewport ? null : offset;
       });
-      if (current() && !committed?.deny && sample) {
+      if (current() && (!committed?.deny || committed.deny === probeDenial) && sample) {
         if (sample.clipped) { anchor.block = 'start'; anchor.dirty = true; continue; }
         anchor.anchorOffset = sample.marker;
         anchor.distance += sample.readerDisplacement;
@@ -758,8 +1125,10 @@ function finishHistoryNavigation(page, owner) {
   if (page.navigationOwner !== owner) return false;
   const previous = drawnWindow(page), first = previous.entries[0], last = previous.entries.at(-1);
   const snapshot = page.navigationTimeline;
+  if (first && page.disclosurePrefix?.upper && entryKey(first) !== page.disclosurePrefix.key) page.disclosurePrefix = null;
   page.navigationTimeline = null; page.adding = null; page.navigating = false; page.navigationOwner = null;
   page.layoutFloor = null;
+  page.bandIntent = 0;
   if (!page.readingAnchor) page.measureAnchor = null;
   if (page.edgeGesture) { page.edgeGesture.settled = true; page.edgeGesture.lastAt = Date.now(); }
   if (snapshot && !page.followTail && first && last) {
@@ -798,7 +1167,10 @@ async function browseHistory($, id, direction) {
     page.navigationTimeline = page.timeline ??= conversationEntries(page.live, page);
     return await resizeWindow($, id, page, owner);
   } finally {
-    if (finishHistoryNavigation(page, owner) && state.opened && state.selected === id && gen === state.generation) void invalidate($);
+    if (finishHistoryNavigation(page, owner) && state.opened && state.selected === id && gen === state.generation) {
+      void invalidate($);
+      queueProcessHydration($, id, page);
+    }
   }
 }
 let actionSequence = 0;
@@ -1031,11 +1403,13 @@ async function chooseAttachments($, id, source = 'file') {
       const result = await bridge($, 'ui_history', { target: id, limit: RAW_WINDOW_LIMIT, character_budget: 64000, fold_turns: true });
       if (!state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen) return;
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
-      const before = drawnWindow(page), first = before.entries[0] && entryKey(before.entries[0]);
+      const before = drawnWindow(page);
       const changed = mergeLive(page, result.entries, true, result.turns), cursorChanged = JSON.stringify(page.cursor) !== JSON.stringify(result.next_cursor ?? null);
-      if (changed && !page.followTail && first) {
-        const index = timelineWindow(page).total && page.timeline.findIndex(entry => entryKey(entry) === first);
-        if (index >= 0) { const delta = index - before.start; page.windowStart += delta; if (page.windowEnd != null) page.windowEnd += delta; }
+      const retained = changed && retainedHistoryWindow(page, before);
+      if (retained) {
+        page.windowStart = retained.start;
+        page.windowEnd = retained.start + retained.count;
+        page.windowSize = Math.max(1, retained.count);
       }
       const hadError = page.historyError;
       page.cursor = result.next_cursor ?? null; page.historyError = '';
@@ -1137,18 +1511,16 @@ async function chooseAttachments($, id, source = 'file') {
       page.historyPrefetches?.delete(JSON.stringify(cursor));
       if (result.error || result.offline || !Array.isArray(result.entries)) throw new Error(failureText(result));
       if (result.next_cursor && JSON.stringify(result.next_cursor) === JSON.stringify(cursor)) throw new Error('历史读取位置未推进');
-      const previous = drawnWindow(page), first = previous.entries[0] && entryKey(previous.entries[0]);
+      const previous = drawnWindow(page);
       changed = mergeLive(page, result.entries, true, result.turns);
-      if (changed && !page.followTail && first) {
-        timelineWindow(page);
-        const index = page.timeline.findIndex(entry => entryKey(entry) === first);
-        if (index >= 0) {
-          const delta = index - previous.start;
-          page.windowStart = previous.start + delta; page.windowEnd = previous.start + previous.entries.length + delta;
-          page.windowSize = Math.max(1, previous.entries.length);
-          if (page.renderedGroups) page.renderedGroups = page.renderedGroups.map(group => ({ ...group, start: group.start + delta, end: group.end + delta }));
-        }
-      } else if (changed && !page.followTail && !first) {
+      const retained = changed && retainedHistoryWindow(page, previous);
+      if (retained) {
+        const drop = previous.entries.length - retained.count, delta = retained.start - previous.start - drop;
+        page.windowStart = retained.start; page.windowEnd = retained.start + retained.count;
+        page.windowSize = Math.max(1, retained.count);
+        if (page.renderedGroups) page.renderedGroups = page.renderedGroups.filter(group => group.start >= previous.start + drop)
+          .map(group => ({ ...group, start: group.start + delta, end: group.end + delta }));
+      } else if (changed && !page.followTail && !previous.entries.length) {
         // There was no readable anchor to preserve (for example a page of
         // filtered reasoning records). Do not retain an empty [0, 0) window.
         const count = Math.min(VISIBLE_ENTRIES, timelineWindow(page).total);
@@ -1374,7 +1746,6 @@ async function chooseAttachments($, id, source = 'file') {
     const request = ++page.detailSequence;
     page.detailRequests.set(key, request);
     while (page.detailRequests.size > MAX_DETAILS) page.detailRequests.delete(page.detailRequests.keys().next().value);
-    await invalidate($);
     try {
       const result = await bridge($, 'ui_detail', { target: id, turn_id: entry.turn_id, item_id: entry.id, view, expand: true, offset: 0 });
       if (page.detailRequests.get(key) !== request || !state.opened || state.selected !== id || state.generation !== gen || page.historyGeneration !== historyGen || !state.folds.has(foldKey)) return;
@@ -1428,6 +1799,13 @@ export function registerUI(on) {
     const oldGeometry = page?.scrollGeometry, geometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
     const viewportOffset = state.scroll.get(id) ?? Math.max(0, originOffset);
     const owner = page?.navigationOwner;
+    if (page?.bandExposure) {
+      const transaction = page.bandExposure;
+      // A reversal before placement stays on the old, still visible strip.
+      if (e.by > 0 && transaction.target == null && Math.abs(e.offset - e.by - transaction.offset) <= 2) {
+        transaction.frame.rows = transaction.rows; page.bandExposure = null; void invalidate($);
+      } else return next(e);
+    }
     const nativeTarget = owner?.staged ? page.scroller?.nativeTarget : null;
     // Only a real placement can reset the native origin during a transaction.
     // Once a packet starts there, later packets must continue from its end.
@@ -1521,7 +1899,7 @@ export function registerUI(on) {
     // Desktop reports content growth/resizing as person scrolls even when the
     // viewport did not move. That is not an instruction to stop live following.
     const view = page && drawnWindow(page);
-    const newest = view && view.start + view.entries.length >= view.total;
+    const newest = reachesTail(page, view);
     const grew = oldGeometry && e.contentRows - e.bodyRows > oldGeometry.contentRows - oldGeometry.bodyRows;
     if (page && !page.scroller?.pending && (e.by === 0 || page.followTail && tail && !page.windowAnchor && newest && direction > 0)) {
       // A mounted Markdown leaf can grow after the first placement and before
@@ -1534,7 +1912,7 @@ export function registerUI(on) {
     const intent = controller?.intent, observed = controller?.observe(e);
     if (controller && controller.intent === intent) return next(observed);
     if (direction && page) {
-      if (anchor && movement && (anchorLayoutChanged || anchor.measuring || anchor.movement)) {
+      if (anchor && movement && !page.hasHistoryBands && (anchorLayoutChanged || anchor.measuring || anchor.movement)) {
         // The browser can report a wheel after the prefix grew, while the
         // size observer is still in flight. Preserve the reader's motion as
         // well as the growth, then release the reconciled marker.
@@ -1543,6 +1921,11 @@ export function registerUI(on) {
         if (anchor.measuring) anchor.dirty = true;
       } else if (anchor) { page.readingAnchor = null; page.measureAnchor = null; }
       page.historyApproach = direction; page.boundary = null;
+      if (movement && page.openTurns?.size) {
+        page.processDirection = direction;
+        queueProcessHydration($, id, page);
+      }
+      if (movement && page.disclosurePlacement?.minHeight) { page.disclosurePlacement.minHeight = 0; void invalidate($); }
     }
     if (e.origin.kind === 'person' && id) {
       const wasFollowing = page.followTail;
@@ -1568,6 +1951,9 @@ export function registerUI(on) {
       // A downward move to the end of the newest window resumes following.
       // Layout clamps and repeated reports at an unchanged offset do not.
       page.followTail = atBottom && newest && e.by > 0;
+      if (page.followTail && page.lowerBand?.open && view.start + view.entries.length < view.total) {
+        page.followedBandWindow = { timeline: view.timeline, start: view.start, end: view.start + view.entries.length };
+      } else if (!page.followTail) page.followedBandWindow = null;
       page.awayFromBottom = !page.followTail;
       if (!wasFollowing && page.followTail && page.surface === 'desktop') void requestTail($, id);
     }
@@ -1578,10 +1964,49 @@ export function registerUI(on) {
       if (e.by < 0 && e.offset <= threshold && page.cursor) prefetchHistory($, id);
       const earlier = direction < 0 && e.offset <= threshold && (view.start > 0 || page.cursor);
       const nearEnd = e.offset >= paneEnd(e) - threshold;
-      const later = direction > 0 && nearEnd && view.start + view.entries.length < view.total;
+      const later = direction > 0 && nearEnd && !newest;
       const blocked = page.historyBlockedNavigation;
       const atEdge = direction < 0 ? e.offset <= 1 : atBottom;
       const retryDistance = Math.max(1, blocked?.requiredDistance || 0, Math.min(e.bodyRows, Math.ceil(threshold / 3)));
+      if (page.hasHistoryBands && direction < 0 && restoreBandOnApproach(page, e)) {
+        void invalidate($); return next(e);
+      }
+      if (page.hasHistoryBands && later && promoteLowerBand(page, e)) {
+        void invalidate($); return next(e);
+      }
+      if (page.hasHistoryBands && earlier && promoteUpperBand(page, e)) {
+        if (atEdge) waitForUpperBand($, id, page);
+        void invalidate($);
+        return next(e);
+      }
+      if (page.hasHistoryBands && earlier && atEdge && page.upperBand?.groups?.[0]?.start === 0 &&
+          !page.cursor && page.upperBand.rows >= page.upperBand.naturalRows && page.upperBand.naturalRows > 0) {
+        return next(e);
+      }
+      if (page.hasHistoryBands && earlier && atEdge && page.upperBand?.naturalRows > page.upperBand.rows) {
+        exposeUpperBand($, id, page, e.offset);
+        return next(e);
+      }
+      if (page.hasHistoryBands && earlier && atEdge && page.upperBand?.groups?.[0]?.start === 0 && page.cursor && !page.historyError) {
+        page.historyApproach = -1;
+        void history($, id);
+        return next(e);
+      }
+      if (page.hasHistoryBands && (earlier || later) && !atEdge) {
+        // The adjacent native rows already belong to the scrollable pane.
+        // Warm the continuation while the reader crosses them. Rebuilding the
+        // in-flow window here would displace the visible text by whole cells.
+        if (page.bandIntent !== direction) {
+          page.bandIntent = direction;
+          if (later && page.lowerBand) {
+            page.lowerBand.open = true;
+            if (page.lowerBand.naturalRows) page.lowerBand.rows = page.lowerBand.naturalRows + 1;
+          }
+          if (earlier && page.cursor && page.bandCanMerge) void history($, id);
+          else void invalidate($);
+        }
+        return next(e);
+      }
       if ((earlier || later) && (!blocked || blocked.direction !== direction || atEdge || (e.offset - blocked.offset) * direction >= retryDistance)) {
         page.historyApproach = 0;
         page.readingAnchor = null; page.measureAnchor = null;
@@ -1607,6 +2032,7 @@ export function registerUI(on) {
     page.scrollGeometry = { contentRows: e.contentRows, bodyRows: e.bodyRows };
     if (transfer?.targetOffset) {
       transfer.offset = transfer.targetOffset(e);
+      if (transfer.offset === null) return { deny: probeDenial };
       return next({ ...e, offset: transfer.offset });
     }
     // Keyed placements release Desktop's native end-follow mode.
@@ -1646,6 +2072,45 @@ export function registerUI(on) {
       return {};
     }
     if (!state.opened || !state.selected) return next(e);
+    if (e.data?.action === 'history-band-part-size') {
+      const frame = pageFor(state.selected).upperBand, { key, part, rows } = e.data;
+      if (frame?.token === key && Number.isInteger(part) && part >= 0 && part < (frame.partCounts?.length ?? 0) &&
+          e.element === `codex_band_part_${state.selected}_${part}` && Number.isFinite(rows) && rows > 0) frame.partRows[part] = rows;
+      return {};
+    }
+    if (e.element === `codex_navigation_sync_${state.selected}` && e.data?.action === 'expose-band') {
+      await placeExposedBand($, state.selected, pageFor(state.selected), e.data.token);
+      return {};
+    }
+    if (e.data?.action === 'history-band-size') {
+      const page = pageFor(state.selected);
+      const upper = e.element === `codex_band_size_${state.selected}_above`;
+      const lower = e.element === `codex_band_size_${state.selected}_below`;
+      const frame = upper ? page.upperBand : lower ? page.lowerBand : null;
+      if (frame && frame.token === e.data.key && Number.isSafeInteger(e.data.rows) && e.data.rows > 0) {
+        frame.naturalRows = e.data.rows;
+        if (lower && frame.open && frame.rows !== frame.naturalRows + 1) {
+          frame.rows = frame.naturalRows + 1; await invalidate($);
+        }
+        if (upper && page.resumeOnBandSize) {
+          page.resumeOnBandSize = false;
+          if (await resumeUpperBand($, state.selected, page)) return {};
+        }
+        if (upper && page.waitingBand && page.waitingBand === page.bandCore && frame.rows === 0) {
+          page.waitingBand = null;
+          const offset = state.scroll.get(state.selected) || 0;
+          if (offset <= 1) exposeUpperBand($, state.selected, page, offset);
+        }
+        if (upper && page.followTail && !page.navigationOwner && !page.navigationRequest) {
+          const rows = frame.naturalRows;
+          if (rows > frame.rows) { frame.rows = rows; await invalidate($); }
+          if (page.primeHistoryPages > 0 && frame.groups?.[0]?.start === 0 && page.cursor && !page.historyLoading && !page.historyError) {
+            page.primeHistoryPages--; void history($, state.selected);
+          }
+        }
+      }
+      return {};
+    }
     if (e.data?.action === 'history-size' && (e.element === `codex_prefix_size_${state.selected}_timeline` || e.element === `codex_prefix_size_${state.selected}_file`)) {
       await reconcileReadingAnchor($, state.selected, e.data.key, e.element, e.data.rows);
       return {};
@@ -1659,6 +2124,7 @@ export function registerUI(on) {
       if (boundary) {
         page.historyApproach = 0;
         page.boundary = null;
+        if (direction < 0 && page.hasHistoryBands && await resumeUpperBand($, id, page)) return {};
       }
       const scrollGeneration = page.scrollGeneration;
       $.clock.after(0, () => {
@@ -1867,7 +2333,7 @@ function renderPane($, e, next) {
       return budget.reserveChars(hint(`${key}_hint`, control, name, 18, 0, !!status), 3 * labelPadding, 3 * labelPadding + copyIconSize - source.length);
     };
     const disclosure = (key, label, onPress, entry, integration = false, expanded) => {
-      const activate = entry ? (...args) => {
+      const activate = entry && entry.type !== 'turnSummary' ? (...args) => {
         page.scrollGeneration++; page.readingAnchor = null; page.historyApproach = 0; page.boundary = null;
         if (!page.followTail) holdWindow(page); page.windowAnchor = entryKey(entry);
         // Request the reading anchor without blocking the visible disclosure.
@@ -1876,7 +2342,7 @@ function renderPane($, e, next) {
       } : onPress;
       const vector = typeof expanded === 'boolean' && e.surface === 'desktop' && typeof Svg === 'function' && typeof Client === 'function';
       if (entry?.type === 'turnSummary' && e.surface === 'desktop') {
-        return nativeGraphicButton({ Box, Button }, { key, label, onPress: activate, gap: 0, dimColor: true, children: [
+        return nativeGraphicButton({ Box, Button: copyTarget }, { key, label, onPress: activate, gap: 0, dimColor: true, children: [
           Text({ key: `label_${key}`, dimColor: true, children: [label] }),
           typeof Svg === 'function' ? Svg({ key: `icon_${key}`, source: disclosureIcon(expanded), alt: expanded ? '收起过程' : '展开过程', width: 12, height: 12 })
             : caption(`icon_${key}`, expanded ? '⌄' : '›'),
@@ -1957,6 +2423,27 @@ function renderPane($, e, next) {
     const markerGroup = (start, key, children) => Box({ key: `activity_read_anchor_${id}:${start}`, position: 'relative', flexDirection: 'column', minWidth: 0, children: [
       Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key, plain: true, label: '·', onPress: () => {} })] }), ...children,
     ] });
+    const measureBodies = e.surface === 'desktop' && Number.isFinite((page.scrollGeometry ?? e.props?.scroll)?.bodyRows);
+    const bodyAnchor = key => compactKey(`codex_body_start_${key}`, 200);
+    const bodyContent = (key, node, truncated) => {
+      if (!measureBodies || !truncated) return node;
+      const anchor = bodyAnchor(key), placement = page.disclosurePlacement;
+      return markerGroup(key, (placement?.key === anchor && placement.marker) || anchor, [node]);
+    };
+    const bodyToggle = (buttonKey, key, label, entry, collapsing, change) => {
+      if (!measureBodies) return disclosure(buttonKey, label, async () => {
+        const pending = change();
+        await invalidate($);
+        return pending;
+      });
+      // The control moves to the end of the expanded text. Measure the original
+      // passage instead so opening it never asks the host to reveal its new end.
+      const activate = () => placeDisclosure($, id, page, {
+        key: bodyAnchor(key), entry, generation, geometry: e.props?.scroll, keepHeight: collapsing, inline: true,
+      }, () => { void change(); });
+      control.navigationActions.set(buttonKey, activate);
+      return disclosure(buttonKey, label, activate);
+    };
     const groupCost = node => {
       const cost = budget.cost(node);
       // The reading marker wraps its group. Either prefix observer can wrap
@@ -2006,14 +2493,11 @@ function renderPane($, e, next) {
           const key = `turn_process_${id}:${entry.turn_id}`, label = durationLabel(entry.duration_ms, entry.status);
           if (!entry.hasProcess) {
             if (Number.isFinite(entry.duration_ms)) itemRows.push(caption(key, label));
-          } else itemRows.push(disclosure(key, label, async () => {
-            page.openTurns ??= new Set();
-            if (entry.open) page.openTurns.delete(entry.turn_id);
-            else page.openTurns.add(entry.turn_id);
-            refreshTimeline(page);
-            await invalidate($);
-            if (!entry.open && entry.firstPage) return loadProcessPage($, id, entry.firstPage);
-          }, entry, false, entry.open));
+          } else {
+            const activate = () => toggleTurnProcess($, id, page, key, entry, generation, e.props?.scroll);
+            control.navigationActions.set(key, activate);
+            itemRows.push(disclosure(key, label, activate, entry, false, entry.open));
+          }
           continue;
         }
         if (['collabAgentToolCall', 'collabToolCall', 'subAgentActivity'].includes(entry.type) && !entry.communication) {
@@ -2033,7 +2517,7 @@ function renderPane($, e, next) {
           const incoming = ['userMessage', 'parentMessage', 'directUserMessage'].includes(entry.type);
           const shown = bodyOpen && loaded && !loaded.error ? loaded : null;
           const text = safe(shown?.text ?? (local && truncated && !bodyOpen ? rawBody.slice(0, 4096) : rawBody));
-          message.push(shown?.external ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: normalizeMessageMarkdown(text, { nativeMath: e.surface === 'desktop' }) }));
+          message.push(bodyContent(key, shown?.external ? Text({ key: `message_${key}`, size: 'body', children: [text] }) : Markdown({ key: `message_${key}`, text: normalizeMessageMarkdown(text, { nativeMath: e.surface === 'desktop' }) }), truncated));
           if (entry.type === 'agentMessage' && entry.message?.is_final) {
             const copy = (press = {}) => copyMessage($, id, entry, press.surface ?? e.surface);
             const action = copyButton(`message_copy_${key}`, entryKey(entry), '复制回复', copy);
@@ -2051,10 +2535,10 @@ function renderPane($, e, next) {
           if (bodyOpen && loaded?.error) message.push(caption(`message_error_${key}`, loaded.text));
           if (bodyOpen && shown?.external) message.push(Markdown({ key: `message_link_${key}`, text: `[打开完整正文](${shown.file_url})` }));
           const bodyActive = bodyOpen && (local || Boolean(loaded) || page.detailRequests.has(cacheKey));
-          if (truncated) message.push(disclosure(`item_${key}`, bodyActive && !loaded?.error ? '收起' : loaded?.error && bodyOpen ? '重试读取正文' : '展开全文', () => {
-            if (bodyActive && !loaded?.error) { state.folds.delete(bodyKey); page.detailRequests.delete(cacheKey); return invalidate($); }
+          if (truncated) message.push(bodyToggle(`item_${key}`, key, bodyActive && !loaded?.error ? '收起' : loaded?.error && bodyOpen ? '重试读取正文' : '展开全文', entry, bodyActive, () => {
+            if (bodyActive && !loaded?.error) { state.folds.delete(bodyKey); page.detailRequests.delete(cacheKey); return; }
             state.folds.add(bodyKey);
-            if (local || (loaded && !loaded.error)) return invalidate($);
+            if (local || (loaded && !loaded.error)) return;
             return expandBody($, id, entry, view, bodyKey);
           }));
           const content = Box({ key: `message_content_${key}`, flexDirection: 'column', gap: 'sm', ...(incoming ? { flexShrink: 1, minWidth: 0, borderStyle: 'round', borderDimColor: true, padding: 1, ...(e.surface === 'desktop' ? { backgroundColor: 'rgba(128,128,128,0.08)' } : {}) } : { width: '100%', paddingY: e.surface === 'desktop' ? 0.8 : 1 }), children: message });
@@ -2115,7 +2599,7 @@ function renderPane($, e, next) {
           if (expanded) {
             const loaded = detailFor(page, entry, undefined, view), shown = bodyOpen && loaded && !loaded.error ? loaded : null;
             const text = safe(shown?.text ?? entry.communication.text);
-            const contents = [shown?.external ? Text({ key: `communication_${key}`, size: 'body', children: [text] }) : Markdown({ key: `communication_${key}`, text: normalizeMessageMarkdown(text, { nativeMath: e.surface === 'desktop' }) })];
+            const contents = [bodyContent(key, shown?.external ? Text({ key: `communication_${key}`, size: 'body', children: [text] }) : Markdown({ key: `communication_${key}`, text: normalizeMessageMarkdown(text, { nativeMath: e.surface === 'desktop' }) }), entry.communication.truncated)];
             const failure = communicationFailure(entry);
             if (failure) contents.push(caption(`communication_failure_${key}`, `发送异常：${failure}`));
             if (bodyOpen && loaded?.error) contents.push(caption(`communication_error_${key}`, loaded.text));
@@ -2126,10 +2610,10 @@ function renderPane($, e, next) {
             }
             itemRows.push(Box({ key: `tool_content_${key}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 0.7 : 'sm', paddingX: 1, children: contents }));
             const bodyActive = bodyOpen && (Boolean(loaded) || page.detailRequests.has(cacheKey));
-            if (entry.communication.truncated) itemRows.push(disclosure(`communication_detail_${key}`, bodyActive && !loaded?.error ? '收起' : bodyOpen && loaded?.error ? '重试读取正文' : '展开全文', () => {
-              if (bodyActive && !loaded?.error) { state.folds.delete(bodyKey); page.detailRequests.delete(cacheKey); return invalidate($); }
+            if (entry.communication.truncated) itemRows.push(bodyToggle(`communication_detail_${key}`, key, bodyActive && !loaded?.error ? '收起' : bodyOpen && loaded?.error ? '重试读取正文' : '展开全文', entry, bodyActive, () => {
+              if (bodyActive && !loaded?.error) { state.folds.delete(bodyKey); page.detailRequests.delete(cacheKey); return; }
               state.folds.add(bodyKey);
-              if (loaded && !loaded.error) return invalidate($);
+              if (loaded && !loaded.error) return;
               return expandBody($, id, entry, view, bodyKey);
             }));
             if (shown?.external) {
@@ -2242,13 +2726,16 @@ function renderPane($, e, next) {
     let hasLater = view.start + entries.length < view.total;
     const historyEnd = Box({ key: `codex_history_end_${id}`, height: 1, children: [] });
     const timeline = rows => Box({ key: `codex_timeline_${id}`, flexDirection: 'column', rowGap: e.surface === 'desktop' ? 1 : 'md', minWidth: 0, ...(fillPane ? { flexGrow: 1 } : {}), children: rows });
-    const navigationProps = { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, attempt: page.navigationRequest?.attempt || 0, tailToken: page.tailRequest?.token || 0 };
+    const exposure = page.bandExposure;
+    const navigationProps = { token: page.navigationRequest?.ready ? page.navigationRequest.token : 0, attempt: page.navigationRequest?.attempt || 0, tailToken: page.tailRequest?.token || 0,
+      exposure: exposure ? `${exposure.token}/${exposure.attempt}` : '' };
     const tailMarker = Box({ position: 'absolute', bottom: 0, left: 0, width: 1, height: 0, overflow: 'hidden', children: [Button({ key: tailKey(id, page.tailMarkerToken), plain: true, label: '·', onPress: () => {} })] });
     const jumpNode = jumpControl('viewport');
     const jumping = e.surface === 'desktop' && page.tailRequest?.placement === 'jump';
     const settling = e.surface === 'desktop' && (page.navigationOwner?.staged || jumping);
     const settlingLabel = jumping ? '正在定位最新消息' : '正在加载历史消息';
     const canWatchSize = e.surface === 'desktop' && typeof Client === 'function';
+    const useBands = canWatchSize && fillPane && Number.isFinite(e.props?.bodyColumns) && e.props.bodyColumns > 1;
     const prefixBox = (scope, gap, rows, key, contentRows) => Box({ key: `codex_prefix_${id}_${scope}`, position: 'relative', flexDirection: 'column', rowGap: gap, minWidth: 0, children: [
       ...rows,
       ...(key ? [Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden',
@@ -2275,7 +2762,7 @@ function renderPane($, e, next) {
       const offset = Math.max(0, Number.isFinite(scroll?.offset) ? scroll.offset : state.scroll.get(id) || 0);
       const contentRows = scroll?.contentRows ?? page.scrollGeometry?.contentRows;
       const short = Number.isFinite(contentRows) && atPaneBottom(0, contentRows, bodyRows, e.surface);
-      const canRequest = !page.navigating && !page.navigationRequest && !page.tailRequest && !page.historyLoading && !page.historyError && !state.restoringPreview;
+      const canRequest = !page.navigating && !page.navigationRequest && !page.tailRequest && !page.historyLoading && !page.historyError && !state.restoringPreview && !page.waitingBand && !page.bandExposure;
       const fillDirection = page.shortFillDirection ?? (hasEarlier ? -1 : 1);
       // A resize can put a previously moving reader at a physical endpoint.
       // The host has no further displacement to report there.
@@ -2291,12 +2778,12 @@ function renderPane($, e, next) {
         page.edgeKey = edgeToken;
       }
       const sync = typeof Client === 'function' ? [Box({ key: `codex_sync_region_${id}`, position: 'absolute', top: offset, left: 0, width: 1, height: 1, children: [Client({ key: `codex_navigation_sync_${id}`, module: './navigation-sync.js', width: 1, height: 1, props: reserving ? { token: 0, tailToken: 0, edgeToken: '', edgeDirection: 0 } : { ...navigationProps, edgeToken, edgeDirection } })] })] : [];
-      const loadingLayer = settling || reserving && e.surface === 'desktop' ? [Box({ key: `codex_history_settling_${id}`, position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'background', children: [
+      const loadingLayer = settling || reserving && e.surface === 'desktop' ? [Box({ key: `codex_history_settling_${id}`, position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'composerSidebarBackground', children: [
         Box({ key: `codex_history_settling_indicator_${id}`, position: 'absolute', top: offset + 2, left: 0, right: 0, height: 2, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', children: [
           typeof Svg === 'function' ? Svg({ key: `codex_history_settling_spinner_${id}`, source: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#888" stroke-opacity=".25" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="#888" stroke-width="1.5"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur=".8s" repeatCount="indefinite"/></path></svg>', alt: settlingLabel, width: 18, height: 18, isInteractive: true }) : caption(`codex_history_settling_label_${id}`, settlingLabel),
         ] }),
       ] })] : [];
-      const frame = Box({ key: 'codex_conversation', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'lg', ...(fillPane ? { minHeight: Math.max(bodyRows, page.layoutFloor || 0) } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...loadingLayer, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
+      const frame = Box({ key: 'codex_conversation', position: 'relative', overflow: 'hidden', flexDirection: 'column', gap: 'lg', ...(e.surface === 'desktop' ? { backgroundColor: 'composerSidebarBackground' } : {}), ...(fillPane ? { minHeight: Math.max(bodyRows, page.layoutFloor || 0, page.disclosurePlacement?.minHeight ?? 0) } : {}), children: [...sync, tailMarker, headerNode, ...content, ...(hasLater ? [historyEnd] : []), composerNode, ...loadingLayer, ...(fillPane ? [overlay(scroll)] : page.awayFromBottom || hasLater ? [jumpNode] : [])] });
       return frame;
     };
     // Preserve the partitions already on screen. Joining newly prepended tool
@@ -2339,18 +2826,34 @@ function renderPane($, e, next) {
       chars: measuredShell.chars + (historyBusy ? 0 : spinnerCost.chars) + 512,
       wireChars: measuredShell.wireChars + (historyBusy ? 0 : spinnerCost.wireChars) + 512 };
     const paneLimit = RENDER_LIMIT;
+    const coreLimit = useBands ? historyCoreLimit(shellCost, paneLimit) : paneLimit;
+    const heldUpper = useBands && !page.adding && page.disclosurePrefix?.key === groups[0]?.key ? page.disclosurePrefix?.upper : null;
+    if (heldUpper?.cost) {
+      for (const field of ['chars', 'wireChars', 'nodes']) coreLimit[field] = Math.min(coreLimit[field], paneLimit[field] - heldUpper.cost[field]);
+    }
     // A composer with attachments and its reserved draft can leave less than
     // two default wire budgets. Keep room for the neighbouring group and the
     // controls around a paginated group.
     const pageGroupLimit = { ...GROUP_RENDER_LIMIT,
       wireChars: Math.min(GROUP_RENDER_LIMIT.wireChars, Math.max(512, Math.floor((paneLimit.wireChars - shellCost.wireChars) / 2) - 1024)) };
-    const retained = page.adding;
+    let retained = page.adding;
     const anchor = page.windowAnchor ? (page.navigationTimeline ?? page.timeline).findIndex(entry => entryKey(entry) === page.windowAnchor) : undefined;
-    const plan = planHistoryWindow({ groups, renderGroup, retained, direction: page.adding?.direction ?? -1, anchor: anchor >= 0 ? anchor : undefined, shellCost, limit: paneLimit, maxEntries: RAW_WINDOW_LIMIT, shift: !!page.adding });
+    if (!retained && page.disclosurePrefix?.key === page.windowAnchor && anchor >= 0) {
+      const first = groups.find(group => group.key === page.disclosurePrefix.first);
+      if (first && first.start <= anchor) retained = { start: first.start, end: anchor + 1 };
+    }
+    const maxCoreEntries = useBands ? Math.min(Math.floor(RAW_WINDOW_LIMIT * 0.7), RAW_WINDOW_LIMIT - (heldUpper?.count ?? 0)) : RAW_WINDOW_LIMIT;
+    const plan = planHistoryWindow({ groups, renderGroup, retained, direction: page.adding?.direction ?? (retained ? 1 : -1), anchor: anchor >= 0 ? anchor : undefined, shellCost, limit: coreLimit, maxEntries: maxCoreEntries, shift: !!page.adding });
     // Expanding several retained groups can increase their combined cost. Keep
     // every retained boundary and apply the existing content pager to the
     // largest representations rather than evicting a message being read.
     const selectedGroups = plan.groups;
+    // Even a cache containing only the newest fetch needs a real upper
+    // neighbour before the next cursor is read. Its native slot then exists
+    // in the initial tail layout and can absorb that fetch while reading.
+    if (useBands && page.cursor && plan.start === 0 && !page.adding && !page.windowAnchor && selectedGroups.length > 2 && page.followTail) {
+      selectedGroups.splice(0, Math.min(3, Math.ceil(selectedGroups.length / 4)));
+    }
     const sumCost = () => historyWindowCost(shellCost, selectedGroups);
     const fraction = cost => Math.max(cost.chars / paneLimit.chars, cost.wireChars / paneLimit.wireChars, cost.nodes / paneLimit.nodes);
     for (let pass = 0; pass < selectedGroups.length * 12; pass++) {
@@ -2381,10 +2884,12 @@ function renderPane($, e, next) {
     view = { ...view, start: plan.start, entries };
     hasEarlier = view.start > 0 || !!page.cursor;
     hasLater = view.start + entries.length < view.total;
+    const upperSummary = heldUpper && selectedGroups[0]?.key === page.disclosurePrefix.key ? selectedGroups[0] : null;
     // Adjacent chunks are one visual file, with no paragraph gap at buffer edges.
     const visualGroups = [];
     let cluster = null, timelineAnchor = -1, fileAnchor = -1;
     for (const group of selectedGroups) {
+      if (group === upperSummary) continue;
       const file = group.group.items[0]?.fileView;
       const anchored = group.key === page.measureAnchor;
       const node = anchored ? markerGroup(group.start, page.measureKey, [group.node]) : group.node;
@@ -2406,7 +2911,164 @@ function renderPane($, e, next) {
     };
     const rows = visualGroups.map((group, index) => group.node ?? fileBuffer(group.key,
       index === timelineAnchor ? watchPrefix(group.nodes, fileAnchor, 'file', 0) : group.nodes));
-    const tree = root([timeline(watchPrefix(rows, timelineAnchor, 'timeline', 1))]);
+    let contentTimeline = timeline(watchPrefix(rows, timelineAnchor, 'timeline', 1));
+    const bandCore = useBands && !page.adding && page.bandCore?.first === selectedGroups[0]?.key &&
+      page.bandCore?.last === selectedGroups.at(-1)?.key ? page.bandCore : null;
+    if (!bandCore) page.bandCore = null;
+    const stack = children => Box({ flexDirection: 'column', flexShrink: 0, rowGap: 1, minWidth: 0, children });
+    const nativeBand = (key, frame, children, alignStart) => Box({ key, flexDirection: alignStart ? 'column' : 'column-reverse', height: frame.rows,
+      flexShrink: 0, overflow: 'hidden', children: [stack(children)] });
+    let compactCore;
+    if (bandCore) {
+      const coreSections = bandSections(rows, budget.cost);
+      const matches = bandCore.partCounts?.length === coreSections.length && coreSections.every((section, i) => section.length === bandCore.partCounts[i]);
+      contentTimeline = nativeBand(`codex_resident_core_${id}`, bandCore, coreSections.map(stack), bandCore.align === 'start');
+      if (matches) compactCore = visibleRows => {
+        const reduced = cropBandSections({ sections: coreSections, heights: bandCore.partRows, naturalRows: bandCore.naturalRows,
+          height: bandCore.rows, visibleRows, alignStart: bandCore.align === 'start', Box });
+        return reduced ? nativeBand(undefined, bandCore, reduced, bandCore.align === 'start') : null;
+      };
+    }
+    page.hasHistoryBands = useBands;
+    page.captureBandStrip = null;
+    page.bandCanMerge = false;
+    if (!useBands || (!hasEarlier && !upperSummary) || !selectedGroups.length) page.upperBand = null;
+    if (!useBands || !hasLater || !selectedGroups.length) page.lowerBand = null;
+    if (useBands && selectedGroups.length && (hasEarlier || hasLater || upperSummary)) {
+      const all = page.navigationTimeline ?? page.timeline;
+      let cost = sumCost(), remaining = RAW_WINDOW_LIMIT - entries.length;
+      const band = direction => {
+        const upper = direction < 0;
+        const pinned = upper && upperSummary;
+        const seam = pinned ? heldUpper.seam : upper ? selectedGroups[0].key : selectedGroups.at(-1).key;
+        const scope = upper ? 'upperBand' : 'lowerBand';
+        let frame = page[scope];
+        if (frame?.seam !== seam || frame.columns !== e.props.bodyColumns || frame.bodyRows !== bodyRows) {
+          frame = page[scope] = { seam, columns: e.props.bodyColumns, bodyRows, token: ++navigationSequence };
+        }
+        if (pinned && frame.columns === heldUpper.columns && frame.bodyRows === heldUpper.bodyRows) frame.rows ??= heldUpper.rows;
+        const boundary = direction < 0 ? plan.start : plan.end;
+        // Limit both construction and mounted entries. Partition neighbouring
+        // tool calls exactly as in the ordinary timeline.
+        const count = Math.min(remaining, pinned ? heldUpper.count - 1 : 48);
+        let index = direction < 0 ? Math.max(0, boundary - count) : boundary;
+        if (pinned) {
+          const first = all.findIndex(entry => entryKey(entry) === heldUpper.first);
+          if (first >= index && first <= boundary) index = first;
+        }
+        const end = direction < 0 ? boundary : Math.min(all.length, boundary + count);
+        const records = groupEntries(all.slice(index, end)).map(group => {
+          const start = index; index += group.items.length;
+          return { start, end: index, key: entryKey(group.items[0]), group };
+        });
+        if (direction < 0) records.reverse();
+        // Opening a disclosure often introduces a lower neighbour. Keep the
+        // existing upper lane's budget while its visible prefix is held.
+        const holdingDisclosure = pinned || page.disclosurePrefix?.key === page.windowAnchor && page.windowAnchor;
+        const shared = upper && hasLater && !holdingDisclosure ? historyCoreLimit(cost, paneLimit) : paneLimit;
+        const result = historyBand({ records, render: renderGroup, cost, limit: shared, remaining, direction });
+        cost = result.cost; remaining = result.remaining;
+        const mounted = pinned ? [...result.groups, upperSummary] : result.groups;
+        frame.entries = mounted.flatMap(group => group.group.items); frame.timeline = all;
+        frame.groups = mounted.map(({ start, end, key }) => ({ start, end, key }));
+        frame.cost = historyWindowCost({ chars: 0, wireChars: 0, nodes: 0, depth: 0 }, mounted);
+        if (!mounted.length) { page[scope] = null; return null; }
+        const frontier = upper ? mounted[0].key : mounted.at(-1).key;
+        if (frame.frontier !== frontier) {
+          frame.frontier = frontier; frame.token = ++navigationSequence; frame.naturalRows = null;
+        }
+        const cells = [];
+        for (const group of mounted) {
+          const file = group.group.items[0]?.fileView;
+          if (file?.kind === 'chunk') {
+            const prior = cells.at(-1);
+            if (prior?.file === file.key) prior.chunks.push(group.node);
+            else cells.push({ file: file.key, chunks: [group.node] });
+          } else cells.push({ node: pinned && group.key === page.measureAnchor ? markerGroup(group.start, page.measureKey, [group.node]) : group.node });
+        }
+        const children = cells.map(cell => cell.node ?? fileBuffer(cell.file, cell.chunks));
+        // A numeric height is supported by the native Box. When neighbouring
+        // groups are short, only reserve the inter-group gaps and the padding
+        // that the actual message renderer puts in the pane. This remains
+        // filled even if Markdown is still mounting or has no visible text.
+        const gapRows = Math.max(0, cells.length - 1) * bandSeamRows;
+        const messagePadding = mounted.filter(group => ['agentMessage', 'plan', 'userMessage', 'parentMessage', 'directUserMessage'].includes(group.group.type)).length;
+        if (!upper && bandCore?.align === 'start') frame.open = true;
+        frame.rows ??= upper && bandCore ? bandCore.prefixRows ?? 0 : Math.min(bodyRows * 2, Math.max(1, Math.floor(gapRows + messagePadding)));
+        if (upper) page.bandCanMerge = true;
+        const name = upper ? 'above' : 'below';
+        const key = `codex_history_band_${name}_${id}`;
+        const sensor = Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden', children: [
+          Client({ key: `codex_band_size_${id}_${name}`, module: './history-size.js', width: 1, height: '100%',
+            props: { key: frame.token, band: true, contentRows: Math.max(bodyRows, page.scrollGeometry?.contentRows || 0) } }),
+        ] });
+        const sections = upper ? bandSections(children, budget.cost) : null;
+        let measured = children;
+        if (sections) {
+          const counts = sections.map(section => section.length);
+          if (frame.partToken !== frame.token || frame.partCounts?.length !== counts.length || counts.some((n, i) => frame.partCounts[i] !== n)) {
+            frame.partToken = frame.token; frame.partCounts = counts; frame.partRows = counts.map(() => 0);
+          }
+          const scale = 128;
+          measured = sections.map((section, part) => Box({ position: 'relative', flexDirection: 'column', flexShrink: 0, rowGap: 1, minWidth: 0, children: [
+            ...section, ...(sections.length > 1 ? [Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden', flexDirection: 'column', children: [
+              Box({ height: `${scale * 100}%`, flexShrink: 0, width: 0, overflow: 'hidden', flexDirection: 'column', children: [
+                Client({ key: `codex_band_part_${id}_${part}`, module: './history-size.js', width: 1, height: '100%',
+                  props: { key: frame.token, part, scale, contentRows: Math.max(32, Math.min(131072, (page.scrollGeometry?.contentRows || bodyRows) * scale)) } }),
+              ] }),
+            ] })] : []),
+          ] }));
+          frame.compact = visibleRows => {
+            const reduced = cropBandSections({ sections, heights: frame.partRows, naturalRows: frame.naturalRows, height: frame.rows, visibleRows, alignStart: false, Box });
+            return reduced ? nativeBand(undefined, frame, reduced, false) : null;
+          };
+        }
+        return Box({ key, overflow: 'hidden', flexShrink: 0,
+          height: frame.rows, flexDirection: upper ? 'column-reverse' : 'column', children: [
+            Box({ position: 'relative', flexDirection: 'column', flexShrink: 0, minWidth: 0, rowGap: 1, children: [...measured, sensor] }),
+          ] });
+      };
+      // Keep the main Markdown/Code leaves first in native traversal. Desktop
+      // reuses those portal slots by ordinal, even when the Box keys match.
+      const upper = hasEarlier || upperSummary ? band(-1) : null;
+      const lower = hasLater ? band(1) : null;
+      if (lower && page.lowerBand.open && page.lowerBand.groups.at(-1)?.end === view.total) hasLater = false;
+      if (upper || lower) {
+        const originalCore = contentTimeline;
+        if (upper) {
+          const oldUpperRows = page.upperBand.rows;
+          const frame = page.upperBand;
+          page.captureBandStrip = () => {
+            const oldUpper = oldUpperRows ? frame.compact?.(bodyRows + 1) ?? upper : Box({ height: 0, children: [] });
+            const core = oldUpperRows < bodyRows + 1 ? compactCore?.(bodyRows + 1 - oldUpperRows) ?? originalCore : null;
+            return budget.readingStrip(Box({ flexDirection: 'column', rowGap: bandCore ? 0 : 1, children: core ? [oldUpper, core] : [oldUpper] }));
+          };
+        }
+        const core = upper ? Box({ flexDirection: 'column-reverse', minWidth: 0, rowGap: bandCore ? 0 : 1, children: [contentTimeline, upper] }) : contentTimeline;
+        contentTimeline = lower ? Box({ flexDirection: 'column', minWidth: 0, rowGap: 1, children: [core, lower] }) : core;
+      }
+    }
+    let tree;
+    if (exposure) {
+      // Keep the old source pixels at their original scroll coordinate while
+      // Desktop acknowledges the new extent. The marker belongs exclusively
+      // to this paint. No stale native key table can authorize the move.
+      const marker = Box({ position: 'absolute', top: 0, left: 0, width: 1, height: 0, overflow: 'hidden',
+        children: [Button({ key: exposure.marker, plain: true, label: '·', onPress: () => {} })] });
+      const copy = exposure.strip && budget.drawStrip(exposure.strip);
+      const withLayer = content => Box({ position: 'relative', flexDirection: 'column', children: [marker, contentTimeline, Box({ key: `codex_band_${content ? 'reading_strip' : 'positioning'}_${id}`, position: 'absolute',
+        top: 0, left: 0, right: 0, height: bodyRows + 1, overflow: 'hidden', backgroundColor: 'composerSidebarBackground', flexDirection: 'column',
+        children: content ? [Box({ flexDirection: 'column', flexShrink: 0, children: [content] })] : [caption(`codex_band_placement_${id}`, '正在定位历史消息…')] })] });
+      if (copy) {
+        const staged = root([withLayer(copy)]);
+        // A temporary display-only duplicate may use part of the normal
+        // 20k text margin. Check the actual full tree; native text still has
+        // a 6k margin, and wire, nodes and depth keep their ordinary limits.
+        if (budget.fits(staged, { ...RENDER_LIMIT, chars: 94000 })) tree = staged;
+      }
+      if (!tree) contentTimeline = withLayer(null);
+    }
+    tree ??= root([contentTimeline]);
     page.renderedGroups = selectedGroups.map(({ start, end, key }) => ({ start, end, key }));
     page.renderedWindow = { ...view, entries, timeline: page.navigationTimeline ?? page.timeline };
     if (!page.followTail) { page.windowStart = view.start; page.windowEnd = view.start + entries.length; page.windowSize = Math.max(1, entries.length); }

@@ -17,7 +17,7 @@ const waitFor = async predicate => {
   assert.fail('the expected native frame did not appear');
 };
 
-async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, onProbeReply = () => {}, onRender = () => {}, commitScroll = () => ({}), prefixGrowth = () => 0, autoPost = true, shortViewport = false, nativeContentRows, messageRows = () => 1, vectorControls = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
+async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, onProbeReply = () => {}, onRender = () => {}, commitScroll = () => ({}), prefixGrowth = () => 0, measureOffset = (_, offset) => offset, autoPost = true, shortViewport = false, nativeContentRows, messageRows = () => 1, vectorControls = false, bodyColumns, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
   closeUI();
   const hooks = [], scrolls = [], samples = [], calls = [], timers = [];
   let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0, invalidations = 0;
@@ -40,10 +40,10 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
           const markerIndex = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
           const precedingRows = nativePainted.slice(0, markerIndex).filter(n => n.type === 'Markdown' || n.type === 'Text' && n.props.key?.startsWith('message_'))
             .reduce((sum, node) => sum + messageRows(node), 0);
-          const isReadingMarker = args.to?.key?.startsWith('codex_read_anchor_');
+          const isReadingMarker = ['codex_read_anchor_', 'turn_process_a:', 'codex_body_start_'].some(prefix => args.to?.key?.startsWith(prefix));
           const marker = 3 + precedingRows + prefixGrowth();
-          const destination = isReadingMarker ? Math.max(0, Math.min(contentRows - 10, marker - (args.block === 'end' ? 9 : 0)))
-            : args.to === 'end' || args.block === 'end' ? contentRows - 10 : 3;
+          const destination = measureOffset(args, isReadingMarker ? Math.max(0, Math.min(contentRows - 10, marker - (args.block === 'end' ? 9 : 0)))
+            : args.to === 'end' || args.block === 'end' ? contentRows - 10 : 3);
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
           const result = await host.dispatch('ui.scroll', e);
           if (result.deny) {
@@ -75,7 +75,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   const host = nativeHooks(hooks, $); registerUI(host.on);
   const draw = async (restoredScroll = {}) => {
     constructed = 0;
-    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}), ...restoredScroll } } }, () => null));
+    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { bodyColumns, scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}), ...restoredScroll } } }, () => null));
     onRender(painted);
     maxConstructed = Math.max(maxConstructed, constructed);
     const sync = painted.find(n => n.type === 'Client' && n.props.module === './navigation-sync.js');
@@ -115,6 +115,28 @@ const readyToken = h => h.painted.find(n => n.props.module === './navigation-syn
 const settling = h => h.painted.some(n => n.props.key === 'codex_history_settling_a');
 
 const longEntries = () => Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
+
+test('desktop waits for the painted band revision before placing the measured row', async t => {
+  const h = await setup({ live: longEntries(), bodyColumns: 82, nativeContentRows: 610 });
+  t.after(h.close);
+  await h.nativeMove(120 - h.offset);
+  const painted = await h.draw(), upper = painted.find(node => node.props.key === 'codex_history_band_above_a');
+  const sensor = painted.find(node => node.props.key === 'codex_band_size_a_above');
+  assert.ok(upper && sensor);
+  const oldRows = upper.props.height, delta = 43;
+  const count = h.scrolls.length;
+  await h.host.surface(() => h.host.dispatch('ui.message', { element: sensor.props.key,
+    data: { action: 'history-band-size', key: sensor.props.props.key, rows: oldRows + delta } }));
+  await h.nativeMove(-h.offset);
+  assert.equal(h.offset, 0, 'the native reply must not move against the old extent');
+  await waitFor(() => h.offset === delta).catch(error => {
+    throw new Error(JSON.stringify({ offset: h.offset, scrolls: h.scrolls.slice(count), messages: h.host.calls.filter(call => call.event === 'ui.message').map(call => call.input.data?.action) }), { cause: error });
+  });
+  const expanded = await h.draw();
+  assert.equal(expanded.find(node => node.props.key === upper.props.key).props.height, oldRows + delta);
+  assert.ok(h.scrolls.slice(count).every(request => request.to.key.startsWith('codex_band_exposure_')));
+  assert.equal(settling(h), false);
+});
 
 test('a full history window fetches older and newer records at one fifth of scrollbar travel', async t => {
   const h = await setup({ live: longEntries(), nativeContentRows: 1010 }); t.after(h.close);
@@ -161,8 +183,11 @@ test('late growing Markdown above the reader is corrected after navigation retur
   const surface = { elements: { Box: props => props }, rows: 50, setState(value) { this.state = value; }, post(data) {
     dispatched.push(h.host.surface(() => h.host.dispatch('ui.message', { element: client.props.key, data })));
   } };
+  const firstSample = h.samples.length;
   historySize(client.props.props, surface);
   historySize(client.props.props, surface); await Promise.all(dispatched);
+  const initial = h.samples.slice(firstSample).filter(sample => sample.args.to?.key === client.props.props.key);
+  assert.ok(initial.length && initial.every(sample => sample.deny), 'mounting an unchanged prefix never schedules a stale native scroll write');
   growth = 73; surface.rows += growth;
   historySize(client.props.props, surface); await Promise.all(dispatched);
   assert.equal(h.offset, held + 73, 'the retained item stays at its previous viewport row');
@@ -204,7 +229,7 @@ for (const autodrift of [false, true]) test(`reverse movement preserves the read
 
 test('a delayed prefix measurement cannot replace the start of a new hard-top navigation', async t => {
   let anchorKey, release;
-  const h = await setup({ live: longEntries(), nativeContentRows: 600, commitScroll({ to }) {
+  const h = await setup({ live: longEntries(), nativeContentRows: 600, onProbeReply({ to }) {
     if (anchorKey && to?.key === anchorKey && !release) return new Promise(resolve => { release = resolve; });
     return {};
   } }); t.after(() => { release?.({}); h.close(); });
@@ -538,7 +563,7 @@ test('one jump reaches native end after the latest frame paints without a tail m
 
 test('a delayed read of the newest footer cannot undo the first upward wheel', async t => {
   let armed = false, release;
-  const h = await setup({ live: longEntries(), nativeContentRows: 510, commitScroll({ to }) {
+  const h = await setup({ live: longEntries(), nativeContentRows: 510, onProbeReply({ to }) {
     if (armed && !release && to?.key?.startsWith('codex_tail_')) return new Promise(resolve => { release = resolve; });
     return {};
   } });
@@ -627,6 +652,160 @@ test('one native edge visit advances past many pages containing only folded proc
   assert.deepEqual(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).map(call => call.args.cursor.index), Array.from({ length: 21 }, (_, i) => 20 - i));
 });
 
+test('an opened 24-hour process reaches uncached earlier steps with ordinary upward navigation', async t => {
+  const steps = Array.from({ length: 120 }, (_, i) => ({
+    id: `s${i}`, turn_id: 't', type: 'agentMessage', data: { text: `step-${i}` }, message: { phase: 'commentary' },
+  }));
+  const turn = { id: 't', status: 'completed', duration_ms: 86400000, final_item_id: 'final', history_start_loaded: false };
+  const prompt = { id: 'prompt', turn_id: 't', type: 'userMessage', data: { content: [{ type: 'text', text: 'First prompt' }] }, turn_input: 'start' };
+  const final = { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'Final reply' }, message: { phase: 'final_answer', is_final: true } };
+  const page = start => ({ type: 'turnProcessPage', turn_id: 't', cursor: String(start), limit: 30,
+    ids: steps.slice(start, start + 30).map(step => step.id) });
+  const h = await setup({ nativeContentRows: 100, history: ({ cursor, process_page: locator }) => {
+    if (locator) {
+      const start = Number(locator.cursor);
+      return { entries: steps.slice(start, start + locator.limit) };
+    }
+    if (!cursor) return { entries: [page(90), final], turns: [turn], next_cursor: { start: 60 } };
+    if (cursor.start) return { entries: [page(cursor.start)], next_cursor: { start: cursor.start - 30 } };
+    return { entries: [prompt, page(0)], turns: [{ ...turn, history_start_loaded: true }], next_cursor: null };
+  } }); t.after(h.close);
+  const summary = 'turn_process_a:t';
+  const processReads = () => h.calls.filter(({ args }) => args.process_page).map(({ args }) => Number(args.process_page.cursor));
+  assert.deepEqual(processReads(), []);
+  await h.press(summary);
+  await waitFor(() => messages(h).includes('step-90'));
+  assert.deepEqual(processReads(), [90]);
+  for (const start of [60, 30, 0]) {
+    await h.nativeMove(50 - h.offset);
+    await h.nativeMove(-100);
+    await waitFor(() => messages(h).includes(`step-${start}`) && !settling(h));
+  }
+  assert.ok(h.painted.some(node => node.props.key === 'message_a:t:prompt'));
+  assert.deepEqual([...new Set(processReads())], [90, 60, 30, 0]);
+});
+
+for (const growth of [0, 7]) test(`opening and closing a process preserves its summary with ${growth} rows of prefix growth`, async t => {
+  const earlier = Array.from({ length: 15 }, (_, i) => ({ ...entry(i), turn_id: 'older' }));
+  const turns = [{ id: 't', status: 'completed', duration_ms: 86400000, final_item_id: 'm101' }];
+  const live = [...earlier, entry(100), { ...entry(101), message: { phase: 'final_answer', is_final: true } }];
+  let prefix = 0;
+  const h = await setup({ nativeContentRows: 100, vectorControls: true, revision: () => ({ revision: 1, entries: live, turns }),
+    prefixGrowth: () => prefix,
+    onRender(tree) {
+      prefix = tree.some(node => node.props.key === 'icon_turn_process_a:t' && node.props.alt === '收起过程') ? growth : 0;
+    },
+  }); t.after(h.close);
+  await h.nativeMove(10 - h.offset);
+  const before = h.offset, sampleStart = h.samples.length;
+  await h.press('turn_process_a:t');
+  assert.equal(h.offset, before + growth);
+  assert.ok(messages(h).includes('message-100'));
+  await h.press('turn_process_a:t');
+  assert.equal(h.offset, before);
+  assert.ok(!messages(h).includes('message-100'));
+  const placement = h.samples.slice(sampleStart).filter(({ args }) => args.to?.key?.startsWith('codex_read_anchor_'));
+  assert.ok(placement.some(({ deny }) => deny), 'the new layout was sampled');
+  assert.equal(placement.filter(({ deny }) => !deny).length, growth ? 2 : 0, 'a matching row never rewrites the native viewport');
+});
+
+function bufferedTurnFixture({ seam = false } = {}) {
+  const turns = Array.from({ length: 90 }, (_, i) => ({ id: `turn-${i}`, status: 'completed', duration_ms: 86400000, final_item_id: `final-${i}` }));
+  const live = turns.flatMap(({ id: turnId }, i) => [
+    { id: `step-${i}`, turn_id: turnId, type: 'agentMessage', data: { text: `process step ${i}` }, message: { phase: 'commentary' } },
+    { id: `final-${i}`, turn_id: turnId, type: 'agentMessage',
+      // Fill the remaining core budget up to the first reply's header.
+      data: { text: `final ${i} ${'text '.repeat(500)}${seam && i === 74 ? 'x'.repeat(2400) : ''}` }, message: { phase: 'final_answer', is_final: true } },
+  ]);
+  return () => ({ revision: 1, entries: live, turns });
+}
+
+test('a process summary clicked farther inside the upper history buffer opens in the main window', async t => {
+  const h = await setup({ bodyColumns: 80, nativeContentRows: 200, revision: bufferedTurnFixture() }); t.after(h.close);
+  const buffered = tree => tree.filter(node => node.props.key?.startsWith('codex_history_band_')).flatMap(nodes);
+  const summary = buffered(h.painted).find(node => node.type === 'Button' && node.props.key.startsWith('turn_process_a:'));
+  assert.ok(summary, 'an older summary is initially mounted in a neighbour buffer');
+  await h.press(summary.props.key);
+  const id = summary.props.key.split('-').at(-1);
+  await waitFor(() => messages(h).includes(`process step ${id}`));
+  assert.ok(h.painted.some(node => node.props.key === summary.props.key));
+  assert.ok(!buffered(h.painted).some(node => node.props.key === summary.props.key));
+});
+
+test('the last upper-lane summary stays in that physical lane when its process opens below', async t => {
+  const h = await setup({ bodyColumns: 80, nativeContentRows: 200, revision: bufferedTurnFixture({ seam: true }) }); t.after(h.close);
+  const upper = () => h.painted.find(node => node.props.key === 'codex_history_band_above_a');
+  const oldBand = upper(), groups = oldBand.props.children[0].props.children;
+  const summary = nodes(groups.at(-2)).find(node => node.type === 'Button' && node.props.key.startsWith('turn_process_a:'));
+  assert.ok(summary, groups.at(-2).props.key);
+  const id = summary.props.key.split('-').at(-1);
+  const upperNodes = new Set(nodes(oldBand));
+  assert.ok(h.painted.find(node => node.type === 'Markdown' && !upperNodes.has(node)).props.text.startsWith(`final ${id} `));
+  const height = oldBand.props.height;
+  await h.press(summary.props.key);
+  await waitFor(() => messages(h).includes(`process step ${id}`));
+  assert.equal(upper().props.height, height);
+  assert.ok(nodes(upper()).some(node => node.props.key === summary.props.key));
+  assert.ok(!nodes(upper()).some(node => node.props.text === `process step ${id}`));
+  await h.press(summary.props.key);
+  assert.equal(upper().props.height, height);
+  assert.ok(nodes(upper()).some(node => node.props.key === summary.props.key));
+  assert.ok(!messages(h).includes(`process step ${id}`));
+});
+
+test('a deferred final message can collapse during body loading and keeps its reading row', { timeout: 5000 }, async t => {
+  const key = 'item_a:t:m100';
+  const live = [...Array.from({ length: 25 }, (_, i) => entry(i)), { ...entry(100), message: { is_final: true, truncated: true } }];
+  let completePreload, completeBody, reads = 0;
+  const h = await setup({ live, nativeContentRows: 100,
+    measureOffset: ({ to, block }, offset) => to?.key?.startsWith('codex_body_start_') && block === 'start' ? -2 : offset,
+    history({ cursor, expand }) {
+      if (expand && ++reads === 1) return new Promise(resolve => { completeBody = resolve; });
+      if (expand) return { text: 'Fresh complete body' };
+      if (cursor) return new Promise(resolve => { completePreload = resolve; });
+      return { entries: [], next_cursor: { older: true } };
+    },
+  });
+  t.after(() => { completePreload?.({ entries: [], next_cursor: null }); completeBody?.({ text: 'Late complete body' }); h.close(); });
+  await waitFor(() => completePreload);
+  await h.nativeMove(30 - h.offset);
+  const before = h.offset, samples = h.samples.length, invalidations = h.invalidations;
+  await h.press(key);
+  assert.equal(reads, 1);
+  assert.equal(h.invalidations, invalidations + 1, 'a pending body requires one repaint');
+  assert.equal(h.offset, before);
+  assert.ok(h.samples.slice(samples).some(({ args, deny }) => args.to?.key?.startsWith('codex_body_start_') && args.block === 'end' && deny), 'negative start coordinates are retried read-only from the opposite alignment');
+  await waitFor(() => h.painted.some(node => node.props.key === key && node.props.label === '收起'));
+  await h.nativeMove(5);
+  const moved = before + 5;
+  assert.equal(h.offset, moved, 'a genuine wheel still owns the viewport while the read is pending');
+  await h.press(key);
+  assert.equal(h.offset, moved);
+  completePreload({ entries: [], next_cursor: null });
+  completeBody({ text: 'Late complete body' });
+  await pause(30);
+  assert.equal(h.invalidations, invalidations + 2, 'collapse repaints once and the discarded response adds no repaint');
+  assert.ok(!messages(h).includes('Late complete body'));
+  assert.ok(messages(h).includes('message-100'));
+  await h.press(key);
+  await waitFor(() => messages(h).includes('Fresh complete body'));
+  assert.equal(reads, 2);
+  assert.equal(h.offset, moved);
+});
+
+test('expanding and collapsing a local message each need one repaint', async t => {
+  const local = { ...entry(100), id: 'action:send', type: 'directUserMessage', data: { text: `${'text '.repeat(900)}visible end` } };
+  const h = await setup({ live: [...Array.from({ length: 25 }, (_, i) => entry(i)), local], nativeContentRows: 100 }); t.after(h.close);
+  await h.nativeMove(30 - h.offset);
+  const invalidations = h.invalidations;
+  await h.press('item_a:t:action:send');
+  assert.equal(h.invalidations, invalidations + 1);
+  assert.ok(messages(h).at(-1).endsWith('visible end'));
+  await h.press('item_a:t:action:send');
+  assert.equal(h.invalidations, invalidations + 2);
+  assert.ok(!messages(h).at(-1).endsWith('visible end'));
+});
+
 test('a scroll during cooldown does not consume the next upward intent', async t => {
   const live = Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
   const h = await setup({ live }); t.after(h.close);
@@ -710,4 +889,30 @@ test('failed candidate positioning restores the old history window before removi
   assert.ok(rejected > 0, 'candidate measurement must exercise the failure path');
   assert.equal(messages(h)[0], oldFirst, 'unpositioned earlier content must not be revealed');
   assert.ok(!h.painted.some(n => n.props.key === 'codex_history_settling_a'), 'failed measurement must release its loading layer');
+});
+
+test('successive visits to the physical top consume cached older pages to the first record', async t => {
+  const h = await setup({ bodyColumns: 82, nativeContentRows: 96, history({ cursor }) {
+    if (!cursor) return { entries: Array.from({ length: 30 }, (_, i) => entry(i + 3)), next_cursor: { index: 2 } };
+    return { entries: [entry(cursor.index)], next_cursor: cursor.index ? { index: cursor.index - 1 } : null };
+  } });
+  t.after(h.close);
+  const cursors = () => h.calls.filter(call => call.args.cursor).map(call => call.args.cursor.index);
+  const upperMessages = () => nodes(h.painted.find(node => node.props.key === 'codex_history_band_above_a'))
+    .filter(node => node.type === 'Markdown').map(node => node.props.text);
+  await waitFor(() => cursors().includes(1));
+  assert.deepEqual(cursors(), [2, 1]);
+  assert.ok(!messages(h).includes('message-2'));
+  assert.equal(upperMessages()[0], 'message-3', 'the upper band starts at the first merged record');
+
+  const visitTop = async index => {
+    if (h.offset <= 1) await h.nativeMove(8);
+    await h.nativeMove(-1000);
+    await waitFor(() => upperMessages()[0] === `message-${index}`);
+  };
+  await visitTop(2);
+  await visitTop(1);
+  await visitTop(0);
+  assert.equal(h.offset, 0);
+  assert.deepEqual(cursors(), [2, 1, 0]);
 });

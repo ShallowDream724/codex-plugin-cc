@@ -225,7 +225,7 @@ test('a history-only turn folds on interruption even when no live item arrives',
   await poll(); tree = await draw();
   assert.ok(byKey(tree, 'turn_process_a:t'));
   assert.ok(!byKey(tree, 'message_a:t:steer'));
-  await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
+  await byKey(tree, 'turn_process_a:t').props.onPress(); await new Promise(setImmediate); tree = await draw();
   assert.ok(byKey(tree, 'message_a:t:progress'));
   assert.ok(byKey(tree, 'message_a:t:steer'));
 });
@@ -389,7 +389,7 @@ test('the live pane gives only the confirmed final copy and time when an active 
   assert.ok(byKey(tree, 'message_copy_a:t:answer'));
   assert.ok(!byKey(tree, 'message_a:t:note')); assert.ok(!byKey(tree, 'message_a:t:draft'));
 
-  await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
+  await byKey(tree, 'turn_process_a:t').props.onPress(); await new Promise(setImmediate); tree = await draw();
   assert.ok(tree.indexOf(byKey(tree, 'message_a:t:draft')) < tree.indexOf(byKey(tree, 'message_a:t:note')));
   assert.deepEqual(tree.filter(node => node.props.key?.startsWith('message_copy_a:t:')).map(node => node.props.key), ['message_copy_a:t:answer']);
   assert.deepEqual(tree.filter(node => node.props.key?.startsWith('message_time_a:t:')).map(node => node.props.key), ['message_time_a:t:answer']);
@@ -417,7 +417,7 @@ test('native pane folds intermediate guidance, keeps the prompt and final copy/t
   assert.ok(!byKey(tree, 'message_a:t:comment2'), 'native process classification survives the duplicate live message with no phase');
   const before = requests.length;
   scrolls.length = 0;
-  await byKey(tree, 'turn_process_a:t').props.onPress(); tree = await draw();
+  await byKey(tree, 'turn_process_a:t').props.onPress(); await new Promise(setImmediate); tree = await draw();
   assert.ok(byKey(tree, 'message_a:t:comment')); assert.ok(byKey(tree, 'message_a:t:comment2'));
   assert.ok(tree.indexOf(byKey(tree, 'message_a:t:comment')) < tree.indexOf(byKey(tree, 'message_a:t:follow')));
   assert.ok(tree.indexOf(byKey(tree, 'message_a:t:follow')) < tree.indexOf(byKey(tree, 'message_a:t:comment2')));
@@ -442,4 +442,35 @@ test('native pane folds intermediate guidance, keeps the prompt and final copy/t
   assert.equal(byKey(await draw('desktop'), 'message_time_a:t:done').props.children[0], '今天 15:42');
   t.mock.timers.tick(60_000);
   assert.equal(byKey(await draw('desktop'), 'message_time_a:t:done').props.children[0], '昨天 15:42');
+});
+
+test('closing a process discards its pending detail response and reopening requests it again', async t => {
+  const { store } = fixture([{ id: 't', status: 'completed', durationMs: 86400000,
+    items: [prompt('p', 'start'), message('step', 'commentary', 'running'), message('f', 'final_answer', 'done')] }]);
+  const history = store.history.bind(store);
+  let started, release, detailRequests = 0;
+  const requested = new Promise(resolve => { started = resolve; });
+  store.history = async args => {
+    const result = await history(args);
+    if (args.process_page && ++detailRequests === 1) await new Promise(resolve => { release = resolve; started(); });
+    return result;
+  };
+  const { draw, byKey } = await openFixturePane(t, store);
+  t.after(() => release?.());
+  const button = tree => byKey(tree, 'turn_process_a:t');
+  const opening = button(await draw()).props.onPress();
+  await requested;
+  const expanded = await draw();
+  assert.ok(byKey(expanded, 'turn_process_page_a:t:step'));
+  await button(expanded).props.onPress();
+  release();
+  await opening;
+  await new Promise(setImmediate);
+  const closed = await draw();
+  assert.ok(!byKey(closed, 'message_a:t:step'));
+  assert.ok(byKey(closed, 'message_a:t:f'));
+  await button(closed).props.onPress();
+  await new Promise(setImmediate);
+  assert.equal(detailRequests, 2);
+  assert.ok(byKey(await draw(), 'message_a:t:step'));
 });

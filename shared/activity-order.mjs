@@ -1,13 +1,18 @@
 // A wait may be recorded at completion even though it began before later
 // lifecycle events. Move only waits whose recorded start proves the ordering.
 export function orderWaits(entries) {
+  const isWait = entry => (entry.type === 'collabAgentToolCall' || entry.type === 'collabToolCall') && entry.data?.tool === 'wait';
+  const lastWait = entries.findLastIndex(entry => isWait(entry) && Number.isFinite(entry.started_at_ms));
+  // Most archived turns are ordinary tool records or unloaded page references.
+  // Keep the caller's snapshot independent without building a traversal stack.
+  if (lastWait <= 0) return entries.slice();
   const records = new Map(), children = new Map(), moved = new Set();
-  for (let i = 0; i < entries.length; i++) {
+  for (let i = 0; i <= lastWait; i++) {
     const entry = entries[i], time = entry.started_at_ms;
     if (!Number.isFinite(time)) continue;
     let maxima = records.get(entry.turn_id);
     if (!maxima) { maxima = []; records.set(entry.turn_id, maxima); }
-    if (['collabAgentToolCall', 'collabToolCall'].includes(entry.type) && entry.data?.tool === 'wait') {
+    if (isWait(entry)) {
       // Prefix maxima identify the earliest prior item later than this wait.
       let low = 0, high = maxima.length;
       while (low < high) {
@@ -22,6 +27,7 @@ export function orderWaits(entries) {
     }
     if (!maxima.length || time > maxima[maxima.length - 1].time) maxima.push({ time, index: i });
   }
+  if (!moved.size) return entries.slice();
   const result = [], stack = [];
   for (let i = entries.length - 1; i >= 0; i--) if (!moved.has(i)) stack.push([i, false]);
   while (stack.length) {

@@ -5,7 +5,11 @@ export default function navigationSync(props, surface) {
   const attempt = Number.isSafeInteger(props?.attempt) ? props.attempt : 0;
   const tail = Number.isSafeInteger(props?.tailToken) ? props.tailToken : 0;
   const edge = typeof props?.edgeToken === 'string' ? props.edgeToken : '';
-  if (token > 0 && (token !== surface.state?.navigation || attempt !== (surface.state?.attempt || 0))) {
+  const exposure = props?.exposure || '';
+  if (exposure && exposure !== surface.state?.exposure) {
+    surface.setState({ ...surface.state, exposure });
+    surface.post({ action: 'expose-band', token: exposure });
+  } else if (token > 0 && (token !== surface.state?.navigation || attempt !== (surface.state?.attempt || 0))) {
     surface.setState({ ...surface.state, navigation: token, attempt });
     surface.post({ action: 'navigate', token });
   } else if (tail > 0 && tail !== surface.state?.tail) {

@@ -38,9 +38,11 @@ export function expandProcessReferences(entries) {
     if (entry.type !== 'turnProcessPage') return [entry];
     const locator = { turn_id: entry.turn_id, cursor: entry.cursor, limit: entry.limit };
     const pageKey = JSON.stringify([entry.turn_id, entry.cursor, entry.limit]);
-    return entry.ids.map(id => ({ id, turn_id: entry.turn_id, type: 'turnProcessRef', locator, pageKey }));
+    return entry.ids.map(id => ({ id, turn_id: entry.turn_id, type: 'turnProcessRef', locator, pageKey, processIds: entry.ids }));
   });
 }
+
+export const processPageError = page => page?.error ?? (page?.records ? '历史记录位置已变更' : undefined);
 
 function openingInput(items, meta) {
   const explicit = items.find(item => item.turn_input === 'start' && inputItem(item.type));
@@ -78,7 +80,7 @@ export function turnTimeline(entries, turns, isOpen, pages) {
       continue;
     }
     if (entry !== items[0]) continue;
-    const open = isOpen(entry.turn_id);
+    const open = Boolean(isOpen(entry.turn_id));
     const opener = openingInput(items, meta);
     // History can identify the final before earlier pages are loaded. A
     // live-only turn uses the last completed candidate in its current order.
@@ -102,7 +104,8 @@ export function turnTimeline(entries, turns, isOpen, pages) {
     // notifications arrived after the turn closed.
     if (open) {
       for (const item of items.filter(process)) {
-        out.push(item.type === 'turnProcessRef' ? { ...item, type: 'turnProcessPending', error: pages?.get(item.pageKey)?.error } : withoutFinalActions(item));
+        const page = pages?.get(item.pageKey);
+        out.push(item.type === 'turnProcessRef' ? { ...item, type: 'turnProcessPending', error: processPageError(page) } : withoutFinalActions(item));
       }
     }
     if (final || legacyReply) out.push(final ?? legacyReply);

@@ -17,13 +17,18 @@ class Client extends EventEmitter {
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function setup(t, agents, handler) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'agent-metadata-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  let store, controller;
+  t.after(async () => {
+    await store?.close();
+    await controller?.close();
+    await rm(dir, { recursive: true, force: true });
+  });
   const statePath = path.join(dir, 'state.json');
   await writeFile(statePath, JSON.stringify({ version: 1, pendingEvents: [], agents }));
-  const client = new Client(handler), controller = new AgentController({ client, statePath });
+  const client = new Client(handler);
+  controller = new AgentController({ client, statePath });
   await controller.init();
-  const store = ActivityStore.attach(client, controller);
-  t.after(async () => { await store.close(); await controller.close(); });
+  store = ActivityStore.attach(client, controller);
   return { client, controller, store, statePath };
 }
 const saved = (id, extra = {}) => ({ id, threadId: `thread-${id}`, status: 'completed', ...extra });
