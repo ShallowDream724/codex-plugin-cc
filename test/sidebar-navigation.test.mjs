@@ -23,13 +23,15 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
       open: async () => { nativePainted = painted; return { isPlaced: true }; }, invalidate() {},
       scroll: async args => {
         scrolls.push(args);
-        if (args.to?.key) {
-          if (!nativePainted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted');
-          await onMeasurement(args.to.key);
+        if (args.to?.key || args.to === 'end') {
+          if (args.to?.key) {
+            if (!nativePainted.some(n => n.type === 'Button' && n.props.key === args.to.key)) throw Error('key not painted');
+            await onMeasurement(args.to.key);
+          }
           const contentRows = nativeContentRows ?? Math.max(20, nativePainted.filter(n => n.type === 'Markdown').length + 10);
           const markerIndex = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
           const precedingRows = nativePainted.slice(0, markerIndex).filter(n => n.type === 'Markdown' || n.type === 'Text' && n.props.key?.startsWith('message_')).length;
-          const destination = args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
+          const destination = args.to === 'end' || args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
           offset = (await host.dispatch('ui.scroll', e)).offset;
         }
@@ -163,7 +165,7 @@ test('a short viewport stops automatic history loads after exhausting its cursor
     const index = args.cursor?.index ?? 3;
     return { entries: [entry(index)], next_cursor: index > 0 ? { index: index - 1 } : null };
   } }); t.after(h.close);
-  await pause(900);
+  for (let attempt = 0; attempt < 6 && !messages(h).includes('message-0'); attempt++) await h.waitNavigation();
   assert.deepEqual(messages(h), ['message-0', 'message-1', 'message-2', 'message-3']);
   const snapshot = messages(h);
   await pause(700);

@@ -122,8 +122,25 @@ test('settled measurement holds the viewport through changing geometry and commi
   controller.observe(event('person', 35, 0, 100));
   const result = await controller.measure('marker', before, true, true);
   assert.equal(result.offset, 45);
-  assert.deepEqual(returned, [35, 35, 35, 35, 35, 45]);
+  assert.deepEqual(returned, [35, 35, 35, 35, 45]);
   assert.deepEqual(positions, [45]);
+});
+
+test('a continuously growing reading marker commits its actual coordinate in the same native event', async () => {
+  const before = { offset: 4, anchorOffset: 9, contentRows: 50, bodyRows: 10 };
+  let controller, marker = 9;
+  const positions = [];
+  controller = paneScroll({ settleBeforeCommit: true, valid: () => true, later: (_delay, run) => run(),
+    position: offset => positions.push(offset), scroll: async () => {
+      marker += 7;
+      controller.observe(event('plugin', marker, marker - 4, 100 + marker));
+      return {};
+    },
+  });
+  controller.stage(before, true, true);
+  const committed = await controller.measure('painted-marker', before, true, true);
+  assert.equal(committed.offset, marker - 5);
+  assert.deepEqual(positions, [marker - 5]);
 });
 
 test('synchronous layout commits two stable anchor samples after 32ms', async () => {

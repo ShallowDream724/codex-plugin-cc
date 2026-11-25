@@ -3,15 +3,16 @@ import assert from 'node:assert/strict';
 import { registerUI, openAgent, closeUI } from '../hooks/ui.js';
 import { nativeHooks } from './native-hooks.mjs';
 import navigationSync from '../hooks/navigation-sync.js';
+import historySize from '../hooks/history-size.js';
 
 const nodes = tree => tree && typeof tree === 'object' ? [tree, ...(tree.props?.children || []).flatMap(nodes)] : [];
 const entry = i => ({ id: `m${i}`, turn_id: 't', type: 'agentMessage', data: { text: `message-${i}` } });
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, autoPost = true, shortViewport = false, nativeContentRows, vectorControls = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
+async function setup({ live = [], history = () => ({ entries: [], next_cursor: null }), revision = () => ({ revision: 1, entries: live }), onMeasurement = async () => {}, commitScroll = () => ({}), prefixGrowth = () => 0, autoPost = true, shortViewport = false, nativeContentRows, vectorControls = false, agents = [{ agent_id: 'a', status: 'completed' }] } = {}) {
   closeUI();
-  const hooks = [], scrolls = [], calls = [], timers = [];
-  let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0;
+  const hooks = [], scrolls = [], samples = [], calls = [], timers = [];
+  let painted = [], nativePainted = [], offset = 0, drawQueued = false, closed = false, constructed = 0, maxConstructed = 0, invalidations = 0;
   const rows = tree => typeof nativeContentRows === 'function' ? nativeContentRows(tree) : nativeContentRows ?? Math.max(20, tree.filter(n => n.type === 'Markdown').length + 10);
   const surfacePending = new Set();
   const surface = { state: 0, setState(value) { this.state = value; }, elements: { Box: props => props }, post(data) {
@@ -30,14 +31,19 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
           const contentRows = rows(nativePainted);
           const markerIndex = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
           const precedingRows = nativePainted.slice(0, markerIndex).filter(n => n.type === 'Markdown' || n.type === 'Text' && n.props.key?.startsWith('message_')).length;
-          const destination = args.to === 'end' || args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows : 3;
+          const destination = args.to === 'end' || args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + precedingRows + prefixGrowth() : 3;
           const e = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };
-          offset = (await host.dispatch('ui.scroll', e)).offset;
+          const result = await host.dispatch('ui.scroll', e);
+          const commit = await commitScroll(args);
+          samples.push({ args, before: offset, after: commit.deny ? offset : result.offset });
+          if (commit.deny) return commit;
+          offset = result.offset;
         }
         return {};
       },
     },
     state: { get: async () => ({ value: 0, version: 0 }), set: async () => {
+      invalidations++;
       if (!drawQueued) { drawQueued = true; setImmediate(async () => { drawQueued = false; if (!closed) await draw(); }); }
       return { isSet: true };
     } },
@@ -50,9 +56,9 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
     } },
   };
   const host = nativeHooks(hooks, $); registerUI(host.on);
-  const draw = async () => {
+  const draw = async (restoredScroll = {}) => {
     constructed = 0;
-    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}) } } }, () => null));
+    painted = nodes(await hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop', props: { scroll: { bodyRows: 10, ...(shortViewport ? { contentRows: 10, offset: 0 } : {}), ...restoredScroll } } }, () => null));
     maxConstructed = Math.max(maxConstructed, constructed);
     const sync = painted.find(n => n.type === 'Client' && n.props.module === './navigation-sync.js');
     if ((typeof autoPost === 'function' ? autoPost() : autoPost) && sync) navigationSync(sync.props.props, surface);
@@ -79,7 +85,7 @@ async function setup({ live = [], history = () => ({ entries: [], next_cursor: n
   };
   const waitNavigation = async () => { await pause(300); while (surfacePending.size) await Promise.all([...surfacePending]); };
   const visitEdge = async direction => { wheel(-direction, 5); await pause(200); wheel(direction); await waitNavigation(); };
-  return { $, draw, wheel, nativeMove, visitEdge, calls, scrolls, tick: () => timers[0](), waitNavigation, open: id => openAgent($, id), press: key => host.dispatch('ui.press', { requestId: 'codex_subagent_activity', element: key }), resetConstructed: () => { maxConstructed = 0; }, get maxConstructed() { return maxConstructed; }, host, get offset() { return offset; }, get painted() { return painted; }, close: () => { closed = true; closeUI(); } };
+  return { $, draw, wheel, nativeMove, visitEdge, calls, scrolls, samples, tick: () => timers[0](), waitNavigation, open: id => openAgent($, id), press: key => host.dispatch('ui.press', { requestId: 'codex_subagent_activity', element: key }), resetConstructed: () => { maxConstructed = 0; }, get maxConstructed() { return maxConstructed; }, get invalidations() { return invalidations; }, host, get offset() { return offset; }, get painted() { return painted; }, close: () => { closed = true; closeUI(); } };
 }
 const messages = h => h.painted.filter(n => n.type === 'Markdown').map(n => n.props.text);
 const hasMessage = (h, prefix) => h.painted.some(n => n.type === 'Markdown' && n.props.text?.startsWith(prefix) || n.type === 'Text' && n.props.key?.startsWith('message_') && n.props.children?.some(value => typeof value === 'string' && value.startsWith(prefix)));
@@ -89,6 +95,53 @@ const upward = (h, contentRows = 10, by = -1) => h.host.dispatch('ui.scroll', { 
 const navigations = h => h.host.calls.filter(call => call.event === 'ui.message' && call.input.data?.action === 'navigate').length;
 
 const longEntries = () => Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
+
+test('a restored hard top spends a prior upward approach once without another wheel event', async t => {
+  const h = await setup({ live: longEntries(), nativeContentRows: 400 }); t.after(h.close);
+  const initial = messages(h)[0];
+  await h.nativeMove(-50);
+  assert.equal(navigations(h), 0, 'the reader is still far from the edge');
+  // qv only reports displacement. Resizing/restoring the pane can paint at
+  // row zero with no further actionable wheel notification at that hard edge.
+  const restored = { offset: 0, bodyRows: 10 };
+  const painted = await h.draw(restored);
+  assert.equal(painted.find(n => n.props.module === './navigation-sync.js').props.props.edgeDirection, -1);
+  await h.waitNavigation();
+  assert.equal(navigations(h), 1, h.host.calls.filter(call => call.event === 'ui.message').map(call => call.input.data.action).join(','));
+  assert.notEqual(messages(h)[0], initial);
+  assert.equal(navigations(h), 1);
+  await h.draw(restored); await h.draw(restored); await h.waitNavigation();
+  assert.equal(navigations(h), 1, 'unchanged boundary paints do not spend the same approach twice');
+});
+
+test('late growing Markdown above the reader is corrected after navigation returns', async t => {
+  let growth = 0;
+  const h = await setup({ live: longEntries(), nativeContentRows: () => 600 + growth, prefixGrowth: () => growth }); t.after(h.close);
+  await h.nativeMove(-1000); await h.waitNavigation();
+  const client = (await h.draw()).find(n => n.type === 'Client' && n.props.module === './history-size.js');
+  assert.ok(client, 'a retained rich prefix owns a size observer');
+  const held = h.offset, dispatched = [];
+  const surface = { elements: { Box: props => props }, rows: 50, setState(value) { this.state = value; }, post(data) {
+    dispatched.push(h.host.surface(() => h.host.dispatch('ui.message', { element: client.props.key, data })));
+  } };
+  historySize(client.props.props, surface);
+  historySize(client.props.props, surface); await Promise.all(dispatched);
+  growth = 73; surface.rows += growth;
+  historySize(client.props.props, surface); await Promise.all(dispatched);
+  assert.equal(h.offset, held + 73, 'the retained item stays at its previous viewport row');
+  historySize(client.props.props, surface);
+  assert.equal(dispatched.length, 2, 'unchanged geometry does not start another native probe');
+  const probes = h.scrolls.length;
+  surface.state = null;
+  historySize(client.props.props, surface);
+  historySize(client.props.props, surface); await Promise.all(dispatched);
+  assert.equal(h.scrolls.length, probes, 'a remounted Client cannot remeasure an already reconciled size');
+  await pause(200); await h.nativeMove(1);
+  const moved = h.offset;
+  growth += 10; surface.rows += 10;
+  historySize(client.props.props, surface); await Promise.all(dispatched);
+  assert.equal(h.offset, moved, 'a later human move owns the viewport');
+});
 
 test('one prepend keeps its native reading marker even with long source item IDs', async t => {
   const h = await setup({ live: longEntries().map(e => ({ ...e, id: 'x'.repeat(270) + e.id })) }); t.after(h.close);
@@ -122,23 +175,111 @@ test('continuous wheel inertia crossing a prepend keeps the committed reading po
   assert.equal(navigations(h), 1, 'events continuing after settlement belong to the same gesture');
   clearInterval(wheel);
   await h.nativeMove(-1);
-  assert.equal(h.offset, held - 1, 'native input based on the committed frame can move without an idle interval');
+  assert.equal(h.offset, held, 'even fresh-coordinate packets in this burst retain the committed reading position');
+  await pause(210);
+  await h.nativeMove(-1);
+  assert.equal(h.offset, held - 1, 'a new gesture immediately moves the reader');
   await h.nativeMove(-1000); await h.waitNavigation();
   assert.equal(navigations(h), 2, 'subsequent sustained input reaches the new edge');
 });
 
-test('jump from older history reaches the true end even while the new sync client is suspended', async t => {
-  let mounted = true;
-  const h = await setup({ live: longEntries(), vectorControls: true, autoPost: () => mounted }); t.after(h.close);
+test('one jump from older history settles at the newest footer through a delayed layout and refused commit', async t => {
+  let mounted = true, delayedRows = 0, refused = false;
+  const contentRows = tree => Math.max(20, tree.filter(n => n.type === 'Markdown').length + 10 + delayedRows);
+  const h = await setup({ live: longEntries(), vectorControls: true, autoPost: () => mounted, nativeContentRows: contentRows,
+    commitScroll({ to }) {
+      if (!mounted && !refused && to === 'end') {
+        refused = true;
+        delayedRows = 48;
+        return { deny: 'the window moved meanwhile' };
+      }
+      return {};
+    },
+  }); t.after(h.close);
   h.wheel(-1); await h.waitNavigation();
   assert.ok(!hasMessage(h, 'message-99 '));
+  assert.ok(Number.isFinite(h.offset), JSON.stringify(h.samples));
   mounted = false;
-  const prior = h.scrolls.length;
+  const prior = h.samples.length;
   await h.host.surface(() => h.host.dispatch('ui.message', { element: 'codex_jump_a_viewport', data: { action: 'activate', expanded: false } }));
   await h.draw();
   assert.ok(hasMessage(h, 'message-99 '));
-  assert.ok(h.scrolls.slice(prior).some(call => call.to === 'end'), 'the click commits native end in its own registered frame');
-  assert.equal(h.offset, Math.max(10, messages(h).length));
+  assert.ok(h.painted.some(node => node.props.key === 'codex_back_directory_footer'));
+  const samples = h.samples.slice(prior), end = contentRows(h.painted) - 10;
+  const moved = samples.filter(sample => sample.before !== sample.after);
+  assert.ok(refused);
+  assert.equal(samples.filter(sample => sample.args.to === 'end').length, 2, 'the same click retries the refused end');
+  assert.deepEqual(moved.map(sample => [sample.args.to, sample.after]), [['end', end]], 'probes leave the viewport in place');
+  assert.equal(h.offset, end);
+
+  const queued = await h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, by: -4, offset: 6, contentRows: contentRows(h.painted), bodyRows: 10 });
+  assert.equal(queued.offset, end, 'a queued old-window wheel report preserves the committed end');
+  await h.nativeMove(-3);
+  assert.equal(h.offset, end - 3, 'an upward wheel beginning at the real end can read immediately');
+});
+
+test('one jump reaches native end after the latest frame paints without a tail marker', async t => {
+  let jumping = false, refused = 0, missing = 0;
+  const h = await setup({ live: longEntries(), vectorControls: true,
+    onMeasurement(key) {
+      if (jumping && key.startsWith('codex_tail_a_')) {
+        missing++;
+        throw Error('the tail marker is absent from the native key table');
+      }
+    },
+    commitScroll({ to }) {
+      if (jumping && to === 'end' && ++refused <= 6) return { deny: 'the window moved meanwhile' };
+      return {};
+    },
+  }); t.after(h.close);
+  await h.wheel(-1); await h.waitNavigation();
+  assert.ok(!hasMessage(h, 'message-99 '));
+  const prior = h.samples.length, priorDispatches = h.host.calls.length;
+  jumping = true;
+  await h.host.surface(() => h.host.dispatch('ui.message', { element: 'codex_jump_a_viewport', data: { action: 'activate', expanded: false } }));
+  await h.waitNavigation(); await h.draw();
+  assert.ok(missing > 0, 'the native key table never admits the new tail marker');
+  assert.ok(h.host.calls.slice(priorDispatches).some(call => call.input.data?.action === 'tail'), 'the latest frame acknowledges the jump');
+  const samples = h.samples.slice(prior), end = messages(h).length;
+  assert.equal(samples.filter(sample => sample.args.to === 'end').length, 7, 'refusal through one second is retried by the same click');
+  assert.deepEqual(samples.filter(sample => sample.before !== sample.after).map(sample => sample.after), [end]);
+  assert.ok(hasMessage(h, 'message-99 '));
+  assert.equal(h.offset, end);
+});
+
+test('a later upward move releases native following even when the reported row geometry has changed', async t => {
+  const h = await setup({ live: longEntries(), vectorControls: true }); t.after(h.close);
+  await h.nativeMove(-4); await h.draw();
+  await h.host.surface(() => h.host.dispatch('ui.message', { element: 'codex_jump_a_viewport', data: { action: 'activate', expanded: false } }));
+  await h.waitNavigation();
+  const previousEnd = h.offset, bodyRows = 10, contentRows = previousEnd + bodyRows + 26;
+  const report = (offset, by) => h.host.dispatch('ui.scroll', { origin: { kind: 'person' }, offset, by, contentRows, bodyRows });
+  const layout = await report(previousEnd, 0);
+  assert.equal(layout.offset, contentRows - bodyRows, 'layout growth retains end-following');
+  const upward = await report(previousEnd - 3, -3);
+  assert.equal(upward.offset, previousEnd - 3, 'a later real upward move must escape following despite a mismatched starting row');
+});
+
+test('an upward move from the measured viewport cancels an in-flight jump to latest', async t => {
+  let mounted = true, probes = 0, signalSample, release;
+  const sampling = new Promise(resolve => { signalSample = resolve; });
+  const h = await setup({ live: longEntries(), vectorControls: true, autoPost: () => mounted,
+    onMeasurement(key) {
+      if (mounted || !key.startsWith('codex_tail_a_') || ++probes !== 2) return;
+      return new Promise(resolve => { release = resolve; signalSample(); });
+    },
+  }); t.after(() => { release?.(); h.close(); });
+  h.wheel(-1); await h.waitNavigation();
+  mounted = false;
+  const prior = h.scrolls.length;
+  const jump = h.host.surface(() => h.host.dispatch('ui.message', { element: 'codex_jump_a_viewport', data: { action: 'activate', expanded: false } }));
+  await Promise.race([sampling, pause(1500).then(() => { throw Error('tail measurement did not start'); })]);
+  const held = h.offset;
+  assert.ok(held > 0);
+  await h.nativeMove(-1);
+  release(); await jump;
+  assert.equal(h.offset, held - 1, 'the cancelled measurement preserves the newer reading position');
+  assert.ok(!h.scrolls.slice(prior).some(call => call.to === 'end'));
 });
 
 test('short viewport consumes multiple cursors before a native wheel can move', async t => {
@@ -168,10 +309,12 @@ test('one native edge visit advances past many pages containing only folded proc
       next_cursor: { index: cursor.index - 1 },
     };
   } }); t.after(h.close);
+  const draws = h.invalidations;
   await h.nativeMove(-1000);
   for (let attempt = 0; attempt < 8 && !messages(h).includes('message--1'); attempt++) await h.waitNavigation();
   assert.deepEqual(messages(h), ['message--1', ...Array.from({ length: 20 }, (_, i) => `message-${i}`)]);
   assert.equal(navigations(h), 1);
+  assert.ok(h.invalidations - draws < 12, 'twenty invisible cursor pages do not redraw the pane separately');
   assert.deepEqual(h.calls.filter(call => call.operation === 'ui_history' && call.args.cursor).map(call => call.args.cursor.index), Array.from({ length: 21 }, (_, i) => 20 - i));
 });
 

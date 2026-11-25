@@ -19,6 +19,7 @@ function assertNativeDimensions(tree) {
 }
 
 function connect($, handler) {
+  $.ui.toast ??= () => {};
   $.clock.after ??= (_ms, fn) => { const timer = setImmediate(fn); return { cancel() { clearImmediate(timer); } }; };
   $.state ??= { get: async () => { await new Promise(setImmediate); return { value: undefined, version: 0 }; }, set: async () => { $.ui.invalidate(); return { isSet: true }; } };
   $.session = { id: async () => 'session', cwd: async () => 'C:/work' };
@@ -340,8 +341,8 @@ test('conversation shows prose and expandable file changes with authoritative co
 });
 
 test('desktop file changes show a basename and diff rows with one native copy action', async (t) => {
-  const hooks = [], copied = [], calls = [];
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, copy: async value => { copied.push(value); return { isCopied: true }; }, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  const hooks = [], copied = [], calls = [], notices = [];
+  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Svg', 'Client'].map(type => [type, props => ({ type, props })])), invalidate() {}, copy: async value => { copied.push(value); return { isCopied: true }; }, toast: message => notices.push(message), open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
   const source = '@@ -4,2 +4,3 @@\n one\n+<literal html>\n two\n';
   const entry = { id: 'file', turn_id: 't', type: 'fileChange', data: { changes: [{ path: 'C:/project/src/example.cpp', diff: source }] } };
   connect($, async (_$, op) => { calls.push(op); return op === 'ui_list' ? { agents: [{ agent_id: 'a', status: 'completed' }] } : op === 'ui_revision' ? { revision: 1, entries: [entry] } : { entries: [], next_cursor: null }; });
@@ -361,6 +362,8 @@ test('desktop file changes show a basename and diff rows with one native copy ac
   assert.deepEqual(actions.map(node => node.type), ['Button']);
   actions[0].props.onPress({ surface: 'desktop' });
   assert.deepEqual(copied, [{ text: source, surface: 'desktop' }]);
+  await new Promise(setImmediate);
+  assert.deepEqual(notices, ['已复制']);
   assert.ok(!calls.includes('ui_detail'), 'complete local diff needs no extra read');
 });
 
@@ -481,31 +484,56 @@ test('desktop tool expansion keeps the pane valid through output and raw-call di
   assert.ok(!nodes(await draw()).some(node => node.props.key === 'item_a:t:run'));
 });
 
-test('final response copy retrieves exact raw text and ignores commentary and stale requests', async (t) => {
-  const hooks = [], copied = [], calls = []; let deferred;
+test('desktop final response copy uses exact raw text and ignores commentary and stale requests', async (t) => {
+  const hooks = [], copied = [], calls = [], notices = [];
+  let pendingRead, pendingCopy;
   const entries = [
     { id: 'comment', turn_id: 't', type: 'agentMessage', data: { text: 'thinking' }, message: { is_final: false } },
     { id: 'tool', turn_id: 't', type: 'commandExecution', data: { command: 'test' } },
     { id: 'final', turn_id: 't', type: 'agentMessage', data: { text: 'preview' }, message: { is_final: true, truncated: true } },
   ];
-  const $ = { ui: { resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])), copy: async value => { copied.push(value.text); return { isCopied: true }; }, invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}) }, clock: { every: () => ({ cancel() {} }) } };
+  const $ = { ui: {
+    resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown'].map(type => [type, props => ({ type, props })])),
+    copy: async value => { copied.push(value.text); return pendingCopy ? new Promise(resolve => { pendingCopy.resolve = resolve; }) : { isCopied: true }; },
+    toast: message => notices.push(message), invalidate() {}, open: async () => ({ isPlaced: true }), scroll: async () => ({}),
+  }, clock: { every: () => ({ cancel() {} }) } };
   connect($, async (_$, op, args) => {
     if (op === 'ui_list') return { agents: [{ agent_id: 'a', status: 'completed' }, { agent_id: 'b', status: 'completed' }] };
     if (op === 'ui_revision') return args.target === 'a' ? { revision: 1, entries, turns: [{ id: 't', status: 'completed' }] } : { revision: 1, entries: [] };
-    if (op === 'ui_detail') { calls.push(args); if (deferred) return new Promise(resolve => { deferred.resolve = resolve; }); return { text: '**full**\r\n\\[raw\\]' }; }
+    if (op === 'ui_detail') { calls.push(args); if (pendingRead) return new Promise(resolve => { pendingRead.resolve = resolve; }); return { text: '**full**\r\n\\[raw\\]' }; }
     return { entries: [], next_cursor: null };
   });
   closeUI(); t.after(closeUI); registerUI((...args) => hooks.push({ event: args[0], matcher: args.length === 3 ? args[1] : {}, fn: args.at(-1) })); await openAgent($, 'a');
-  const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'terminal' }, () => null);
-  let tree = nodes(await draw());
+  const draw = () => hooks.find(h => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
+  const key = 'message_copy_a:t:final';
+  const tree = nodes(await draw());
   assert.deepEqual(tree.filter(n => n.props.key?.startsWith('message_copy_')).map(n => n.props.key), ['message_copy_a:t:final']);
-  tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
+  const press = tree.find(n => n.props.key === key).props.onPress;
+  press();
   await new Promise(setImmediate);
   assert.deepEqual(copied, ['**full**\r\n\\[raw\\]']);
   assert.deepEqual(calls, [{ target: 'a', item_id: 'final', turn_id: 't', view: 'message', copy: true }]);
-  deferred = {}; tree.find(n => n.props.key === 'message_copy_a:t:final').props.onPress();
-  await new Promise(setImmediate); await openAgent($, 'b'); deferred.resolve({ text: 'stale' }); await new Promise(setImmediate);
+  assert.deepEqual(notices, ['已复制']);
+
+  pendingRead = {};
+  press();
+  await new Promise(setImmediate);
+  await openAgent($, 'b');
+  pendingRead.resolve({ text: 'stale' });
+  await new Promise(setImmediate);
   assert.equal(copied.length, 1);
+  assert.deepEqual(notices, ['已复制']);
+
+  pendingRead = undefined;
+  pendingCopy = {};
+  await openAgent($, 'a');
+  nodes(await draw()).find(n => n.props.key === key).props.onPress();
+  await new Promise(setImmediate);
+  assert.equal(copied.length, 2);
+  await openAgent($, 'b');
+  pendingCopy.resolve({ isCopied: true });
+  await new Promise(setImmediate);
+  assert.deepEqual(notices, ['已复制']);
 });
 
 test('copy rejects incomplete results without writing to clipboard', async (t) => {
@@ -866,6 +894,10 @@ test('failed discovery has a recovery action without an untargeted composer and 
   });
   $.clock.after = (_ms, fn) => { afters.push(fn); return { cancel() {} }; };
   closeUI(); const host = nativeHooks(hooks, $); registerUI(host.on); await openAgent($, 'a');
+  $.ui.scroll = async () => {
+    await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, by: 0, offset: 90, contentRows: 100, bodyRows: 10 });
+    return {};
+  };
   const draw = () => hooks.find((h) => h.event === 'ui.render').fn($, { requestId: 'codex_subagent_activity', surface: 'desktop' }, () => null);
   let tree = await draw(); assert.equal(panes[0].title, 'Codex'); assert.match(JSON.stringify(tree), /helper version mismatch/);
   assert.equal(nodes(tree).find((node) => node.type === 'Input'), undefined); assert.equal(nodes(tree).find((node) => node.props.key === 'codex_older'), undefined);
@@ -1165,10 +1197,15 @@ test('1200-line file beyond 100k characters remains continuous in both direction
     resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Input', 'Markdown', 'Code', 'Client'].map(type => [type, props => ({ type, props })])),
     open: async () => { nativePainted = painted; return { isPlaced: true }; }, invalidate() {},
     scroll: async args => {
+      const contentRows = Math.max(30, nativePainted.filter(n => n.type === 'Text').length + 10);
+      if (args.to === 'end') {
+        const end = contentRows - 10;
+        offset = (await host.dispatch('ui.scroll', { origin: { kind: 'plugin' }, offset: end, by: end - offset, contentRows, bodyRows: 10 })).offset;
+        return {};
+      }
       if (args.to?.key) {
         const marker = nativePainted.findIndex(n => n.type === 'Button' && n.props.key === args.to.key);
         if (marker < 0) throw Error(`unpainted marker ${args.to.key}`);
-        const contentRows = Math.max(30, nativePainted.filter(n => n.type === 'Text').length + 10);
         const preceding = nativePainted.slice(0, marker).filter(n => n.type === 'Text').length;
         const destination = args.block === 'end' ? contentRows - 10 : args.to.key.startsWith('codex_read_anchor_') ? 3 + preceding : 3;
         const event = { origin: { kind: 'plugin' }, offset: destination, by: destination - offset, contentRows, bodyRows: 10 };

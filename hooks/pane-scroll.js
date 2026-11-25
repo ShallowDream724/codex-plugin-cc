@@ -34,10 +34,6 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
       if (!pending) { latest = sample(e); return e; }
       const request = pending;
       const measured = sample(e);
-      if (settleBeforeCommit && request.before && request.committing) {
-        request.commitObserved = true;
-        return { ...e, offset: request.commitOffset };
-      }
       // A later human move owns the viewport. Do not overwrite it with an
       // asynchronous correction from an older frame.
       const unchanged = request.intent === intent;
@@ -52,6 +48,12 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
       const result = { ...measured, offset: Math.max(0, Math.min(offset, Math.max(0, measured.contentRows - measured.bodyRows))) };
       request.result = result;
       if (settleBeforeCommit && request.before) {
+        if (request.committing) {
+          // The host can finish a rich leaf between the last probe and this
+          // dispatch. Commit the coordinate measured by the commit itself.
+          request.commitObserved = true;
+          return { ...e, offset: result.offset };
+        }
         // The keyed scroll reveals the marker coordinate, but its native
         // movement must not expose partially painted history to the reader.
         return { ...e, offset: measured.offset };
@@ -83,24 +85,23 @@ export function paneScroll({ scroll, later, valid, position, refresh, settleBefo
         if (accepted && request.result) {
           result = request.result;
           if (!atomic) position(result.offset);
-          const stable = anchor ? previous?.anchorOffset === result.anchorOffset && (!atomic || previous?.contentRows === result.contentRows) : previous?.contentRows === result.contentRows;
+          const stable = anchor ? previous?.anchorOffset === result.anchorOffset : previous?.contentRows === result.contentRows;
           const minimum = atomic && synchronousLayout() ? 32 : anchor ? 224 : 96;
           if (!before || elapsed >= minimum && stable && previous.bodyRows === result.bodyRows) { settled = true; break; }
           previous = result;
         } else previous = null;
       }
       if (atomic) {
-        // Commit the sampled offset through the same native scroll hook. Do
-        // not recompute it from the commit event's potentially newer geometry.
+        // A painted reading marker is usable even while the surrounding
+        // Markdown keeps growing. Its live size observer maintains the anchor.
         let accepted = false;
-        if (settled && result && !disposed && valid() && token === serial && request.intent === intent) {
+        if ((settled || anchor || !above) && result && !disposed && valid() && token === serial && request.intent === intent) {
           request.committing = true;
-          request.commitOffset = result.offset;
           request.commitObserved = false;
           try { accepted = !(await scroll({ to: { key }, block: 'start' }))?.deny; } catch { /* Commit failed. */ }
         }
         if (!accepted || !request.commitObserved || disposed || !valid() || token !== serial || request.intent !== intent) result = null;
-        else { latest = result; position(result.offset); }
+        else { result = latest = request.result; position(result.offset); }
       }
       if (pending === request) pending = null;
       return token === serial ? result : null;

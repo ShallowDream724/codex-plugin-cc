@@ -44,9 +44,9 @@ function fragments(source, width) {
 export function nativeRenderBudget(constructors, { copy, copyLabel, copyLabelWidth = 0 } = {}) {
   const records = new WeakMap();
   const cost = node => typeof node === 'string' ? { chars: node.length, wireChars: node.length, nodes: 1, depth: 1 } : records.get(node)?.cost ?? emptyCost;
-  const build = (type, props) => {
+  const build = (type, props, construct = constructors[type]) => {
     props = { ...props, ...(props.key !== undefined ? { key: compactKey(props.key) } : {}) };
-    const node = constructors[type](props), { children: input, ...fields } = props, children = childrenOf(input);
+    const node = construct(props), { children: input, ...fields } = props, children = childrenOf(input);
     // SVG source and the independently capped Input.value contribute to the
     // Desktop tree budget. Image bytes are carried separately.
     const counted = type === 'Svg' || type === 'Image' ? { key: fields.key, alt: fields.alt } : type === 'Input' ? { ...fields, value: undefined } : fields;
@@ -116,5 +116,7 @@ export function nativeRenderBudget(constructors, { copy, copyLabel, copyLabelWid
     if (batch.length) result.push(build(type, { ...props, children: batch }));
     return result.length ? result : [node];
   };
-  return { ui, cost, fits: (node, limit = RENDER_LIMIT) => renderCostFits(cost(node), limit), pages, reserveChars };
+  return { ui, cost, fits: (node, limit = RENDER_LIMIT) => renderCostFits(cost(node), limit), pages, reserveChars,
+    // A retained native Button still counts against this frame's budget.
+    buttonWith: (props, construct) => build('Button', props, construct) };
 }
