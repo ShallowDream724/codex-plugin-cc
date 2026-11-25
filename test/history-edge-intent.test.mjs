@@ -116,6 +116,23 @@ const settling = h => h.painted.some(n => n.props.key === 'codex_history_settlin
 
 const longEntries = () => Array.from({ length: 100 }, (_, i) => ({ ...entry(i), data: { text: `message-${i} ${'x'.repeat(4000)}` } }));
 
+test('a desktop history with measured sections emits native-valid Box dimensions', async t => {
+  const h = await setup({ live: longEntries(), bodyColumns: 82 });
+  t.after(h.close);
+  const tree = await h.draw();
+  assert.ok(tree.some(node => node.props.key?.startsWith('codex_band_part_')), 'exercise the section-height measurement path');
+  for (const { type, props } of tree) {
+    if (type !== 'Box') continue;
+    for (const key of ['width', 'height', 'minWidth', 'minHeight']) {
+      const value = props[key];
+      if (value === undefined) continue;
+      const valid = typeof value === 'number' ? Number.isFinite(value) && value >= 0 && value <= 10_000
+        : typeof value === 'string' && /^\d{1,3}%$/.test(value);
+      assert.ok(valid, `Claude refuses Box ${key}=${value}`);
+    }
+  }
+});
+
 test('desktop waits for the painted band revision before placing the measured row', async t => {
   const h = await setup({ live: longEntries(), bodyColumns: 82, nativeContentRows: 610 });
   t.after(h.close);
@@ -136,6 +153,43 @@ test('desktop waits for the painted band revision before placing the measured ro
   assert.equal(expanded.find(node => node.props.key === upper.props.key).props.height, oldRows + delta);
   assert.ok(h.scrolls.slice(count).every(request => request.to.key.startsWith('codex_band_exposure_')));
   assert.equal(settling(h), false);
+});
+
+test('an oversized native band falls back to the measured history window', async t => {
+  const h = await setup({ live: longEntries(), bodyColumns: 82, nativeContentRows: 610 });
+  t.after(h.close);
+  const sensor = h.painted.find(node => node.props.key === 'codex_band_size_a_above');
+  assert.ok(sensor);
+  await h.host.surface(() => h.host.dispatch('ui.message', { element: sensor.props.key,
+    data: { action: 'history-band-size', key: sensor.props.props.key, rows: 10_001 } }));
+  const painted = await h.draw();
+  assert.equal(painted.some(node => node.props.key?.startsWith('codex_history_band_')), false);
+  assert.ok(messages(h).length, 'the ordinary history window continues to render messages');
+  const first = messages(h)[0];
+  await h.nativeMove(-h.offset);
+  await waitFor(() => messages(h)[0] !== first && !settling(h));
+});
+
+test('the height sensor expands with valid Box dimensions and reports only measured rows', () => {
+  const messages = [];
+  const surface = { elements: { Box: props => props }, rows: 10_000, setState(value) { this.state = value; },
+    post(data) { messages.push(data); } };
+  const props = { key: 1, contentRows: 5_000, scale: 128, part: 0 };
+  assert.equal(historySize(props, surface).height, 10_000);
+  const expanded = historySize(props, surface);
+  assert.deepEqual(expanded.children.map(child => child.height), [10_000, 10_000, 10_000, 10_000]);
+  assert.deepEqual(messages, []);
+  surface.rows = 12_501;
+  historySize(props, surface);
+  assert.deepEqual(messages, [{ action: 'history-band-part-size', key: 1, part: 0, rows: 12_501 / 128 }]);
+
+  surface.rows = 1_000_000;
+  const capped = historySize(props, surface);
+  assert.equal(capped.children.length, 32);
+  const cappedState = surface.state;
+  historySize(props, surface);
+  assert.equal(surface.state, cappedState, 'a saturated sensor stops resizing at its capacity');
+  assert.equal(messages.length, 1);
 });
 
 test('a full history window fetches older and newer records at one fifth of scrollbar travel', async t => {

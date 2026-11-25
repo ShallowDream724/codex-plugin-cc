@@ -1,5 +1,11 @@
 # 验证记录
 
+## rc.39 开发版（2026-11-25）
+
+在实际安装的 Claude Code 2.1.330 中，通过 `claude-code/testing` 挂载桌面 Pane，用 120 条合成历史复现了 rc.38 的空白面板。宿主拒绝测量组件的高度 `12800%`，整棵面板树因此无法显示。此前的 Edge 回放覆盖滚动几何，绕过了 Claude 在绘制前执行的属性校验。
+
+通过 `/codex-agents` 打开列表并点击已完成代理，检查空历史、1 条消息和 120 条消息。在 rc.38 中只有长历史用例被宿主拒绝。rc.39 三项均通过，长历史能绘出最新消息和多个测量分组。设定 `CODEX_SUBAGENTS_TEST_CLAUDE` 后运行 `node --test test/native-pane-host.test.mjs` 可复验。指定 `CODEX_SUBAGENTS_TEST_PLUGIN_DIR` 可对解包产物或安装缓存执行同一测试。
+
 ## rc.38 开发版（2026-11-25）
 
 - Windows 离线套件共 675 项，673 项通过，2 项按环境跳过。另在 Claude Code 2.1.330 的隔离环境运行全部 4 项宿主集成测试，均通过。

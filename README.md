@@ -4,7 +4,7 @@
 
 仓库：[ShallowDream724/codex-plugin-cc](https://github.com/ShallowDream724/codex-plugin-cc)。本插件的开发、文档与安装入口统一使用默认 **main** 分支。
 
-当前开发版本为 **0.2.0-rc.38**。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时依赖 Node.js 和 Codex CLI。
+当前开发版本为 **0.2.0-rc.39**。本插件从 `y-cruce/codex-plugin-cc` 精简而来，运行时依赖 Node.js 和 Codex CLI。
 
 ## 安装条件
 

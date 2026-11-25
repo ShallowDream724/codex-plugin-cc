@@ -11,7 +11,7 @@ import { fileChangeSummary, fileChangeSource } from '../shared/file-changes.mjs'
 import { compactKey, GROUP_RENDER_LIMIT, INPUT_RENDER_LIMIT, nativeRenderBudget, RENDER_LIMIT } from './render-budget.js';
 import { paneMarkerOffset, paneScroll, probeDenial } from './pane-scroll.js';
 import { historyWindowCost, historyWindowFits, planHistoryWindow } from './history-window.js';
-import { bandSections, cropBandSections, historyBand, historyCoreLimit } from './history-band.js';
+import { bandSections, cropBandSections, historyBand, historyCoreLimit, maxBandRows } from './history-band.js';
 import { mostRecentAgent, renderAgentDirectory } from './agent-directory.js';
 import { fileViewEntries, appendFilePage } from './file-stream.js';
 import { parseUnifiedDiffDetailed } from '../shared/unified-diff.mjs';
@@ -724,6 +724,8 @@ function promoteLowerBand(page, e) {
       paneEnd(e) - e.offset + e.bodyRows + 1 > band.rows) return false;
   const first = band.groups[0], last = band.groups.at(-1);
   if (!first || last.end >= all.length) return false;
+  const prefixRows = (page.upperBand?.rows ?? 0) + core.rows + bandSeamRows;
+  if (prefixRows > maxBandRows) return false;
   const remember = frame => frame && { seam: frame.seam, columns: frame.columns, bodyRows: frame.bodyRows,
     rows: frame.rows, open: frame.open, token: ++navigationSequence };
   const trail = page.bandTrail ??= [];
@@ -731,7 +733,6 @@ function promoteLowerBand(page, e) {
   // Every component before this band has an explicit native height. Reuse
   // their real measured extent as the prefix for the next window. The older
   // window stays in the trail and is restored on approach from this side.
-  const prefixRows = (page.upperBand?.rows ?? 0) + core.rows + bandSeamRows;
   page.bandCore = { first: first.key, last: last.key, rows: band.rows, align: 'start', prefixRows };
   page.windowStart = first.start; page.windowEnd = last.end; page.windowSize = last.end - first.start;
   page.renderedWindow = null; page.renderedGroups = band.groups;
@@ -2088,6 +2089,17 @@ export function registerUI(on) {
       const lower = e.element === `codex_band_size_${state.selected}_below`;
       const frame = upper ? page.upperBand : lower ? page.lowerBand : null;
       if (frame && frame.token === e.data.key && Number.isSafeInteger(e.data.rows) && e.data.rows > 0) {
+        if (e.data.rows + (lower ? 1 : 0) > maxBandRows) {
+          // A single native band requires an explicit Box height. Use the
+          // ordinary measured window at this width when the content exceeds it.
+          page.bandGeometryLimit = frame.columns;
+          page.bandTrail = null;
+          page.waitingBand = null;
+          page.resumeOnBandSize = false;
+          if (page.bandExposure?.frame === frame) page.bandExposure = null;
+          await invalidate($);
+          return {};
+        }
         frame.naturalRows = e.data.rows;
         if (lower && frame.open && frame.rows !== frame.naturalRows + 1) {
           frame.rows = frame.naturalRows + 1; await invalidate($);
@@ -2735,7 +2747,8 @@ function renderPane($, e, next) {
     const settling = e.surface === 'desktop' && (page.navigationOwner?.staged || jumping);
     const settlingLabel = jumping ? '正在定位最新消息' : '正在加载历史消息';
     const canWatchSize = e.surface === 'desktop' && typeof Client === 'function';
-    const useBands = canWatchSize && fillPane && Number.isFinite(e.props?.bodyColumns) && e.props.bodyColumns > 1;
+    const useBands = canWatchSize && fillPane && Number.isFinite(e.props?.bodyColumns) &&
+      e.props.bodyColumns > 1 && e.props.bodyColumns !== page.bandGeometryLimit;
     const prefixBox = (scope, gap, rows, key, contentRows) => Box({ key: `codex_prefix_${id}_${scope}`, position: 'relative', flexDirection: 'column', rowGap: gap, minWidth: 0, children: [
       ...rows,
       ...(key ? [Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden',
@@ -3009,13 +3022,20 @@ function renderPane($, e, next) {
           if (frame.partToken !== frame.token || frame.partCounts?.length !== counts.length || counts.some((n, i) => frame.partCounts[i] !== n)) {
             frame.partToken = frame.token; frame.partCounts = counts; frame.partRows = counts.map(() => 0);
           }
-          const scale = 128;
+          // The desktop host accepts up to three percentage digits per Box.
+          // Compose the scale so its sub-row measurement passes native validation.
+          const partSensor = part => {
+            const scale = 8 * 8 * 2;
+            let node = Client({ key: `codex_band_part_${id}_${part}`, module: './history-size.js', width: 1, height: '100%',
+              props: { key: frame.token, part, scale, contentRows: Math.max(32, Math.min(131072, (page.scrollGeometry?.contentRows || bodyRows) * scale)) } });
+            for (const height of ['200%', '800%', '800%']) {
+              node = Box({ height, flexShrink: 0, width: 0, overflow: 'hidden', flexDirection: 'column', children: [node] });
+            }
+            return node;
+          };
           measured = sections.map((section, part) => Box({ position: 'relative', flexDirection: 'column', flexShrink: 0, rowGap: 1, minWidth: 0, children: [
             ...section, ...(sections.length > 1 ? [Box({ position: 'absolute', left: 0, top: 0, bottom: 0, width: 0, overflow: 'hidden', flexDirection: 'column', children: [
-              Box({ height: `${scale * 100}%`, flexShrink: 0, width: 0, overflow: 'hidden', flexDirection: 'column', children: [
-                Client({ key: `codex_band_part_${id}_${part}`, module: './history-size.js', width: 1, height: '100%',
-                  props: { key: frame.token, part, scale, contentRows: Math.max(32, Math.min(131072, (page.scrollGeometry?.contentRows || bodyRows) * scale)) } }),
-              ] }),
+              partSensor(part),
             ] })] : []),
           ] }));
           frame.compact = visibleRows => {

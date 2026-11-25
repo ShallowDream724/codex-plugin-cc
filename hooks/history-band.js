@@ -1,5 +1,7 @@
 import { appendRenderCost, renderCostFits } from './render-budget.js';
 
+export const maxBandRows = 10_000;
+
 // Spend the remainder on real, contiguous neighbours. They share the pane's
 // ordinary text, wire, node and entry budgets with the in-flow reading window.
 export function historyBand({ records, render, cost, limit, remaining, direction }) {
@@ -41,7 +43,8 @@ export function bandSections(children, cost) {
 // Preserve native gaps and the fractional remainder of the bottom-aligned
 // stack. Only off-screen sections are replaced by their measured dimensions.
 export function cropBandSections({ sections, heights, naturalRows, height, visibleRows, alignStart, Box }) {
-  if (!sections.length || sections.length !== heights?.length || heights.some(rows => !(rows > 0)) || !(naturalRows > 0)) return null;
+  if (!sections.length || sections.length !== heights?.length || heights.some(rows => !(rows > 0 && rows <= maxBandRows)) ||
+      !(naturalRows > 0 && naturalRows <= maxBandRows)) return null;
   const total = heights.reduce((sum, rows) => sum + rows, 0);
   const gap = sections.length > 1 ? (naturalRows - total) / (sections.length - 1) : 0;
   if (Math.abs(total - naturalRows) > sections.length * 2 + 1) return null;
